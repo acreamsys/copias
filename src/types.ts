@@ -30,6 +30,7 @@ export interface Product {
   offer_price: number | null;
   stock: number;
   category_id: string;
+  category?: string;
   brand_id: string;
   featured: boolean;
   active: boolean;
@@ -51,6 +52,24 @@ export interface Product {
   location?: string | null;
   created_at?: string;
   updated_at?: string;
+}
+
+export interface ProductMovementLog {
+  id: string;
+  product_id: string;
+  product_name: string;
+  product_sku: string;
+  type: 'ingreso' | 'egreso' | 'ajuste' | 'venta' | 'compra' | 'nota_entrega' | 'pedido' | 'devolucion';
+  quantity: number; // positive for entry, negative for output
+  previous_stock: number;
+  new_stock: number;
+  concept: string;
+  reference_id?: string;
+  reference_type?: string;
+  unit_price?: number;
+  total_amount?: number;
+  user_name?: string;
+  created_at: string;
 }
 
 export interface ProductImage {
@@ -106,6 +125,9 @@ export interface SplitPaymentDetail {
   amount_cop?: number;
   rate?: number;
   reference?: string;
+  bank_account_id?: string;
+  bankAccountId?: string;
+  bank_account_name?: string;
 }
 
 export interface Order {
@@ -121,7 +143,9 @@ export interface Order {
     sku: string;
     quantity: number;
     price: number;
+    cost_price?: number | null;
   }[];
+  seller_name?: string | null;
   total_price: number;
   status: string;
   created_at?: string;
@@ -163,6 +187,7 @@ export interface PurchaseItem {
 }
 
 export interface PurchaseInstallment {
+  id?: string;
   number: number;
   due_date: string;
   amount: number;
@@ -186,6 +211,8 @@ export interface Purchase {
   total_items?: number;
   payment_method?: 'Efectivo USD' | 'Efectivo Bs' | 'Transferencia' | 'Pago Móvil' | 'Punto de Venta' | 'Zelle' | 'Crédito / CXP' | string;
   payment_status?: 'pagado' | 'pendiente' | 'parcial' | string;
+  paid_amount?: number;
+  initial_payment?: number;
   due_date?: string;
   installments_count?: number;
   installments?: PurchaseInstallment[];
@@ -325,6 +352,7 @@ export interface QuoteItem {
 export interface Quote {
   id: string;
   quote_number: string;
+  client_id?: string | null;
   client_name: string;
   client_phone: string;
   client_email?: string | null;
@@ -458,7 +486,7 @@ export interface PaymentMethodConfig {
   id: string;
   code: string;
   name: string;
-  currency: 'VES' | 'USD' | 'EUR' | 'COP' | 'MULTIMONEDA';
+  currency: 'VES' | 'USD' | 'EUR' | 'COP' | 'MULTIMONEDA' | string;
   type: 'movil' | 'efectivo' | 'transferencia' | 'punto' | 'digital' | 'otro';
   description?: string;
   instructions?: string;
@@ -526,7 +554,10 @@ export interface Invoice {
   customer_address?: string;
   payment_method: string;
   subtotal: number;
+  discount?: number;
+  discount_code?: string | null;
   iva: number;
+  igtf?: number;
   total: number;
   items: any[];
   notes?: string;
@@ -564,6 +595,7 @@ export interface BusinessProfile {
   rif: string;
   website: string;
   logo_url: string;
+  tax_id?: string | null;
   slogan?: string;
   saas_plan?: 'gratuito' | 'basico' | 'pro' | 'enterprise' | string;
   updated_at?: string;
@@ -576,126 +608,6 @@ export interface BusinessBranch {
   address: string;
 }
 
-export interface AuthSession {
-  id: string;
-  usuario_tipo: 'interno' | 'cliente';
-  usuario_id: string;
-  usuario_email: string;
-  token: string;
-  ip: string;
-  navegador: string;
-  fecha_inicio: string;
-  fecha_expira: string;
-}
-
-export interface SecurityAuditLog {
-  id: string;
-  timestamp: string;
-  user_type: 'interno' | 'cliente';
-  user_email: string;
-  action: 'login' | 'failed_login' | 'register' | 'logout' | 'password_reset' | 'lockout' | string;
-  ip: string;
-  details: string;
-}
-
-export interface CustomerQuote {
-  id: string;
-  customer_email: string;
-  title: string;
-  items_description: string;
-  estimated_price: number;
-  status: 'pendiente' | 'aprobada' | 'rechazada';
-  created_at: string;
-}
-
-export interface WishlistItem {
-  id: string;
-  user_email: string;
-  product_id: string;
-  created_at: string;
-}
-
-export interface BannerSlide {
-  id: string;
-  title: string;
-  subtitle?: string;
-  badge?: string;
-  image_url: string;
-  button_text?: string;
-  target_category?: string;
-  target_offer?: boolean;
-  active: boolean;
-  sort_order: number;
-}
-
-export interface LandingConfig {
-  id?: string;
-  is_active: boolean;
-  title: string;
-  subtitle: string;
-  badge: string;
-  image_url: string;
-  button_text: string;
-}
-
-export interface HomeCarouselCardItem {
-  id: string;
-  title: string;
-  subtitle: string;
-  badge: string;
-  enabled?: boolean;
-  sort_order: number;
-}
-
-export interface Tax {
-  id: string;
-  name: string;
-  rate: number;
-  is_active: boolean;
-  created_at?: string;
-}
-
-export interface PaymentMethodConfig {
-  id: string;
-  code: string;
-  name: string;
-  currency: 'VES' | 'USD' | 'EUR' | 'COP' | 'MULTIMONEDA';
-  type: 'movil' | 'efectivo' | 'transferencia' | 'punto' | 'digital' | 'otro';
-  description?: string;
-  instructions?: string;
-  account_details?: string;
-  bank_account_id?: string;
-  bank_account_name?: string;
-  incoming_commission?: number;
-  outgoing_commission?: number;
-  is_active: boolean;
-  requires_reference?: boolean;
-  allow_pos?: boolean;
-  allow_online?: boolean;
-  sort_order?: number;
-  created_at?: string;
-}
-
-export interface CashSession {
-  id: string;
-  empleado_nombre?: string;
-  empleado_id?: string;
-  apertura: string;
-  cierre?: string;
-  apertura_bs: number;
-  apertura_usd: number;
-  cierre_bs?: number | null;
-  cierre_usd?: number | null;
-  esperado_bs?: number | null;
-  esperado_usd?: number | null;
-  diferencia_bs?: number | null;
-  diferencia_usd?: number | null;
-  estado: 'abierta' | 'cerrada';
-  estado_arqueo?: 'cuadrada' | 'descuadre_faltante' | 'descuadre_sobrante' | string | null;
-  observaciones?: string | null;
-  created_at?: string;
-}
-
 export interface CashOp {
   id: string;
   session_id?: string | null;
@@ -727,7 +639,10 @@ export interface Invoice {
   customer_address?: string;
   payment_method: string;
   subtotal: number;
+  discount?: number;
+  discount_code?: string | null;
   iva: number;
+  igtf?: number;
   total: number;
   items: any[];
   notes?: string;
@@ -763,6 +678,7 @@ export interface BusinessProfile {
   rif: string;
   website: string;
   logo_url: string;
+  tax_id?: string | null;
   slogan?: string;
   saas_plan?: 'gratuito' | 'basico' | 'pro' | 'enterprise' | string;
   updated_at?: string;
@@ -801,6 +717,7 @@ export interface BankAccount {
   notes?: string;
   created_at?: string;
   updated_at?: string;
+  alias_ids?: string[];
 }
 
 export interface BankTransfer {
@@ -810,6 +727,7 @@ export interface BankTransfer {
   from_account_name?: string;
   to_account_name?: string;
   amount: number;
+  amount_bs?: number;
   currency: string;
   exchange_rate?: number;
   converted_amount?: number;
@@ -823,15 +741,18 @@ export interface GastoFijo {
   id: string;
   name: string;
   category: string;
+  description?: string;
   amount: number;      // en USD
   amount_bs?: number;  // en VES
   type: 'fijo' | 'variable';
   frequency?: 'semanal' | 'quincenal' | 'mensual' | 'anual' | 'unico' | string;
   payment_method?: string;
   bank_account_id?: string;
+  bank_account_name?: string;
   next_due_date?: string;
   last_paid_date?: string;
   status: 'pendiente' | 'pagado' | 'vencido' | 'parcial';
+  reference?: string;
   notes?: string;
   created_at?: string;
   updated_at?: string;
@@ -853,15 +774,34 @@ export interface GastoFijoPayment {
   created_at?: string;
 }
 
+export interface SystemCurrency {
+  id: string;
+  code: string;
+  name: string;
+  symbol: string;
+  rate: number;
+  is_active: boolean;
+  is_main?: boolean;
+  country_code?: string;
+  decimals?: number;
+  position?: 'prefix' | 'suffix';
+  created_at?: string;
+  updated_at?: string;
+}
+
 export type AdminMenuType = 
+  | 'indicadores'
   | 'sales' 
   | 'orders' 
   | 'cotizaciones' 
+  | 'sales_report'
   | 'products' 
+  | 'movimiento'
   | 'compras' 
   | 'caja' 
   | 'cuentas_bancarias' 
   | 'balance' 
+  | 'reportes_cuentas'
   | 'gastos' 
   | 'marketing' 
   | 'reportes' 

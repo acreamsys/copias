@@ -3,19 +3,51 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { dbService } from './supabase';
+export type CurrencyCode = 'USD' | 'EUR' | 'VES' | 'COP' | 'USDT' | string;
 
-export type CurrencyCode = 'USD' | 'EUR' | 'VES' | 'COP';
-
-export const DEFAULT_RATES: Record<CurrencyCode, number> = {
+export const DEFAULT_RATES: Record<string, number> = {
   USD: 1,
+  USDT: 1,
   EUR: 0.92,
-  VES: 45.5,
+  VES: 842.2067,
   COP: 4100
 };
 
+export const CACHED_RATES_KEY = 'copias_bellavista_cached_rates';
+
+export function getCachedCurrencyRates(): Record<string, number> {
+  if (typeof window === 'undefined') return DEFAULT_RATES;
+  try {
+    const raw = localStorage.getItem(CACHED_RATES_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.VES === 'number' && parsed.VES > 50) {
+        return {
+          USD: Number(parsed.USD) || DEFAULT_RATES.USD,
+          EUR: Number(parsed.EUR) || DEFAULT_RATES.EUR,
+          VES: Number(parsed.VES) || DEFAULT_RATES.VES,
+          COP: Number(parsed.COP) || DEFAULT_RATES.COP,
+          ...parsed
+        };
+      }
+    }
+  } catch (e) {
+    console.warn('Error reading cached currency rates:', e);
+  }
+  return DEFAULT_RATES;
+}
+
+export function saveCachedCurrencyRates(rates: Record<string, number>): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(CACHED_RATES_KEY, JSON.stringify(rates));
+  } catch (e) {
+    console.warn('Error saving cached currency rates:', e);
+  }
+}
+
 export interface CurrencyConfig {
-  code: CurrencyCode;
+  code: string;
   symbol: string;
   position: 'prefix' | 'suffix';
   thousandSeparator: string;
@@ -24,7 +56,7 @@ export interface CurrencyConfig {
   label: string;
 }
 
-export const CURRENCIES: Record<CurrencyCode, CurrencyConfig> = {
+export const CURRENCIES: Record<string, CurrencyConfig> = {
   USD: {
     code: 'USD',
     symbol: '$',
@@ -33,6 +65,15 @@ export const CURRENCIES: Record<CurrencyCode, CurrencyConfig> = {
     decimalSeparator: '.',
     decimals: 2,
     label: 'Dólar (USD)',
+  },
+  USDT: {
+    code: 'USDT',
+    symbol: 'USDT',
+    position: 'suffix',
+    thousandSeparator: ',',
+    decimalSeparator: '.',
+    decimals: 2,
+    label: 'Tether / USDT (Binance)',
   },
   EUR: {
     code: 'EUR',
@@ -62,6 +103,26 @@ export const CURRENCIES: Record<CurrencyCode, CurrencyConfig> = {
     label: 'Peso Colombiano (COP)',
   },
 };
+
+export function registerDynamicCurrency(currency: {
+  code: string;
+  symbol: string;
+  label?: string;
+  name?: string;
+  position?: 'prefix' | 'suffix';
+  decimals?: number;
+}): void {
+  const code = currency.code.toUpperCase().trim();
+  CURRENCIES[code] = {
+    code,
+    symbol: currency.symbol || '$',
+    position: currency.position || (code === 'EUR' ? 'suffix' : 'prefix'),
+    thousandSeparator: code === 'USD' ? ',' : '.',
+    decimalSeparator: code === 'USD' ? '.' : ',',
+    decimals: currency.decimals !== undefined ? currency.decimals : 2,
+    label: currency.label || currency.name || `${code} (${currency.symbol || '$'})`,
+  };
+}
 
 // Global state / helper for formatters
 export function formatCurrency(amountUSD: number, currencyCode: CurrencyCode, rates: Record<CurrencyCode, number>): string {

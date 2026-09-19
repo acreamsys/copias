@@ -422,8 +422,8 @@ export default function ReportesDiariosPage({
       currency: 'USD' | 'VES';
     }[] = [];
 
-    // Map each bank/cash account directly from Supabase bank_accounts
-    bankAccountsList.forEach(acc => {
+    // Map each bank/cash account directly from Supabase bank_accounts (active only)
+    bankAccountsList.filter(acc => acc.is_active !== false).forEach(acc => {
       const lowerName = (acc.name || acc.bank_name || '').toLowerCase().trim();
       const isUSD = acc.currency === 'USD' || 
         lowerName.includes('dolar') || 
@@ -967,20 +967,20 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.products;
         <div className="flex items-center gap-2">
           <button
             onClick={() => setShowSqlModal(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-50 hover:bg-violet-100 text-violet-700 text-xs font-bold rounded-xl transition border border-violet-200"
+            className="flex items-center gap-1.5 px-3.5 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 text-xs font-montserrat font-bold rounded-full transition shadow-2xs hover:shadow-xs cursor-pointer active:scale-98"
             title="Ver código SQL para Supabase"
           >
-            <FileText className="w-3.5 h-3.5" />
+            <FileText className="w-4 h-4 text-[#005da9]" />
             <span>Código Supabase</span>
           </button>
 
           <button
             onClick={loadAllRealtimeData}
             disabled={isLoading}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold rounded-xl transition"
+            className="flex items-center gap-1.5 px-3.5 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 text-xs font-montserrat font-bold rounded-full transition shadow-2xs hover:shadow-xs cursor-pointer active:scale-98 disabled:opacity-50"
             title="Recargar datos"
           >
-            <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
+            <RefreshCw className={`w-4 h-4 text-[#005da9] ${isLoading ? 'animate-spin' : ''}`} />
             <span>Actualizar</span>
           </button>
         </div>
@@ -1001,7 +1001,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.products;
               setStartDateTime(`${dStr}T00:00`);
               setEndDateTime(`${dStr}T23:59`);
             }}
-            className="px-2.5 py-1 rounded-lg text-xs font-bold bg-violet-50 text-violet-700 hover:bg-violet-100 transition border border-violet-200"
+            className="px-3 py-1.5 rounded-full text-xs font-montserrat font-bold bg-white text-[#1D3557] border border-slate-300 shadow-2xs hover:bg-slate-50 transition cursor-pointer active:scale-98"
           >
             Hoy
           </button>
@@ -1014,7 +1014,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.products;
               setStartDateTime(`${dStr}T00:00`);
               setEndDateTime(`${dStr}T23:59`);
             }}
-            className="px-2.5 py-1 rounded-lg text-xs font-bold bg-gray-100 text-gray-700 hover:bg-gray-200 transition"
+            className="px-3 py-1.5 rounded-full text-xs font-montserrat font-bold bg-white text-[#1D3557] border border-slate-300 shadow-2xs hover:bg-slate-50 transition cursor-pointer active:scale-98"
           >
             Ayer
           </button>
@@ -1029,7 +1029,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.products;
               setStartDateTime(`${startStr}T00:00`);
               setEndDateTime(`${todayStr}T23:59`);
             }}
-            className="px-2.5 py-1 rounded-lg text-xs font-bold bg-gray-100 text-gray-700 hover:bg-gray-200 transition"
+            className="px-3 py-1.5 rounded-full text-xs font-montserrat font-bold bg-white text-[#1D3557] border border-slate-300 shadow-2xs hover:bg-slate-50 transition cursor-pointer active:scale-98"
           >
             Esta Semana
           </button>
@@ -1042,7 +1042,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.products;
               setStartDateTime(`${firstDay}T00:00`);
               setEndDateTime(`${todayStr}T23:59`);
             }}
-            className="px-2.5 py-1 rounded-lg text-xs font-bold bg-gray-100 text-gray-700 hover:bg-gray-200 transition"
+            className="px-3 py-1.5 rounded-full text-xs font-montserrat font-bold bg-white text-[#1D3557] border border-slate-300 shadow-2xs hover:bg-slate-50 transition cursor-pointer active:scale-98"
           >
             Este Mes
           </button>
@@ -1052,7 +1052,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.products;
               setStartDateTime('');
               setEndDateTime('');
             }}
-            className="px-2.5 py-1 rounded-lg text-xs font-extrabold bg-emerald-50 text-emerald-700 hover:bg-emerald-100 transition border border-emerald-200"
+            className="px-3 py-1.5 rounded-full text-xs font-montserrat font-bold bg-white text-[#1D3557] border border-slate-300 shadow-2xs hover:bg-slate-50 transition cursor-pointer active:scale-98"
           >
             Todo el Histórico
           </button>
@@ -1150,8 +1150,9 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.products;
             <button
               type="button"
               onClick={loadAllRealtimeData}
-              className="px-6 py-2.5 bg-[#6C2BD9] hover:bg-[#5B21B6] text-white font-bold text-xs rounded-xl shadow-sm transition active:scale-95 flex items-center gap-2 h-[41px]"
+              className="px-5 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-montserrat font-bold text-xs rounded-full shadow-2xs hover:shadow-xs transition active:scale-98 flex items-center gap-1.5 h-[41px] cursor-pointer"
             >
+              <RefreshCw className={`w-4 h-4 text-[#005da9] ${isLoading ? 'animate-spin' : ''}`} />
               <span>Generar</span>
             </button>
           </div>
@@ -1231,9 +1232,9 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.products;
               type="button"
               onClick={handleDownloadReport}
               disabled={isExporting}
-              className="self-start sm:self-auto px-5 py-2.5 bg-[#6C2BD9] hover:bg-[#5B21B6] text-white font-bold text-xs rounded-xl shadow-xs transition flex items-center gap-2 active:scale-95"
+              className="self-start sm:self-auto px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-montserrat font-bold text-xs rounded-full shadow-2xs hover:shadow-xs transition flex items-center gap-2 active:scale-98 cursor-pointer disabled:opacity-50"
             >
-              <Download className="w-3.5 h-3.5" />
+              <Download className="w-4 h-4 text-[#005da9]" />
               <span>Descargar reporte</span>
             </button>
           </div>
@@ -1244,32 +1245,32 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.products;
               {/* 3 Stat Cards */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
                 {/* Ordenes */}
-                <div className="rounded-2xl p-6 bg-[#FEE2E2] flex flex-col justify-between h-32 transition hover:shadow-xs">
-                  <span className="text-sm font-bold text-gray-800">
+                <div className="rounded-2xl p-6 bg-white hover:bg-slate-50 border border-slate-200 shadow-2xs hover:shadow-xs flex flex-col justify-between h-32 transition-all">
+                  <span className="text-sm font-montserrat font-bold text-[#1D3557]">
                     Ordenes:
                   </span>
-                  <span className="text-3xl font-black text-gray-900 tracking-tight">
+                  <span className="text-3xl font-black text-[#1D3557] tracking-tight">
                     {ventasMetrics.count}
                   </span>
                 </div>
 
                 {/* Ingresos */}
-                <div className="rounded-2xl p-6 bg-[#DCFCE7] flex flex-col justify-between h-32 transition hover:shadow-xs">
-                  <span className="text-sm font-bold text-gray-800">
+                <div className="rounded-2xl p-6 bg-white hover:bg-slate-50 border border-slate-200 shadow-2xs hover:shadow-xs flex flex-col justify-between h-32 transition-all">
+                  <span className="text-sm font-montserrat font-bold text-[#1D3557]">
                     Ingresos:
                   </span>
-                  <span className="text-3xl font-black text-gray-900 tracking-tight">
-                    ${ventasMetrics.ingresos.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  <span className="text-3xl font-black text-[#1D3557] tracking-tight">
+                    ${(Number(ventasMetrics?.ingresos) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </span>
                 </div>
 
                 {/* Utilidad */}
-                <div className="rounded-2xl p-6 bg-[#EDE9FE] flex flex-col justify-between h-32 transition hover:shadow-xs">
-                  <span className="text-sm font-bold text-gray-800">
+                <div className="rounded-2xl p-6 bg-white hover:bg-slate-50 border border-slate-200 shadow-2xs hover:shadow-xs flex flex-col justify-between h-32 transition-all">
+                  <span className="text-sm font-montserrat font-bold text-[#1D3557]">
                     Utilidad:
                   </span>
-                  <span className="text-3xl font-black text-gray-900 tracking-tight">
-                    ${ventasMetrics.utilidad.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  <span className="text-3xl font-black text-[#1D3557] tracking-tight">
+                    ${(Number(ventasMetrics?.utilidad) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </span>
                 </div>
               </div>
@@ -1313,7 +1314,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.products;
                             {sale.createdBy}
                           </td>
                           <td className="py-3.5 px-3 text-right font-bold text-gray-900">
-                            ${sale.total.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            ${(Number(sale?.total) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                           </td>
                         </tr>
                       ))

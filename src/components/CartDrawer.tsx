@@ -8,7 +8,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { X, Trash2, Plus, Minus, ShoppingCart, MessageCircle, AlertCircle, MapPin, Navigation, Loader2, User, Lock, Scan, ChevronDown, ChevronUp, Edit3 } from 'lucide-react';
 import { Product, CartItem, DiscountCode, LoyaltySettings, StoreUser } from '../types.ts';
 import { dbService } from '../lib/supabase.ts';
-import { CurrencyCode, formatCurrency, CURRENCIES } from '../lib/currency';
+import { CurrencyCode, formatCurrency, CURRENCIES, getCachedCurrencyRates } from '../lib/currency';
 import BarcodeScannerModal from './BarcodeScannerModal';
 
 interface CartQtyInputProps {
@@ -677,7 +677,7 @@ export default function CartDrawer({
         currency_code: activeCurrency,
         currency_rates_snapshot: currencyRates,
         totals_by_currency: calculatedTotalsByCurrency,
-        bcv_rate: currencyRates.VES || 45.5
+        bcv_rate: currencyRates.VES || getCachedCurrencyRates().VES
       };
 
       const created = await dbService.createOrder(orderData);

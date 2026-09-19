@@ -7,6 +7,7 @@ import React, { useState, useEffect } from 'react';
 import { ArrowRight, ChevronLeft, ChevronRight, Sparkles } from 'lucide-react';
 import { Product, ProductImage, Category, BannerSlide } from '../types';
 import { dbService } from '../lib/supabase';
+import { handleImageError, DEFAULT_BANNER_FALLBACK } from '../lib/imageUtils';
 
 interface BannerProps {
   onSelectCategoryByName?: (keyword: string) => void;
@@ -99,6 +100,8 @@ export default function Banner({
           src={currentSlide.image_url}
           alt={currentSlide.title}
           className="w-full h-full object-cover transition-all duration-700 ease-in-out"
+          referrerPolicy="no-referrer"
+          onError={(e) => handleImageError(e, DEFAULT_BANNER_FALLBACK)}
         />
 
         {/* Dark Gradient Overlay for optimal text legibility */}

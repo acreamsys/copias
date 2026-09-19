@@ -8,6 +8,7 @@ import { X, MessageCircle, Share2, Clipboard, Printer, CheckCircle2, AlertTriang
 import { Product, Category, Brand, ProductImage } from '../types.ts';
 import { dbService } from '../lib/supabase.ts';
 import { CurrencyCode, CURRENCIES, formatCurrency } from '../lib/currency';
+import { sanitizeImageUrl, handleImageError, DEFAULT_PRODUCT_FALLBACK } from '../lib/imageUtils';
 
 interface ProductDetailModalProps {
   product: Product;
@@ -105,9 +106,9 @@ export default function ProductDetailModal({
   const brand = brands.find(b => b.id === product.brand_id);
 
   // Get current active images list
-  const activeImages = productImages.length > 0 
-    ? productImages.map(img => img.image_url) 
-    : ['https://images.unsplash.com/photo-1586075010923-2dd4570fb338?auto=format&fit=crop&q=80&w=600'];
+  const activeImages = (productImages && productImages.length > 0)
+    ? productImages.map(img => sanitizeImageUrl(img.image_url, DEFAULT_PRODUCT_FALLBACK)) 
+    : [sanitizeImageUrl(product.technical_sheet_url || (product as any).image_url, DEFAULT_PRODUCT_FALLBACK)];
 
   // Handle printing/saving sheet
   const handlePrintTechnicalSheet = () => {
@@ -332,6 +333,7 @@ export default function ProductDetailModal({
                 alt={product.name}
                 className="max-h-[160px] md:max-h-[350px] w-auto object-contain"
                 referrerPolicy="no-referrer"
+                onError={(e) => handleImageError(e, DEFAULT_PRODUCT_FALLBACK)}
               />
               <button
                 onClick={(e) => {

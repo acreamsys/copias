@@ -5,19 +5,20 @@
 
 import React, { useState, useEffect } from 'react';
 import { 
-  User, Lock, ShieldCheck, Activity, Settings, Coins, Megaphone, 
+  User, Lock, Unlock, ShieldCheck, Activity, Settings, Coins, Megaphone, 
   Save, Printer, Clock, Truck, FileText, Sliders, Bell, Volume2, 
   Trash2, Plus, Search, Image as ImageIcon, FileCheck, Check, AlertTriangle, 
   HelpCircle, Sparkles, Code, Copy, LayoutDashboard, Database,
   Building2, Monitor, Edit2, X, CheckCircle2, Power, MapPin, Phone, Globe, Mail,
-  GripVertical, ChevronUp, ChevronDown, Layers, BarChart2, RefreshCw,
-  CreditCard, Smartphone, Banknote, Landmark, QrCode, ToggleLeft, ToggleRight
+  GripVertical, ChevronUp, ChevronDown, Layers, BarChart2, RefreshCw, Download,
+  CreditCard, Smartphone, Banknote, Landmark, QrCode, ToggleLeft, ToggleRight,
+  Edit3, UserCheck, Percent
 } from 'lucide-react';
-import { StoreUser, Tax, BannerSlide, LandingConfig, HomeCarouselCardItem, BusinessProfile, BusinessBranch, BusinessTerminal, ReportModuleConfig, PaymentMethodConfig } from '../types.ts';
-import { dbService } from '../lib/supabase.ts';
+import { StoreUser, Tax, BannerSlide, LandingConfig, HomeCarouselCardItem, BusinessProfile, BusinessBranch, BusinessTerminal, ReportModuleConfig, PaymentMethodConfig, BankAccount, SystemCurrency } from '../types.ts';
+import { dbService, supabase } from '../lib/supabase.ts';
 import { playCashRegisterSound, playLowStockBeep } from '../lib/soundEffects.ts';
 import { useI18n, LanguageCode, ThemeCode, setStoredLanguage, applyTheme, getStoredLanguage, getStoredTheme } from '../lib/i18n.ts';
-import { CurrencyCode, CURRENCIES, DEFAULT_RATES, formatCurrency, saveCurrency } from '../lib/currency.ts';
+import { CurrencyCode, CURRENCIES, DEFAULT_RATES, formatCurrency, saveCurrency, getCachedCurrencyRates } from '../lib/currency.ts';
 
 interface SystemConfigPanelProps {
   currentUser: StoreUser | null;
@@ -37,7 +38,23 @@ interface SystemConfigPanelProps {
   setConfigIva: (val: number) => void;
   configPhone: string;
   setConfigPhone: (val: string) => void;
-  initialSubTab?: 'mi_cuenta' | 'mi_negocio' | 'facturacion' | 'inventario' | 'impresion' | 'dashboard' | 'notificaciones' | 'planes_suscripcion';
+  initialSubTab?: 'mi_cuenta' | 'mi_negocio' | 'usuarios_asociados' | 'facturacion' | 'inventario' | 'impresion' | 'dashboard' | 'notificaciones' | 'planes_suscripcion' | 'mantenimiento';
+  activeSubTab?: 'mi_cuenta' | 'mi_negocio' | 'usuarios_asociados' | 'facturacion' | 'inventario' | 'impresion' | 'dashboard' | 'notificaciones' | 'planes_suscripcion' | 'mantenimiento';
+  hideInternalTabs?: boolean;
+  storeUsers?: StoreUser[];
+  loadingUsers?: boolean;
+  fetchStoreUsers?: () => Promise<void>;
+  lastStoreUsersSync?: string | null;
+  handleToggleStoreUserStatus?: (userId: string, currentStatus: boolean) => Promise<void>;
+  handleOpenPermissionsModal?: (user: StoreUser) => void;
+  setEditingUserId?: (id: string | null) => void;
+  setUserFormName?: (name: string) => void;
+  setUserFormEmail?: (email: string) => void;
+  setUserFormPassword?: (pwd: string) => void;
+  setUserFormRole?: (role: string) => void;
+  setUserFormError?: (error: string) => void;
+  setShowUserModal?: (show: boolean) => void;
+  handleDeleteStoreUser?: (userId: string, name: string, email?: string) => any;
 }
 
 export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
@@ -58,17 +75,128 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
   setConfigIva,
   configPhone,
   setConfigPhone,
-  initialSubTab
+  initialSubTab,
+  activeSubTab,
+  hideInternalTabs = false,
+  storeUsers = [],
+  loadingUsers = false,
+  fetchStoreUsers,
+  lastStoreUsersSync,
+  handleToggleStoreUserStatus,
+  handleOpenPermissionsModal,
+  setEditingUserId,
+  setUserFormName,
+  setUserFormEmail,
+  setUserFormPassword,
+  setUserFormRole,
+  setUserFormError,
+  setShowUserModal,
+  handleDeleteStoreUser
 }) => {
   // ⚙️ SUB-TABS INTERNOS DE CONFIGURACIÓN
   const { t, lang, theme, setLang: setGlobalLang } = useI18n();
-  const [configSubTab, setConfigSubTab] = useState<'mi_cuenta' | 'mi_negocio' | 'facturacion' | 'inventario' | 'impresion' | 'dashboard' | 'notificaciones' | 'planes_suscripcion'>(initialSubTab || 'mi_negocio');
+  const [configSubTab, setConfigSubTab] = useState<'mi_cuenta' | 'mi_negocio' | 'usuarios_asociados' | 'facturacion' | 'inventario' | 'impresion' | 'dashboard' | 'notificaciones' | 'planes_suscripcion' | 'mantenimiento'>(activeSubTab || initialSubTab || 'mi_negocio');
 
   useEffect(() => {
-    if (initialSubTab) {
+    if (activeSubTab) {
+      setConfigSubTab(activeSubTab);
+    } else if (initialSubTab) {
       setConfigSubTab(initialSubTab);
     }
-  }, [initialSubTab]);
+  }, [activeSubTab, initialSubTab]);
+
+  // 🧹 ESTADOS DE DEPURACIÓN / LIMPIEZA DE OPERACIONES
+  const [showCleanModal, setShowCleanModal] = useState(false);
+  const [cleanConfirmText, setCleanConfirmText] = useState('');
+  const [isCleaning, setIsCleaning] = useState(false);
+  const [cleanResult, setCleanResult] = useState<{ success: boolean; details: Record<string, number | string> } | null>(null);
+
+  // 💾 ESTADOS DE RESPALDO DE BASE DE DATOS
+  const [isExportingBackup, setIsExportingBackup] = useState(false);
+  const [backupDownloadMsg, setBackupDownloadMsg] = useState<{ filename: string; timestamp: string; count: number } | null>(null);
+  const [showBackupModal, setShowBackupModal] = useState(false);
+  const [backupModalData, setBackupModalData] = useState<{ filename: string; summary: Record<string, number>; jsonStr: string } | null>(null);
+  const [copiedBackup, setCopiedBackup] = useState(false);
+
+  const handleDownloadFullBackup = async () => {
+    setIsExportingBackup(true);
+    setCopiedBackup(false);
+    try {
+      const res = await dbService.downloadSystemBackup();
+      const totalRecords = Object.values(res.summary).reduce((a, b) => a + b, 0);
+      setBackupModalData({
+        filename: res.filename,
+        summary: res.summary,
+        jsonStr: res.jsonStr
+      });
+      setBackupDownloadMsg({
+        filename: res.filename,
+        timestamp: new Date().toLocaleTimeString(),
+        count: totalRecords
+      });
+      setShowBackupModal(true);
+    } catch (err: any) {
+      console.error("Backup trigger error:", err);
+      alert('Error al generar respaldo del sistema: ' + (err?.message || err));
+    } finally {
+      setIsExportingBackup(false);
+    }
+  };
+
+  const handleDirectDownloadAgain = () => {
+    if (!backupModalData) return;
+    try {
+      const blob = new Blob([backupModalData.jsonStr], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', backupModalData.filename);
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      setTimeout(() => {
+        try {
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+        } catch {}
+      }, 1000);
+    } catch (e) {
+      const encodedData = 'data:application/json;charset=utf-8,' + encodeURIComponent(backupModalData.jsonStr);
+      window.open(encodedData, '_blank');
+    }
+  };
+
+  const handleCopyBackupToClipboard = async () => {
+    if (!backupModalData?.jsonStr) return;
+    try {
+      await navigator.clipboard.writeText(backupModalData.jsonStr);
+      setCopiedBackup(true);
+      setTimeout(() => setCopiedBackup(false), 3000);
+    } catch (e) {
+      const textArea = document.createElement("textarea");
+      textArea.value = backupModalData.jsonStr;
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand("copy");
+      document.body.removeChild(textArea);
+      setCopiedBackup(true);
+      setTimeout(() => setCopiedBackup(false), 3000);
+    }
+  };
+
+  const handleExecuteOperationalClean = async () => {
+    setIsCleaning(true);
+    try {
+      const res = await dbService.cleanOperationalTransactions();
+      setCleanResult(res);
+      setShowCleanModal(false);
+      setCleanConfirmText('');
+    } catch (err: any) {
+      alert('Error al limpiar bases de datos operacionales: ' + (err?.message || err));
+    } finally {
+      setIsCleaning(false);
+    }
+  };
   
   // 👤 1. MI CUENTA (Ajustes de Usuario)
   const [userPerfilNombre, setUserPerfilNombre] = useState<string>(currentUser?.name || '');
@@ -139,11 +267,45 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
   const [newTaxName, setNewTaxName] = useState<string>('');
   const [newTaxRate, setNewTaxRate] = useState<string>('');
   const [taxMessage, setTaxMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [editingTax, setEditingTax] = useState<Tax | null>(null);
+  const [taxToDelete, setTaxToDelete] = useState<Tax | null>(null);
+  const [isDeletingTax, setIsDeletingTax] = useState<boolean>(false);
+  const [isSavingTax, setIsSavingTax] = useState<boolean>(false);
 
-  // 💱 TASAS DE CAMBIO MANUALES Y MONEDA PRINCIPAL
-  const [manualRates, setManualRates] = useState<Record<CurrencyCode, string>>({
+  // 💱 MONEDAS PRINCIPALES Y TASAS DE CAMBIO (REAL-TIME SUPABASE)
+  const [systemCurrencies, setSystemCurrencies] = useState<SystemCurrency[]>([]);
+  const [loadingCurrencies, setLoadingCurrencies] = useState<boolean>(true);
+  const [showCurrencyModal, setShowCurrencyModal] = useState<boolean>(false);
+  const [editingCurrency, setEditingCurrency] = useState<SystemCurrency | null>(null);
+  const [currencyToDelete, setCurrencyToDelete] = useState<SystemCurrency | null>(null);
+  const [isDeletingCurrency, setIsDeletingCurrency] = useState<boolean>(false);
+  const [isSavingCurrency, setIsSavingCurrency] = useState<boolean>(false);
+  const [currencyActionSuccess, setCurrencyActionSuccess] = useState<string | null>(null);
+
+  // Form state for creating/modifying currency
+  const [currencyForm, setCurrencyForm] = useState<{
+    code: string;
+    name: string;
+    symbol: string;
+    rate: string;
+    country_code: string;
+    decimals: number;
+    position: 'prefix' | 'suffix';
+    is_active: boolean;
+  }>({
+    code: '',
+    name: '',
+    symbol: '$',
+    rate: '1',
+    country_code: 'US',
+    decimals: 2,
+    position: 'prefix',
+    is_active: true
+  });
+
+  const [manualRates, setManualRates] = useState<Record<string, string>>({
     USD: '1.00',
-    VES: currencyRates?.VES ? currencyRates.VES.toString() : (bcvInputValue || '45.50'),
+    VES: currencyRates?.VES ? currencyRates.VES.toString() : (bcvInputValue || getCachedCurrencyRates().VES.toString()),
     EUR: currencyRates?.EUR ? currencyRates.EUR.toString() : '0.92',
     COP: currencyRates?.COP ? currencyRates.COP.toString() : '4100'
   });
@@ -151,6 +313,52 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
   const [rateSavingStatus, setRateSavingStatus] = useState<Record<string, { loading?: boolean, message?: { type: 'success' | 'error', text: string } }>>({});
   const [isFetchingLiveBCV, setIsFetchingLiveBCV] = useState<boolean>(false);
   const [mainCurrencySuccessMsg, setMainCurrencySuccessMsg] = useState<string | null>(null);
+
+  const loadSystemCurrencies = async () => {
+    try {
+      setLoadingCurrencies(true);
+      const currencies = await dbService.getCurrencies();
+      setSystemCurrencies(currencies || []);
+      
+      setManualRates(prev => {
+        const next = { ...prev };
+        currencies.forEach(c => {
+          next[c.code] = c.rate.toString();
+        });
+        return next;
+      });
+    } catch (e) {
+      console.error('Error loading currencies:', e);
+    } finally {
+      setLoadingCurrencies(false);
+    }
+  };
+
+  useEffect(() => {
+    loadSystemCurrencies();
+    window.addEventListener('bellavista_currencies_updated', loadSystemCurrencies);
+
+    let channel: any = null;
+    if (supabase) {
+      try {
+        channel = supabase
+          .channel('system_currencies_changes')
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'system_currencies' }, () => {
+            loadSystemCurrencies();
+          })
+          .subscribe();
+      } catch (err) {
+        console.warn('Realtime subscription for currencies note:', err);
+      }
+    }
+
+    return () => {
+      window.removeEventListener('bellavista_currencies_updated', loadSystemCurrencies);
+      if (channel && supabase) {
+        supabase.removeChannel(channel);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     try {
@@ -173,16 +381,16 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
   useEffect(() => {
     setManualRates(prev => ({
       ...prev,
-      VES: currencyRates?.VES ? currencyRates.VES.toString() : (bcvInputValue || prev.VES),
-      EUR: currencyRates?.EUR ? currencyRates.EUR.toString() : prev.EUR,
-      COP: currencyRates?.COP ? currencyRates.COP.toString() : prev.COP,
+      VES: currencyRates?.VES ? currencyRates.VES.toString() : (bcvInputValue || prev.VES || '842.2067'),
+      EUR: currencyRates?.EUR ? currencyRates.EUR.toString() : (prev.EUR || '0.92'),
+      COP: currencyRates?.COP ? currencyRates.COP.toString() : (prev.COP || '4100'),
     }));
   }, [currencyRates, bcvInputValue]);
 
-  const handleSelectMainCurrency = (code: CurrencyCode) => {
+  const handleSelectMainCurrency = (code: string) => {
     setFacturacionMainCurrency(code);
     if (onCurrencyChange) {
-      onCurrencyChange(code);
+      onCurrencyChange(code as any);
     }
     window.dispatchEvent(new CustomEvent('bellavista_currency_changed', { detail: code }));
 
@@ -192,7 +400,129 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
     }, 4500);
   };
 
-  const handleSaveManualRate = async (code: CurrencyCode) => {
+  const handleOpenCreateCurrency = () => {
+    setEditingCurrency(null);
+    setCurrencyForm({
+      code: '',
+      name: '',
+      symbol: '$',
+      rate: '1.00',
+      country_code: 'US',
+      decimals: 2,
+      position: 'prefix',
+      is_active: true
+    });
+    setShowCurrencyModal(true);
+  };
+
+  const handleOpenEditCurrency = (currency: SystemCurrency) => {
+    setEditingCurrency(currency);
+    setCurrencyForm({
+      code: currency.code,
+      name: currency.name,
+      symbol: currency.symbol,
+      rate: (manualRates[currency.code] ?? currency.rate).toString(),
+      country_code: currency.country_code || (currency.code === 'VES' ? 'VE' : currency.code === 'EUR' ? 'EU' : currency.code === 'COP' ? 'CO' : currency.code.slice(0, 2)),
+      decimals: currency.decimals !== undefined ? currency.decimals : 2,
+      position: currency.position || 'prefix',
+      is_active: currency.is_active !== false
+    });
+    setShowCurrencyModal(true);
+  };
+
+  const handleSaveCurrencyModal = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const cleanCode = currencyForm.code.trim().toUpperCase();
+    if (!cleanCode) {
+      alert('Por favor ingrese el código de la moneda (ej. USD, VES, EUR, BRL).');
+      return;
+    }
+    if (!currencyForm.name.trim()) {
+      alert('Por favor ingrese el nombre descriptivo de la moneda.');
+      return;
+    }
+    const parsedRate = parseFloat(currencyForm.rate);
+    if (isNaN(parsedRate) || parsedRate <= 0) {
+      alert('Por favor ingrese una tasa de cambio numérica válida mayor a 0.');
+      return;
+    }
+
+    try {
+      setIsSavingCurrency(true);
+      const saved = await dbService.saveCurrency({
+        id: editingCurrency ? editingCurrency.id : undefined,
+        code: cleanCode,
+        name: currencyForm.name.trim(),
+        symbol: currencyForm.symbol.trim() || '$',
+        rate: parsedRate,
+        country_code: currencyForm.country_code.trim().toUpperCase() || cleanCode.slice(0, 2),
+        decimals: Number(currencyForm.decimals),
+        position: currencyForm.position,
+        is_active: currencyForm.is_active
+      }, currentUser?.name || 'Administrador');
+
+      if (cleanCode === 'VES') {
+        setBcvInputValue(parsedRate.toString());
+      }
+      try {
+        await onUpdateCurrencyRate(cleanCode, parsedRate);
+      } catch (rateErr) {
+        console.warn('onUpdateCurrencyRate exception:', rateErr);
+      }
+
+      // Immediately update local state so the new/modified currency displays without delay
+      setSystemCurrencies(prev => {
+        const idx = prev.findIndex(c => c.code === saved.code);
+        if (idx > -1) {
+          const updated = [...prev];
+          updated[idx] = saved;
+          return updated;
+        }
+        return [...prev, saved];
+      });
+
+      setManualRates(prev => ({
+        ...prev,
+        [saved.code]: saved.rate.toString()
+      }));
+
+      setShowCurrencyModal(false);
+      setEditingCurrency(null);
+      await loadSystemCurrencies();
+
+      setCurrencyActionSuccess(`¡Moneda ${saved.code} (${saved.name}) guardada con éxito en Supabase!`);
+      setTimeout(() => setCurrencyActionSuccess(null), 4000);
+    } catch (err: any) {
+      console.error('Error saving currency in modal:', err);
+      alert('Error al guardar la moneda: ' + (err?.message || 'Error de conexión'));
+    } finally {
+      setIsSavingCurrency(false);
+    }
+  };
+
+  const handleDeleteCurrencyConfirm = async () => {
+    if (!currencyToDelete) return;
+    if (currencyToDelete.code === 'USD') {
+      alert('No es posible eliminar el Dólar (USD) ya que es la divisa base del sistema.');
+      setCurrencyToDelete(null);
+      return;
+    }
+    try {
+      setIsDeletingCurrency(true);
+      await dbService.deleteCurrency(currencyToDelete.id || currencyToDelete.code);
+      setCurrencyToDelete(null);
+      await loadSystemCurrencies();
+      setCurrencyActionSuccess(`Moneda ${currencyToDelete.code} eliminada de Supabase.`);
+      setTimeout(() => setCurrencyActionSuccess(null), 4000);
+    } catch (err: any) {
+      console.error('Error deleting currency:', err);
+      alert('Error al eliminar moneda: ' + (err?.message || 'Error'));
+    } finally {
+      setIsDeletingCurrency(false);
+    }
+  };
+
+  const handleSaveManualRate = async (code: string) => {
     const rawVal = manualRates[code];
     const val = parseFloat(rawVal);
     if (isNaN(val) || val <= 0) {
@@ -212,7 +542,17 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
         [code]: { loading: true, message: undefined }
       }));
 
-      await onUpdateCurrencyRate(code, val);
+      // Find existing currency config or fallback
+      const existing = systemCurrencies.find(c => c.code === code);
+      if (existing) {
+        await dbService.saveCurrency({
+          ...existing,
+          rate: val
+        }, currentUser?.name || 'Administrador');
+      } else {
+        await onUpdateCurrencyRate(code, val);
+      }
+
       if (code === 'VES') {
         setBcvInputValue(val.toString());
       }
@@ -240,7 +580,7 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
         ...prev,
         [code]: {
           loading: false,
-          message: { type: 'error', text: 'No se pudo guardar la tasa. Verifique su conexión.' }
+          message: { type: 'error', text: 'No se pudo guardar la tasa en Supabase. Verifique su conexión.' }
         }
       }));
     }
@@ -295,19 +635,29 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
     }
   };
 
-  // 💳 MÉTODOS DE PAGO (CONFIGURACIÓN DINÁMICA)
+  // 💳 MÉTODOS DE PAGO Y CUENTAS BANCARIAS (CONFIGURACIÓN GLOBAL Y EN TIEMPO REAL)
   const [paymentMethodsList, setPaymentMethodsList] = useState<PaymentMethodConfig[]>([]);
   const [loadingPaymentMethods, setLoadingPaymentMethods] = useState<boolean>(true);
+  const [bankAccounts, setBankAccounts] = useState<BankAccount[]>([]);
+  const [loadingBankAccounts, setLoadingBankAccounts] = useState<boolean>(false);
   const [showPaymentMethodModal, setShowPaymentMethodModal] = useState<boolean>(false);
+  const [showEditSingleModal, setShowEditSingleModal] = useState<boolean>(false);
   const [editingPaymentMethod, setEditingPaymentMethod] = useState<Partial<PaymentMethodConfig> | null>(null);
   const [paymentMethodToDelete, setPaymentMethodToDelete] = useState<PaymentMethodConfig | null>(null);
   const [paymentMethodMsg, setPaymentMethodMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // Form states for "Registrar nuevo método de pago" in the "Métodos de Pago del Sistema" modal
+  const [mgrNewName, setMgrNewName] = useState<string>('');
+  const [mgrNewCurrency, setMgrNewCurrency] = useState<'VES' | 'USD'>('VES');
+  const [mgrNewType, setMgrNewType] = useState<'movil' | 'efectivo' | 'transferencia' | 'punto' | 'digital' | 'otro'>('movil');
+  const [mgrTargetAccountId, setMgrTargetAccountId] = useState<string>('');
+  const [isRegisteringMethod, setIsRegisteringMethod] = useState<boolean>(false);
 
   const loadPaymentMethods = async () => {
     try {
       setLoadingPaymentMethods(true);
       const methods = await dbService.getPaymentMethods();
-      setPaymentMethodsList(methods);
+      setPaymentMethodsList(methods || []);
     } catch (err) {
       console.error('Error loading payment methods:', err);
     } finally {
@@ -315,36 +665,157 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
     }
   };
 
+  const loadBankAccounts = async () => {
+    try {
+      setLoadingBankAccounts(true);
+      const accs = await dbService.getBankAccounts();
+      setBankAccounts(accs || []);
+    } catch (err) {
+      console.error('Error loading bank accounts:', err);
+    } finally {
+      setLoadingBankAccounts(false);
+    }
+  };
+
   useEffect(() => {
     loadPaymentMethods();
-    const handlePmUpdated = () => loadPaymentMethods();
+    loadBankAccounts();
+    const handlePmUpdated = () => {
+      loadPaymentMethods();
+      loadBankAccounts();
+    };
     window.addEventListener('bellavista_payment_methods_updated', handlePmUpdated);
     return () => {
       window.removeEventListener('bellavista_payment_methods_updated', handlePmUpdated);
     };
   }, []);
 
+  // Helper to determine if a method is bound to an account and get the account name
+  const getMethodBoundAccount = (pm: PaymentMethodConfig) => {
+    // 1. Direct ID match
+    if (pm.bank_account_id) {
+      const acc = bankAccounts.find(a => a.id === pm.bank_account_id);
+      if (acc) return { isBound: true, accountName: acc.name, accountId: acc.id };
+    }
+    // 2. Direct name match
+    if (pm.bank_account_name) {
+      return { isBound: true, accountName: pm.bank_account_name, accountId: pm.bank_account_id || '' };
+    }
+    // 3. Check JSON notes in accounts
+    for (const acc of bankAccounts) {
+      if (acc.notes) {
+        try {
+          const parsed = JSON.parse(acc.notes);
+          if (Array.isArray(parsed)) {
+            const found = parsed.find((m: any) => 
+              (m.id && m.id === pm.id) || 
+              (m.code && m.code === pm.code) || 
+              (m.name && m.name.trim().toLowerCase() === pm.name.trim().toLowerCase())
+            );
+            if (found) {
+              return { isBound: true, accountName: acc.name, accountId: acc.id };
+            }
+          }
+        } catch (e) {}
+      }
+      // Or matches default system names (e.g. Efectivo Bolivares / Efectivo Dolares)
+      if (
+        (pm.type === 'efectivo' || pm.name.toLowerCase().includes('efectivo')) &&
+        ((pm.currency === 'VES' && acc.currency === 'VES' && acc.name.toLowerCase().includes('efectivo')) ||
+         (pm.currency === 'USD' && acc.currency === 'USD' && acc.name.toLowerCase().includes('efectivo')))
+      ) {
+        return { isBound: true, accountName: acc.name, accountId: acc.id };
+      }
+    }
+    return { isBound: false, accountName: '', accountId: '' };
+  };
+
   const handleOpenAddPaymentMethod = () => {
-    setEditingPaymentMethod({
-      id: '',
-      code: '',
-      name: '',
-      currency: 'VES',
-      type: 'movil',
-      description: '',
-      instructions: '',
-      account_details: '',
-      is_active: true,
-      requires_reference: true,
-      allow_pos: true,
-      allow_online: true
-    });
+    setMgrNewName('');
+    setMgrNewCurrency('VES');
+    setMgrNewType('movil');
+    setMgrTargetAccountId('');
     setShowPaymentMethodModal(true);
+    loadBankAccounts();
+    loadPaymentMethods();
+  };
+
+  const handleCreateManagerPaymentMethod = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!mgrNewName.trim()) {
+      setPaymentMethodMsg({ type: 'error', text: 'El nombre del método de cobro es obligatorio.' });
+      return;
+    }
+
+    setIsRegisteringMethod(true);
+    const newId = `pm-${Date.now()}`;
+    const targetAcc = bankAccounts.find(a => a.id === mgrTargetAccountId);
+
+    const newPm: PaymentMethodConfig = {
+      id: newId,
+      code: mgrNewName.toUpperCase().replace(/[^A-Z0-9]/g, '_'),
+      name: mgrNewName.trim(),
+      currency: mgrNewCurrency,
+      type: mgrNewType as any,
+      is_active: true,
+      requires_reference: mgrNewType !== 'efectivo',
+      allow_pos: true,
+      allow_online: true,
+      bank_account_id: targetAcc?.id || undefined,
+      bank_account_name: targetAcc?.name || undefined,
+      incoming_commission: 0,
+      outgoing_commission: 0,
+      sort_order: paymentMethodsList.length + 1
+    };
+
+    try {
+      await dbService.savePaymentMethod(newPm);
+
+      // If an account was assigned, also update that account's notes
+      if (targetAcc) {
+        let existingMethods: any[] = [];
+        if (targetAcc.notes) {
+          try {
+            const parsed = JSON.parse(targetAcc.notes);
+            if (Array.isArray(parsed)) existingMethods = parsed;
+          } catch (e) {}
+        }
+        const updated = [
+          ...existingMethods,
+          {
+            id: newId,
+            code: newPm.code,
+            name: newPm.name,
+            currency: newPm.currency,
+            type: newPm.type,
+            incomingCommission: 0,
+            outgoingCommission: 0
+          }
+        ];
+        await dbService.saveBankAccount({
+          ...targetAcc,
+          notes: JSON.stringify(updated)
+        });
+      }
+
+      setPaymentMethodMsg({ type: 'success', text: `Método "${newPm.name}" registrado en el sistema exitosamente.` });
+      setMgrNewName('');
+      setMgrTargetAccountId('');
+      await loadPaymentMethods();
+      await loadBankAccounts();
+      window.dispatchEvent(new CustomEvent('bellavista_payment_methods_updated'));
+      setTimeout(() => setPaymentMethodMsg(null), 4000);
+    } catch (err: any) {
+      console.error(err);
+      setPaymentMethodMsg({ type: 'error', text: err.message || 'Error al crear el método de pago.' });
+    } finally {
+      setIsRegisteringMethod(false);
+    }
   };
 
   const handleOpenEditPaymentMethod = (pm: PaymentMethodConfig) => {
     setEditingPaymentMethod({ ...pm });
-    setShowPaymentMethodModal(true);
+    setShowEditSingleModal(true);
   };
 
   const handleSavePaymentMethod = async (e: React.FormEvent) => {
@@ -354,11 +825,12 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
       return;
     }
     try {
-      await dbService.savePaymentMethod(editingPaymentMethod);
-      setShowPaymentMethodModal(false);
+      await dbService.savePaymentMethod(editingPaymentMethod as PaymentMethodConfig);
+      setShowEditSingleModal(false);
       setEditingPaymentMethod(null);
       setPaymentMethodMsg({ type: 'success', text: `Método de pago "${editingPaymentMethod.name}" guardado correctamente.` });
       await loadPaymentMethods();
+      window.dispatchEvent(new CustomEvent('bellavista_payment_methods_updated'));
       setTimeout(() => setPaymentMethodMsg(null), 3500);
     } catch (err: any) {
       setPaymentMethodMsg({ type: 'error', text: err.message || 'Error al guardar el método de pago.' });
@@ -369,6 +841,7 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
     try {
       await dbService.savePaymentMethod({ ...pm, is_active: !pm.is_active });
       await loadPaymentMethods();
+      window.dispatchEvent(new CustomEvent('bellavista_payment_methods_updated'));
     } catch (err: any) {
       alert(`Error al cambiar estado: ${err.message}`);
     }
@@ -381,6 +854,7 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
       setPaymentMethodToDelete(null);
       setPaymentMethodMsg({ type: 'success', text: `Método "${paymentMethodToDelete.name}" eliminado.` });
       await loadPaymentMethods();
+      window.dispatchEvent(new CustomEvent('bellavista_payment_methods_updated'));
       setTimeout(() => setPaymentMethodMsg(null), 3000);
     } catch (err: any) {
       alert(`Error al eliminar: ${err.message}`);
@@ -849,33 +1323,84 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
     }
   };
 
-  // ADD NEW TAX METHOD
+  // 🏷️ TAX MANAGEMENT HANDLERS (SUPABASE REAL-TIME COMPATIBLE)
   const handleAddTax = async (e: React.FormEvent) => {
     e.preventDefault();
     const rateVal = parseFloat(newTaxRate);
-    if (!newTaxName || isNaN(rateVal)) {
-      setTaxMessage({ type: 'error', text: 'Complete los campos correctamente.' });
+    if (!newTaxName.trim() || isNaN(rateVal) || rateVal < 0) {
+      setTaxMessage({ type: 'error', text: 'Por favor ingrese un nombre y porcentaje válido (ej: IVA General, 16).' });
       return;
     }
     try {
-      await dbService.saveTax({ name: newTaxName, rate: rateVal, is_active: true });
+      await dbService.saveTax({ name: newTaxName.trim(), rate: rateVal, is_active: true });
       setNewTaxName('');
       setNewTaxRate('');
-      setTaxMessage({ type: 'success', text: `Impuesto "${newTaxName}" guardado correctamente.` });
+      setTaxMessage({ type: 'success', text: `Impuesto "${newTaxName.trim()}" registrado y sincronizado exitosamente.` });
       await loadAdminTaxes();
-      setTimeout(() => setTaxMessage(null), 3000);
+      setTimeout(() => setTaxMessage(null), 3500);
     } catch (err: any) {
-      setTaxMessage({ type: 'error', text: err.message || 'Error al guardar.' });
+      setTaxMessage({ type: 'error', text: err.message || 'Error al registrar el impuesto.' });
+    }
+  };
+
+  const handleSaveEditedTax = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingTax) return;
+    const rateVal = parseFloat(editingTax.rate.toString());
+    if (!editingTax.name.trim() || isNaN(rateVal) || rateVal < 0) {
+      setTaxMessage({ type: 'error', text: 'Nombre y porcentaje de impuesto requeridos.' });
+      return;
+    }
+    setIsSavingTax(true);
+    try {
+      await dbService.saveTax({
+        id: editingTax.id,
+        name: editingTax.name.trim(),
+        rate: rateVal,
+        is_active: editingTax.is_active,
+        created_at: editingTax.created_at
+      });
+      setTaxMessage({ type: 'success', text: `Impuesto "${editingTax.name.trim()}" actualizado y sincronizado correctamente.` });
+      setEditingTax(null);
+      await loadAdminTaxes();
+      setTimeout(() => setTaxMessage(null), 3500);
+    } catch (err: any) {
+      setTaxMessage({ type: 'error', text: err.message || 'Error al actualizar el impuesto.' });
+    } finally {
+      setIsSavingTax(false);
+    }
+  };
+
+  const handleConfirmDeleteTax = async () => {
+    if (!taxToDelete) return;
+    setIsDeletingTax(true);
+    try {
+      const deletedName = taxToDelete.name;
+      await dbService.deleteTax(taxToDelete.id);
+      setTaxMessage({ type: 'success', text: `Impuesto "${deletedName}" eliminado exitosamente.` });
+      setTaxToDelete(null);
+      await loadAdminTaxes();
+      setTimeout(() => setTaxMessage(null), 3500);
+    } catch (err: any) {
+      setTaxMessage({ type: 'error', text: err.message || 'Error al eliminar el impuesto.' });
+    } finally {
+      setIsDeletingTax(false);
     }
   };
 
   // TOGGLE TAX METHOD
   const handleToggleTax = async (tax: Tax) => {
     try {
-      await dbService.saveTax({ ...tax, is_active: !tax.is_active });
+      const updatedStatus = !tax.is_active;
+      await dbService.saveTax({ ...tax, is_active: updatedStatus });
+      setTaxMessage({ 
+        type: 'success', 
+        text: `Impuesto "${tax.name}" ${updatedStatus ? 'activado' : 'desactivado'} para facturación.` 
+      });
       await loadAdminTaxes();
+      setTimeout(() => setTaxMessage(null), 3000);
     } catch (err: any) {
-      alert(`Error al cambiar estado del impuesto: ${err.message}`);
+      setTaxMessage({ type: 'error', text: `Error al cambiar estado del impuesto: ${err.message}` });
     }
   };
 
@@ -905,41 +1430,20 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
   };
 
   const menuItems = [
-    { id: 'mi_cuenta', label: `👤 ${t('account.my_account_tab', 'Mi Cuenta')}`, desc: t('account.my_account_desc', 'Perfil, seguridad y contraseña') },
-    { id: 'mi_negocio', label: `🏢 ${t('business.my_business_tab', 'Mi Negocio')}`, desc: t('business.my_business_desc', 'Empresa, SaaS, sedes y cajas') },
-    { id: 'planes_suscripcion', label: `💳 ${t('saas.subscription_tab', 'Plan de Suscripción')}`, desc: t('saas.subscription_desc', 'Gestionar licencia, Free, Básico o Pro') },
-    { id: 'facturacion', label: `💳 ${t('billing.billing_tab', 'Facturación')}`, desc: t('billing.billing_desc', 'Monedas, tasas e impuestos') },
-    { id: 'inventario', label: `📦 ${t('inventory.inventory_tab', 'Inventario / Catálogo')}`, desc: t('inventory.inventory_desc', 'Stock, e-commerce y banners') },
-    { id: 'impresion', label: `🖨️ ${t('print.printing_tab', 'Impresión / Hardware')}`, desc: t('print.printing_desc', 'Ticket, garantía e impresoras') },
-    { id: 'dashboard', label: `📊 ${t('dash.dashboard_tab', 'Panel de Gráficas')}`, desc: t('dash.dashboard_desc', 'Personalizar reportes y vistas') },
-    { id: 'notificaciones', label: `🔔 ${t('notif.notifications_tab', 'Sistema y Alertas')}`, desc: t('notif.notifications_desc', 'Sonidos, correos y alertas') },
+    { id: 'mi_negocio', label: t('business.my_business_tab', 'Mi Negocio'), desc: t('business.my_business_desc', 'Empresa, SaaS, sedes y cajas') },
+    { id: 'mi_cuenta', label: t('account.my_account_tab', 'Mi Cuenta'), desc: t('account.my_account_desc', 'Perfil, seguridad y contraseña') },
+    { id: 'usuarios_asociados', label: 'Usuarios Asociados', desc: 'Gestionar operarios y permisos del sistema' },
+    { id: 'planes_suscripcion', label: t('saas.subscription_tab', 'Planes'), desc: t('saas.subscription_desc', 'Gestionar licencia, Free, Básico o Pro') },
+    { id: 'facturacion', label: t('billing.billing_tab', 'Facturación'), desc: t('billing.billing_desc', 'Monedas, tasas e impuestos') },
+    { id: 'inventario', label: t('inventory.inventory_tab', 'Inventario'), desc: t('inventory.inventory_desc', 'Stock, e-commerce y banners') },
+    { id: 'impresion', label: t('print.printing_tab', 'Impresión'), desc: t('print.printing_desc', 'Ticket, garantía e impresoras') },
+    { id: 'dashboard', label: t('dash.dashboard_tab', 'Panel de Gráficas'), desc: t('dash.dashboard_desc', 'Personalizar reportes y vistas') },
+    { id: 'notificaciones', label: t('notif.notifications_tab', 'Sistema y Alertas'), desc: t('notif.notifications_desc', 'Sonidos, correos y alertas') },
+    { id: 'mantenimiento', label: 'Respaldo y Mantenimiento', desc: 'Descargar copia de seguridad y depurar operaciones' },
   ];
 
   return (
     <div className="bg-white border border-gray-200 rounded-3xl p-6 shadow-xs text-left" id="general_system_configuration_center">
-      {/* HEADER SECTION */}
-      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-gray-100 pb-5 mb-6">
-        <div>
-          <h3 className="text-lg font-black text-gray-900 uppercase tracking-tight flex items-center gap-2">
-            <Settings className="w-5 h-5 text-[#005da9]" />
-            <span>{t('config.control_center_title', 'Centro de Control de Configuraciones')}</span>
-          </h3>
-          <p className="text-xs text-gray-500 font-medium">
-            {t('config.control_center_subtitle', 'Personalice y administre el comportamiento global de su plataforma. Cada cambio se aplica inmediatamente.')}
-          </p>
-        </div>
-        
-        <div className="flex items-center gap-2">
-          <button
-            onClick={handleSaveAll}
-            className="px-5 py-2.5 bg-[#005da9] hover:bg-[#004a87] text-white text-xs font-extrabold rounded-xl flex items-center gap-2 transition shadow-md cursor-pointer"
-          >
-            <Save className="w-4 h-4" />
-            <span>{t('app.save_changes', 'Guardar Cambios')}</span>
-          </button>
-        </div>
-      </div>
-
       {configSaved && (
         <div className="mb-6 p-4 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold rounded-xl flex items-center gap-2 animate-pulse">
           <Check className="w-4 h-4 shrink-0 text-emerald-600" />
@@ -947,28 +1451,242 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
-        {/* SIDE BAR BUTTONS FOR LAYOUT */}
-        <div className="lg:col-span-1 space-y-1.5 border-r border-gray-100 pr-0 lg:pr-4">
-          <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block mb-2 px-3">Menú de Ajustes</span>
+      {/* HORIZONTAL SUBTABS (MATCHING REFERENCE IMAGE) */}
+      {!hideInternalTabs && (
+        <div className="flex items-center gap-6 sm:gap-8 border-b border-gray-200 overflow-x-auto pb-1 text-xs sm:text-sm font-medium mb-6">
           {menuItems.map(item => (
             <button
               key={item.id}
               onClick={() => setConfigSubTab(item.id as any)}
-              className={`w-full text-left px-3.5 py-3 rounded-xl transition-all flex flex-col gap-0.5 cursor-pointer border ${
+              className={`pb-3 transition font-montserrat cursor-pointer whitespace-nowrap ${
                 configSubTab === item.id
-                  ? 'bg-gradient-to-r from-blue-50 to-[#005da9]/5 border-[#005da9]/20 text-[#005da9]'
-                  : 'bg-white hover:bg-gray-50 border-transparent text-gray-700'
+                  ? 'text-[#7928CA] font-bold border-b-2 border-[#7928CA]'
+                  : 'text-gray-400 hover:text-gray-700 font-medium'
               }`}
             >
-              <span className="font-extrabold text-xs">{item.label}</span>
-              <span className="text-[10px] text-gray-400 font-medium">{item.desc}</span>
+              {item.label}
             </button>
           ))}
         </div>
+      )}
 
-        {/* ACTIVE SUB-TAB CONTAINER */}
-        <div className="lg:col-span-3 space-y-6">
+      {/* ACTIVE SUB-TAB CONTAINER */}
+      <div className="space-y-6 font-poppins">
+          {/* TAB: USUARIOS ASOCIADOS */}
+          {configSubTab === 'usuarios_asociados' && (
+            <div className="space-y-5">
+              <div className="border-b border-gray-100 pb-3">
+                <h4 className="text-sm font-black text-gray-800 uppercase tracking-wider flex items-center gap-2 font-montserrat">
+                  <UserCheck className="w-4 h-4 text-[#7928CA]" />
+                  <span>Usuarios Asociados y Accesos</span>
+                </h4>
+                <p className="text-xs text-gray-400">Administre los accesos de los operadores, cajeros y personal administrativo de su negocio.</p>
+              </div>
+
+              {/* ACTION BAR: + Agregar usuario & REALTIME AUDIT INDICATOR */}
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 pt-1">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <button
+                    onClick={() => {
+                      if (setEditingUserId) setEditingUserId(null);
+                      if (setUserFormName) setUserFormName('');
+                      if (setUserFormEmail) setUserFormEmail('');
+                      if (setUserFormPassword) setUserFormPassword('');
+                      if (setUserFormRole) setUserFormRole('Cajero');
+                      if (setUserFormError) setUserFormError('');
+                      if (setShowUserModal) setShowUserModal(true);
+                    }}
+                    className="px-6 py-2.5 rounded-full bg-gradient-to-r from-[#1D3557] via-[#005da9] to-[#7928CA] hover:opacity-95 text-white font-montserrat font-bold text-xs tracking-wider uppercase transition shadow-md hover:shadow-lg active:scale-98 flex items-center gap-2 cursor-pointer"
+                  >
+                    <Plus className="w-4 h-4 text-[#40E0D0] stroke-[2.5]" />
+                    <span>+ Agregar usuario</span>
+                  </button>
+
+                  {/* Botón Sincronizar en tiempo real */}
+                  <button
+                    type="button"
+                    onClick={() => { if (fetchStoreUsers) fetchStoreUsers(); }}
+                    disabled={loadingUsers}
+                    className="px-4 py-2 rounded-full bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 font-montserrat font-bold text-xs shadow-2xs hover:shadow-xs transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    title="Forzar lectura en vivo desde tabla store_users de Supabase"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 text-[#005da9] ${loadingUsers ? 'animate-spin' : ''}`} />
+                    <span>{loadingUsers ? 'Sincronizando...' : 'Sincronizar'}</span>
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2.5 text-xs">
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200 font-bold text-[11px] shadow-2xs">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                    <span>Supabase Live: <strong className="font-mono">store_users</strong></span>
+                    <span className="text-emerald-600 font-normal">| 0% simulado</span>
+                  </span>
+
+                  {lastStoreUsersSync && (
+                    <span className="text-[11px] text-gray-400 font-mono hidden sm:inline-block">
+                      {lastStoreUsersSync}
+                    </span>
+                  )}
+
+                  <span className="px-3 py-1 rounded-full bg-slate-100 text-[#1D3557] font-bold text-[11px] border border-slate-200">
+                    Total operadores: {storeUsers.filter(u => u.role !== 'Cliente').length}
+                  </span>
+                </div>
+              </div>
+
+              {/* CARDS GRID AS SHOWN IN IMAGE 1 */}
+              {loadingUsers && storeUsers.length === 0 ? (
+                <div className="p-12 text-center text-gray-400 font-medium bg-white rounded-2xl border border-gray-150 flex flex-col items-center justify-center gap-2">
+                  <RefreshCw className="w-6 h-6 text-[#7928CA] animate-spin" />
+                  <span>Consultando operadores en tiempo real desde Supabase...</span>
+                </div>
+              ) : storeUsers.filter(u => u.role !== 'Cliente').length === 0 ? (
+                <div className="p-12 text-center text-gray-500 font-medium bg-white rounded-2xl border-2 border-dashed border-gray-200 flex flex-col items-center justify-center gap-3">
+                  <UserCheck className="w-10 h-10 text-gray-300" />
+                  <div>
+                    <h4 className="font-bold text-gray-800 mb-1">Sin operadores registrados en Supabase</h4>
+                    <p className="text-xs text-gray-400 max-w-md mx-auto">
+                      La tabla <code className="bg-gray-100 px-1.5 py-0.5 rounded text-gray-700 font-mono text-[11px]">store_users</code> está lista. Agrega operadores para otorgar acceso administrativo independiente.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => {
+                      if (setEditingUserId) setEditingUserId(null);
+                      if (setUserFormName) setUserFormName('');
+                      if (setUserFormEmail) setUserFormEmail('');
+                      if (setUserFormPassword) setUserFormPassword('');
+                      if (setUserFormRole) setUserFormRole('Cajero');
+                      if (setUserFormError) setUserFormError('');
+                      if (setShowUserModal) setShowUserModal(true);
+                    }}
+                    className="mt-2 px-5 py-2 rounded-full bg-gradient-to-r from-[#1D3557] via-[#005da9] to-[#7928CA] text-white font-bold text-xs cursor-pointer shadow-xs hover:shadow-md transition"
+                  >
+                    + Registrar Primer Operador
+                  </button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 lg:gap-5">
+                  {storeUsers
+                    .filter(u => u.role !== 'Cliente')
+                    .map((user) => {
+                      const isOwner = (user.role || '').toLowerCase() === 'propietario' ||
+                                      user.role === 'Propietario' || 
+                                      user.email?.toLowerCase().includes('sebastian@') || 
+                                      user.name?.toLowerCase().includes('sebastian sanchez') || 
+                                      user.email === 'copiasbellavistafp@gmail.com';
+
+                      // Extract initials for circular avatar
+                      const nameParts = (user.name || 'Usuario').trim().split(/\s+/);
+                      const initials = nameParts.length >= 2
+                        ? `${nameParts[0][0]}${nameParts[1][0]}`.toUpperCase()
+                        : (user.name ? user.name.slice(0, 2).toUpperCase() : 'US');
+
+                      return (
+                        <div 
+                          key={user.id || user.email}
+                          className="bg-white border border-gray-150 rounded-2xl p-4 sm:p-5 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:border-gray-300 hover:shadow-sm transition"
+                        >
+                          {/* Left: Avatar + Details */}
+                          <div className="flex items-center gap-3.5 min-w-0">
+                            <div className="w-12 h-12 rounded-full bg-purple-100 text-purple-700 flex items-center justify-center font-montserrat font-black text-sm shrink-0 shadow-2xs">
+                              {initials}
+                            </div>
+                            <div className="flex flex-col min-w-0">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="font-montserrat font-bold text-gray-900 text-sm truncate">
+                                  {user.name}
+                                </span>
+                                {isOwner && (
+                                  <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold text-white bg-gradient-to-r from-[#FF0080] via-[#E10098] to-[#7928CA] shadow-2xs tracking-wider uppercase">
+                                    Propietario
+                                  </span>
+                                )}
+                              </div>
+                              
+                              <div className="flex items-center gap-2.5 mt-1 flex-wrap">
+                                {/* Purple toggle switch for Activo / Inactivo */}
+                                <button
+                                  type="button"
+                                  onClick={() => { if (handleToggleStoreUserStatus) handleToggleStoreUserStatus(user.id || user.email, user.is_active); }}
+                                  className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-hidden ${
+                                    user.is_active ? 'bg-[#7928CA]' : 'bg-gray-200'
+                                  }`}
+                                  title={user.is_active ? 'Desactivar operador' : 'Activar operador'}
+                                >
+                                  <span
+                                    className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
+                                      user.is_active ? 'translate-x-4' : 'translate-x-0'
+                                    }`}
+                                  />
+                                </button>
+                                <span className={`text-xs font-semibold ${user.is_active ? 'text-gray-700' : 'text-gray-400'}`}>
+                                  {user.is_active ? 'Activo' : 'Inactivo'}
+                                </span>
+                                <span className="text-[11px] text-gray-400 font-medium">
+                                  • {user.role}
+                                </span>
+                              </div>
+
+                              <span className="text-xs text-gray-400 font-medium truncate mt-0.5 font-mono">
+                                {user.email}
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Right: Actions (Permisos, Editar, Eliminar) */}
+                          <div className="flex items-center gap-1.5 shrink-0 self-end sm:self-center border-t sm:border-t-0 pt-2 sm:pt-0 border-gray-100">
+                            {/* Botón de Permisos granular */}
+                            <button
+                              onClick={() => { if (handleOpenPermissionsModal) handleOpenPermissionsModal(user); }}
+                              className="p-2 text-slate-400 hover:text-[#005da9] hover:bg-blue-50 rounded-full transition cursor-pointer"
+                              title="Configurar accesos y módulos"
+                            >
+                              <ShieldCheck className="w-4 h-4" />
+                            </button>
+                            {/* Botón Editar */}
+                            <button
+                              onClick={() => {
+                                if (setEditingUserId) setEditingUserId(user.id || user.email);
+                                if (setUserFormName) setUserFormName(user.name);
+                                if (setUserFormEmail) setUserFormEmail(user.email);
+                                if (setUserFormPassword) setUserFormPassword(user.password || '');
+                                if (setUserFormRole) setUserFormRole(user.role);
+                                if (setUserFormError) setUserFormError('');
+                                if (setShowUserModal) setShowUserModal(true);
+                              }}
+                              className="p-2 text-[#7928CA] hover:bg-[#7928CA]/10 rounded-full transition cursor-pointer"
+                              title="Editar operador / Propietario"
+                            >
+                              <Edit3 className="w-4 h-4 stroke-[2.2]" />
+                            </button>
+                            {/* Botón Eliminar */}
+                            <button
+                              onClick={() => { if (handleDeleteStoreUser) handleDeleteStoreUser(user.id || user.email, user.name, user.email); }}
+                              className="p-2 text-rose-500 hover:bg-rose-50 rounded-full transition cursor-pointer"
+                              title="Eliminar operador / Propietario"
+                            >
+                              <Trash2 className="w-4 h-4 stroke-[2.2]" />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+              )}
+
+              {/* Informative footer explaining segregation */}
+              <div className="p-4 bg-slate-50 border border-slate-200 rounded-2xl flex items-start gap-3 text-xs text-slate-600">
+                <ShieldCheck className="w-5 h-5 text-[#005da9] shrink-0 mt-0.5" />
+                <div>
+                  <strong className="text-slate-800 font-bold block mb-0.5 font-montserrat">Separación Estricta de Cuentas:</strong>
+                  <p className="text-[11px] leading-relaxed text-slate-500">
+                    Los usuarios de esta sección son los <strong>operadores internos</strong> de la tienda (registrados en la tabla <code className="bg-slate-200 px-1 py-0.5 rounded text-[10px]">store_users</code>). Al iniciar sesión, ingresan directamente al <strong>Panel Administrativo</strong> según sus permisos. Los clientes externos se registran de manera independiente en la tabla de clientes y no tienen acceso a la consola administrativa.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* TAB 1: MI CUENTA */}
           {configSubTab === 'mi_cuenta' && (
             <div className="space-y-6">
@@ -1409,17 +2127,18 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
                       }
                     });
                   }}
-                  className="px-5 py-2.5 bg-gray-200/80 hover:bg-gray-300 text-gray-700 font-bold text-xs rounded-xl transition-colors cursor-pointer"
+                  className="px-5 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-bold text-xs rounded-full transition shadow-2xs hover:shadow-xs cursor-pointer active:scale-98 flex items-center gap-1.5"
                 >
-                  Descartar
+                  <X className="w-4 h-4 text-[#005da9]" />
+                  <span>Descartar</span>
                 </button>
                 <button
                   type="button"
                   onClick={handleSaveAll}
                   disabled={isSavingBusiness}
-                  className="px-6 py-2.5 bg-[#005da9] hover:bg-[#004a87] text-white font-bold text-xs rounded-xl shadow-xs transition-colors flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                  className="px-6 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-bold text-xs rounded-full shadow-2xs hover:shadow-xs transition flex items-center gap-2 cursor-pointer disabled:opacity-50 active:scale-98"
                 >
-                  <Save className="w-4 h-4" />
+                  <Save className="w-4 h-4 text-[#005da9]" />
                   <span>{isSavingBusiness ? 'Guardando en Supabase...' : 'Guardar cambios'}</span>
                 </button>
               </div>
@@ -1531,463 +2250,384 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
           {/* TAB 3: FACTURACIÓN */}
           {configSubTab === 'facturacion' && (
             <div className="space-y-6">
-              <div className="border-b border-gray-100 pb-3">
-                <h4 className="text-sm font-black text-gray-800 uppercase tracking-wider">💳 Motor de Facturación, Impuestos y Monedas</h4>
-                <p className="text-xs text-gray-400">Configure los valores fiscales de la empresa, correlativos de comprobantes y gestione las tasas del BCV en tiempo real.</p>
-              </div>
+              {/* MONEDA PRINCIPAL CONTAINER */}
+              <div className="bg-white border border-slate-200 rounded-[16px] p-6 shadow-2xs">
+                {/* Header section with MONEDAS PRINCIPALES and + Nueva Moneda button */}
+                <div className="border-b border-slate-100 pb-4 mb-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-8 h-8 rounded-xl bg-[#103b6e]/10 text-[#103b6e] flex items-center justify-center font-bold">
+                      <Coins className="w-4 h-4 text-[#103b6e]" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-black text-slate-800 uppercase tracking-wider font-montserrat">MONEDAS PRINCIPALES</h3>
+                      <p className="text-[11px] text-gray-500 font-medium">Gestione las divisas del sistema, sus tasas de conversión respecto al Dólar (USD) y sincronización en tiempo real en Supabase.</p>
+                    </div>
+                  </div>
 
-              {/* 1. SELECCIÓN DE MONEDA PRINCIPAL DEL SISTEMA */}
-              <div className="p-5 bg-gradient-to-br from-[#005da9]/5 via-white to-sky-50/30 border border-[#005da9]/20 rounded-2xl space-y-4">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[#005da9]/10 pb-3">
-                  <div>
-                    <h5 className="text-xs font-black text-[#005da9] uppercase flex items-center gap-2 tracking-wide">
-                      <Coins className="w-4 h-4 text-[#005da9]" />
-                      <span>Moneda Principal de la Plataforma (Precios, Facturación y Pedidos)</span>
-                    </h5>
-                    <p className="text-[11px] text-gray-500 mt-0.5">
-                      Seleccione la divisa principal por defecto en la que se fijarán y mostrarán los precios del catálogo en línea, notas de entrega, facturas, tickets y pedidos.
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2 self-start sm:self-auto bg-white px-3 py-1.5 rounded-xl border border-gray-200 shadow-2xs">
-                    <span className="text-[10px] font-bold text-gray-500 uppercase">Activa:</span>
-                    <span className="text-xs font-black text-[#005da9] flex items-center gap-1">
-                      <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                      {CURRENCIES[facturacionMainCurrency]?.label || facturacionMainCurrency} ({CURRENCIES[facturacionMainCurrency]?.symbol})
-                    </span>
-                  </div>
+                  <button
+                    type="button"
+                    onClick={handleOpenCreateCurrency}
+                    className="px-3.5 py-2 bg-[#005da9] hover:bg-[#004a87] text-white text-xs font-black rounded-xl shadow-xs flex items-center gap-1.5 cursor-pointer transition self-start sm:self-auto shrink-0"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>+ Nueva Moneda</span>
+                  </button>
                 </div>
 
+                {/* Success feedback alerts */}
+                {currencyActionSuccess && (
+                  <div className="p-3 mb-4 text-xs font-bold rounded-xl flex items-center gap-2 bg-emerald-50 text-emerald-700 border border-emerald-200 animate-fadeIn">
+                    <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600" />
+                    <span>{currencyActionSuccess}</span>
+                  </div>
+                )}
+
                 {mainCurrencySuccessMsg && (
-                  <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold rounded-xl flex items-center gap-2 animate-fadeIn">
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <div className="p-3 mb-4 text-xs font-bold rounded-xl flex items-center gap-2 bg-blue-50 text-blue-700 border border-blue-200 animate-fadeIn">
+                    <CheckCircle2 className="w-4 h-4 shrink-0 text-blue-600" />
                     <span>{mainCurrencySuccessMsg}</span>
                   </div>
                 )}
 
-                {/* Tarjetas de Selección Interactiva de Moneda Principal */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 pt-1">
-                  {(['USD', 'VES', 'EUR', 'COP'] as CurrencyCode[]).map((code) => {
-                    const cfg = CURRENCIES[code];
-                    const isSelected = facturacionMainCurrency === code;
-                    const samplePrice = formatCurrency(25, code, currencyRates);
-
-                    return (
-                      <div
-                        key={code}
-                        onClick={() => handleSelectMainCurrency(code)}
-                        className={`p-3.5 rounded-xl border-2 transition-all cursor-pointer relative flex flex-col justify-between select-none ${
-                          isSelected
-                            ? 'bg-blue-50/70 border-[#005da9] shadow-sm ring-2 ring-[#005da9]/20'
-                            : 'bg-white border-gray-200 hover:border-gray-300 hover:bg-gray-50/80'
-                        }`}
+                <div className="space-y-6">
+                  {/* Selector de Moneda Activa Principal */}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 bg-slate-50 border border-slate-200 rounded-2xl">
+                    <div>
+                      <span className="text-xs font-black text-slate-800 uppercase tracking-tight block font-montserrat">DIVISA PRINCIPAL DE FACTURACIÓN Y CATÁLOGO</span>
+                      <span className="text-[11px] text-slate-500 font-medium">Define la moneda activa en la que operan por defecto el POS, la tienda online y los reportes.</span>
+                    </div>
+                    
+                    <div className="relative shrink-0">
+                      <select 
+                        value={facturacionMainCurrency}
+                        onChange={(e) => handleSelectMainCurrency(e.target.value)}
+                        className="px-4 py-2 bg-white border border-slate-300 text-slate-800 text-xs font-bold rounded-xl cursor-pointer focus:outline-hidden uppercase tracking-wider font-montserrat shadow-2xs"
                       >
-                        <div className="flex items-start justify-between gap-2 mb-2">
-                          <div className="flex items-center gap-2">
-                            <span className="text-xl">
-                              {code === 'USD' ? '🇺🇸' : code === 'VES' ? '🇻🇪' : code === 'EUR' ? '🇪🇺' : '🇨🇴'}
-                            </span>
-                            <div>
-                              <span className="text-xs font-black text-gray-900 block leading-tight">{cfg.label}</span>
-                              <span className="text-[10px] font-bold text-gray-400 font-mono">Símbolo: {cfg.symbol}</span>
-                            </div>
-                          </div>
-                          <div className={`w-4 h-4 rounded-full border flex items-center justify-center ${
-                            isSelected ? 'bg-[#005da9] border-[#005da9] text-white' : 'border-gray-300 bg-white'
-                          }`}>
-                            {isSelected && <Check className="w-2.5 h-2.5 stroke-[3]" />}
-                          </div>
-                        </div>
+                        {systemCurrencies.map(c => (
+                          <option key={c.code} value={c.code}>
+                            ACTIVA: {c.name} ({c.symbol})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
 
-                        <div className="pt-2 border-t border-gray-100 flex items-center justify-between">
-                          <span className="text-[10px] text-gray-500 font-medium">Ejemplo $25:</span>
-                          <span className={`text-xs font-black font-mono ${isSelected ? 'text-[#005da9]' : 'text-gray-700'}`}>
-                            {samplePrice}
-                          </span>
-                        </div>
+                  {/* List of Main Currencies with Action Buttons: Modificar, Eliminar, Guardar */}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-black text-slate-700 uppercase tracking-wider font-montserrat">
+                        LISTADO DE MONEDAS CONFIGURADAS ({systemCurrencies.length})
+                      </span>
+                    </div>
 
-                        {isSelected && (
-                          <div className="mt-2 text-center bg-emerald-100 text-emerald-800 text-[9px] font-black uppercase py-0.5 rounded-md tracking-wider">
-                            ✓ Moneda Principal Activa
-                          </div>
-                        )}
+                    {loadingCurrencies ? (
+                      <div className="p-8 text-center bg-slate-50 rounded-2xl border border-slate-200 text-xs text-slate-500 font-bold">
+                        <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2 text-[#005da9]" />
+                        <span>Cargando monedas desde Supabase...</span>
                       </div>
-                    );
-                  })}
+                    ) : (
+                      <div className="grid grid-cols-1 gap-3">
+                        {systemCurrencies.map(curr => {
+                          const isMain = facturacionMainCurrency === curr.code;
+                          const isUSD = curr.code === 'USD';
+                          const status = rateSavingStatus[curr.code];
+
+                          return (
+                            <div 
+                              key={curr.code}
+                              className={`p-4 rounded-2xl border transition-all flex flex-col md:flex-row md:items-center justify-between gap-4 ${
+                                isMain 
+                                  ? 'bg-blue-50/40 border-blue-200 shadow-xs' 
+                                  : 'bg-white border-slate-200 hover:border-slate-300'
+                              }`}
+                            >
+                              {/* Left: Flag Tag & Details */}
+                              <div className="flex items-center gap-3.5 min-w-[220px]">
+                                <span className="bg-[#103b6e]/10 text-[#103b6e] px-3 py-2 font-black text-xs rounded-xl min-w-[46px] text-center font-montserrat shrink-0 border border-[#103b6e]/20">
+                                  {curr.country_code || curr.code.slice(0, 2)}
+                                </span>
+                                <div>
+                                  <div className="flex items-center gap-2">
+                                    <h6 className="text-xs font-black text-slate-900 font-montserrat">
+                                      {curr.name}
+                                    </h6>
+                                    {isMain && (
+                                      <span className="px-2 py-0.5 bg-[#005da9] text-white text-[9px] font-black rounded-full uppercase tracking-wider">
+                                        Principal
+                                      </span>
+                                    )}
+                                    {!curr.is_active && (
+                                      <span className="px-2 py-0.5 bg-gray-100 text-gray-500 text-[9px] font-bold rounded-full uppercase">
+                                        Inactiva
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Center: Rate Input */}
+                              <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                                <div className="flex items-center bg-white border border-slate-200 rounded-xl overflow-hidden shadow-2xs">
+                                  <span className="bg-slate-100 text-slate-600 px-3 py-2 font-bold text-[11px] select-none border-r border-slate-200 whitespace-nowrap">
+                                    1 USD =
+                                  </span>
+                                  <input
+                                    type="text"
+                                    value={manualRates[curr.code] ?? curr.rate.toString()}
+                                    onChange={(e) => setManualRates(prev => ({ ...prev, [curr.code]: e.target.value }))}
+                                    disabled={isUSD}
+                                    className="px-3 py-2 bg-transparent text-xs font-mono font-bold text-slate-800 focus:outline-hidden w-28 text-right disabled:bg-slate-50 disabled:text-slate-400"
+                                  />
+                                  <span className="bg-slate-50 text-slate-500 px-2.5 py-2 font-bold text-[11px] select-none border-l border-slate-200">
+                                    {curr.symbol}
+                                  </span>
+                                </div>
+
+                                {curr.code === 'VES' && (
+                                  <button
+                                    type="button"
+                                    onClick={handleFetchLiveBCVRate}
+                                    disabled={isFetchingLiveBCV}
+                                    className="px-2.5 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-[11px] font-bold rounded-xl border border-emerald-200 transition cursor-pointer flex items-center gap-1 shrink-0"
+                                    title="Consultar tasa oficial en vivo desde el portal BCV / DolarAPI"
+                                  >
+                                    <RefreshCw className={`w-3.5 h-3.5 ${isFetchingLiveBCV ? 'animate-spin' : ''}`} />
+                                    <span>Tasa BCV en Vivo</span>
+                                  </button>
+                                )}
+                              </div>
+
+                              {/* Right: Action Buttons (Guardar, Modificar, Eliminar) */}
+                              <div className="flex items-center gap-2 self-end md:self-center shrink-0">
+                                {/* Botón Guardar Tasa */}
+                                <button
+                                  type="button"
+                                  onClick={() => handleSaveManualRate(curr.code)}
+                                  disabled={status?.loading || isUSD}
+                                  className="px-3 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-bold rounded-xl shadow-2xs transition flex items-center gap-1.5 cursor-pointer"
+                                  title="Guardar tasa de cambio en Supabase"
+                                >
+                                  {status?.loading ? (
+                                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                  ) : (
+                                    <Save className="w-3.5 h-3.5" />
+                                  )}
+                                  <span>Guardar</span>
+                                </button>
+
+                                {/* Botón Modificar Moneda */}
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenEditCurrency(curr)}
+                                  className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl transition flex items-center gap-1.5 cursor-pointer border border-slate-200"
+                                  title="Modificar propiedades de la moneda"
+                                >
+                                  <Edit2 className="w-3.5 h-3.5 text-slate-600" />
+                                  <span>Modificar</span>
+                                </button>
+
+                                {/* Botón Eliminar Moneda */}
+                                <button
+                                  type="button"
+                                  onClick={() => setCurrencyToDelete(curr)}
+                                  disabled={isUSD}
+                                  className={`p-2 rounded-xl transition flex items-center justify-center ${
+                                    isUSD 
+                                      ? 'text-gray-300 bg-gray-50 cursor-not-allowed' 
+                                      : 'text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 cursor-pointer'
+                                  }`}
+                                  title={isUSD ? 'El Dólar (USD) es la moneda base del sistema y no puede eliminarse' : 'Eliminar moneda de Supabase'}
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+
+                              {/* Status notification per currency if present */}
+                              {status?.message && (
+                                <div className={`w-full text-left md:col-span-3 text-[11px] font-bold p-2 rounded-lg ${
+                                  status.message.type === 'success' 
+                                    ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' 
+                                    : 'bg-rose-50 text-rose-800 border border-rose-200'
+                                }`}>
+                                  {status.message.text}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
 
-              {/* 2. GESTIÓN Y ACTUALIZACIÓN MANUAL DE TASAS DE CAMBIO */}
-              <div className="p-5 bg-white border border-gray-200 rounded-2xl space-y-4 shadow-2xs">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-gray-100 pb-3">
-                  <div>
-                    <h5 className="text-xs font-black text-gray-800 uppercase flex items-center gap-2 tracking-wide">
-                      <Banknote className="w-4 h-4 text-emerald-600" />
-                      <span>Actualización Manual de Tasas de Cambio del Sistema</span>
-                    </h5>
-                    <p className="text-[11px] text-gray-500 mt-0.5">
-                      Fije manualmente o consulte en vivo las tasas de conversión para cada divisa con respecto a $1.00 USD (Moneda Base).
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={handleFetchLiveBCVRate}
-                    disabled={isFetchingLiveBCV}
-                    className="px-3 py-1.5 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer self-start sm:self-auto"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isFetchingLiveBCV ? 'animate-spin' : ''}`} />
-                    <span>{isFetchingLiveBCV ? 'Consultando BCV...' : 'Consultar BCV Online (DolarAPI)'}</span>
-                  </button>
-                </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  {/* CARD 1: BOLÍVARES (VES / BCV) */}
-                  <div className="p-4 rounded-xl border border-gray-200 bg-gray-50/50 flex flex-col justify-between space-y-3">
+
+              {/* TAXES MANAGEMENT */}
+              <div className="card-minimalist bg-white border border-slate-200 rounded-[16px] p-6 mb-5 shadow-2xs">
+                <div className="border-b border-slate-100 pb-4 mb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-8 h-8 rounded-xl bg-[#103b6e]/10 text-[#103b6e] flex items-center justify-center font-bold">
+                      <Percent className="w-4 h-4 text-[#103b6e]" />
+                    </div>
                     <div>
-                      <div className="flex items-center justify-between gap-2 mb-1.5">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-base">🇻🇪</span>
-                          <span className="text-xs font-black text-gray-900">Bolívar Venezolano (VES)</span>
-                        </div>
-                        <span className="text-[10px] font-black px-2 py-0.5 bg-blue-100 text-blue-800 rounded-md font-mono">
-                          Bs. {(currencyRates.VES || 45.5).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
-                        </span>
-                      </div>
-                      <p className="text-[10px] text-gray-500 font-medium">
-                        Tasa Oficial BCV utilizada en comprobantes, ventas flash y pedidos digitales.
-                      </p>
-                    </div>
-
-                    <div className="space-y-2">
-                      <label className="block text-[10px] font-black text-gray-600 uppercase">Tasa Manual (Bs. por 1 USD)</label>
-                      <div className="relative">
-                        <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                          <span className="text-gray-400 font-extrabold text-xs">Bs.</span>
-                        </div>
-                        <input
-                          type="text"
-                          value={manualRates.VES}
-                          onChange={(e) => setManualRates(prev => ({ ...prev, VES: e.target.value }))}
-                          placeholder="Ej: 45.50"
-                          className="w-full pl-9 pr-3 py-2 bg-white border border-gray-300 rounded-xl text-xs font-bold font-mono focus:ring-2 focus:ring-[#005da9] focus:outline-hidden"
-                        />
-                      </div>
-
-                      <div className="flex items-center gap-2 pt-1">
-                        <button
-                          type="button"
-                          onClick={() => handleSaveManualRate('VES')}
-                          disabled={rateSavingStatus.VES?.loading}
-                          className="flex-1 py-2 px-3 bg-[#005da9] hover:bg-[#004a87] text-white text-xs font-black rounded-xl transition flex items-center justify-center gap-1.5 shadow-2xs cursor-pointer disabled:opacity-50"
-                        >
-                          {rateSavingStatus.VES?.loading ? (
-                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                          ) : (
-                            <Save className="w-3.5 h-3.5" />
-                          )}
-                          <span>Guardar Tasa</span>
-                        </button>
-                      </div>
-
-                      {rateSavingStatus.VES?.message && (
-                        <div className={`p-2 text-[10px] font-bold rounded-lg ${
-                          rateSavingStatus.VES.message.type === 'success' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-rose-50 text-rose-800 border border-rose-200'
-                        }`}>
-                          {rateSavingStatus.VES.message.text}
-                        </div>
-                      )}
+                      <h3 className="text-sm font-black text-slate-800 uppercase tracking-wider font-montserrat">GESTIÓN DE IMPUESTOS</h3>
+                      <p className="text-[11px] text-gray-500 font-medium">Configure, modifique y elimine las tasas impositivas del sistema (IVA, IGTF, Reducido, etc.).</p>
                     </div>
                   </div>
-
-                  {/* CARD 2: EURO (EUR) */}
-                  <div className="p-4 rounded-xl border border-gray-200 bg-gray-50/50 flex flex-col justify-between space-y-3">
-                    <div>
-                      <div className="flex items-center justify-between gap-2 mb-1.5">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-base">🇪🇺</span>
-                          <span className="text-xs font-black text-gray-900">Euro (EUR)</span>
-                        </div>
-                        <span className="text-[10px] font-black px-2 py-0.5 bg-indigo-100 text-indigo-800 rounded-md font-mono">
-                          € {(currencyRates.EUR || 0.92).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
-                        </span>
-                      </div>
-                      <p className="text-[10px] text-gray-500 font-medium">
-                        Tasa de conversión para transacciones y pagos en Euros.
-                      </p>
-                    </div>
-
-                    <div className="space-y-2">
-                      <label className="block text-[10px] font-black text-gray-600 uppercase">Tasa Manual (€ por 1 USD)</label>
-                      <div className="relative">
-                        <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                          <span className="text-gray-400 font-extrabold text-xs">€</span>
-                        </div>
-                        <input
-                          type="text"
-                          value={manualRates.EUR}
-                          onChange={(e) => setManualRates(prev => ({ ...prev, EUR: e.target.value }))}
-                          placeholder="Ej: 0.92"
-                          className="w-full pl-9 pr-3 py-2 bg-white border border-gray-300 rounded-xl text-xs font-bold font-mono focus:ring-2 focus:ring-[#005da9] focus:outline-hidden"
-                        />
-                      </div>
-
-                      <div className="flex items-center gap-2 pt-1">
-                        <button
-                          type="button"
-                          onClick={() => handleSaveManualRate('EUR')}
-                          disabled={rateSavingStatus.EUR?.loading}
-                          className="flex-1 py-2 px-3 bg-[#005da9] hover:bg-[#004a87] text-white text-xs font-black rounded-xl transition flex items-center justify-center gap-1.5 shadow-2xs cursor-pointer disabled:opacity-50"
-                        >
-                          {rateSavingStatus.EUR?.loading ? (
-                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                          ) : (
-                            <Save className="w-3.5 h-3.5" />
-                          )}
-                          <span>Guardar Tasa</span>
-                        </button>
-                      </div>
-
-                      {rateSavingStatus.EUR?.message && (
-                        <div className={`p-2 text-[10px] font-bold rounded-lg ${
-                          rateSavingStatus.EUR.message.type === 'success' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-rose-50 text-rose-800 border border-rose-200'
-                        }`}>
-                          {rateSavingStatus.EUR.message.text}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* CARD 3: PESO COLOMBIANO (COP) */}
-                  <div className="p-4 rounded-xl border border-gray-200 bg-gray-50/50 flex flex-col justify-between space-y-3">
-                    <div>
-                      <div className="flex items-center justify-between gap-2 mb-1.5">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-base">🇨🇴</span>
-                          <span className="text-xs font-black text-gray-900">Peso Colombiano (COP)</span>
-                        </div>
-                        <span className="text-[10px] font-black px-2 py-0.5 bg-amber-100 text-amber-800 rounded-md font-mono">
-                          COP$ {(currencyRates.COP || 4100).toLocaleString('es-VE', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}
-                        </span>
-                      </div>
-                      <p className="text-[10px] text-gray-500 font-medium">
-                        Tasa de conversión para operaciones en Pesos Colombianos.
-                      </p>
-                    </div>
-
-                    <div className="space-y-2">
-                      <label className="block text-[10px] font-black text-gray-600 uppercase">Tasa Manual (COP por 1 USD)</label>
-                      <div className="relative">
-                        <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                          <span className="text-gray-400 font-extrabold text-[10px]">COP</span>
-                        </div>
-                        <input
-                          type="text"
-                          value={manualRates.COP}
-                          onChange={(e) => setManualRates(prev => ({ ...prev, COP: e.target.value }))}
-                          placeholder="Ej: 4100"
-                          className="w-full pl-11 pr-3 py-2 bg-white border border-gray-300 rounded-xl text-xs font-bold font-mono focus:ring-2 focus:ring-[#005da9] focus:outline-hidden"
-                        />
-                      </div>
-
-                      <div className="flex items-center gap-2 pt-1">
-                        <button
-                          type="button"
-                          onClick={() => handleSaveManualRate('COP')}
-                          disabled={rateSavingStatus.COP?.loading}
-                          className="flex-1 py-2 px-3 bg-[#005da9] hover:bg-[#004a87] text-white text-xs font-black rounded-xl transition flex items-center justify-center gap-1.5 shadow-2xs cursor-pointer disabled:opacity-50"
-                        >
-                          {rateSavingStatus.COP?.loading ? (
-                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                          ) : (
-                            <Save className="w-3.5 h-3.5" />
-                          )}
-                          <span>Guardar Tasa</span>
-                        </button>
-                      </div>
-
-                      {rateSavingStatus.COP?.message && (
-                        <div className={`p-2 text-[10px] font-bold rounded-lg ${
-                          rateSavingStatus.COP.message.type === 'success' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-rose-50 text-rose-800 border border-rose-200'
-                        }`}>
-                          {rateSavingStatus.COP.message.text}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                {/* TABLA RESUMEN DE CONVERSIÓN EN TIEMPO REAL */}
-                <div className="mt-4 pt-4 border-t border-gray-100">
-                  <span className="text-[11px] font-black text-gray-700 uppercase tracking-wide block mb-2">
-                    Resumen de Equivalencias del Sistema (Base: 1.00 USD)
+                  <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-slate-100 text-slate-700 border border-slate-200 self-start sm:self-auto">
+                    {adminTaxes.length} impuesto(s) configurado(s)
                   </span>
-                  <div className="overflow-x-auto rounded-xl border border-gray-200">
-                    <table className="w-full text-left text-xs">
-                      <thead className="bg-gray-50 text-gray-500 font-bold uppercase text-[10px]">
-                        <tr>
-                          <th className="px-3 py-2">Moneda</th>
-                          <th className="px-3 py-2">Código</th>
-                          <th className="px-3 py-2">Símbolo</th>
-                          <th className="px-3 py-2">Tasa / 1 USD</th>
-                          <th className="px-3 py-2">Ejemplo ($50 USD)</th>
-                          <th className="px-3 py-2 text-right">Rol</th>
+                </div>
+
+                <div className="space-y-4">
+                  {taxMessage && (
+                    <div className={`p-3 text-xs font-bold rounded-xl flex items-center justify-between gap-2 animate-fadeIn ${
+                      taxMessage.type === 'success' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-rose-50 text-rose-800 border border-rose-200'
+                    }`}>
+                      <div className="flex items-center gap-2">
+                        {taxMessage.type === 'success' ? (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                        ) : (
+                          <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                        )}
+                        <span>{taxMessage.text}</span>
+                      </div>
+                      <button 
+                        type="button" 
+                        onClick={() => setTaxMessage(null)}
+                        className="text-gray-400 hover:text-gray-600 p-0.5 cursor-pointer"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
+
+                  <form onSubmit={handleAddTax} className="flex flex-col sm:flex-row items-stretch gap-3 bg-slate-50/70 p-3.5 rounded-2xl border border-slate-150">
+                    <div className="flex-1">
+                      <label className="block text-[10px] font-black text-slate-500 uppercase tracking-wider mb-1 font-montserrat">
+                        Nombre del Impuesto *
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="Ej: IVA Reducido, IVA General, etc."
+                        value={newTaxName}
+                        onChange={(e) => setNewTaxName(e.target.value)}
+                        className="w-full p-2.5 bg-white border border-slate-200 rounded-xl text-xs font-bold text-slate-800 outline-none focus:border-[#103b6e] transition shadow-xs"
+                      />
+                    </div>
+                    <div className="w-full sm:w-36">
+                      <label className="block text-[10px] font-black text-slate-500 uppercase tracking-wider mb-1 font-montserrat">
+                        Tasa (%) *
+                      </label>
+                      <div className="relative">
+                        <input
+                          type="number"
+                          step="any"
+                          min="0"
+                          placeholder="Ej: 16"
+                          value={newTaxRate}
+                          onChange={(e) => setNewTaxRate(e.target.value)}
+                          className="w-full p-2.5 pr-7 bg-white border border-slate-200 rounded-xl text-xs font-bold text-slate-800 outline-none focus:border-[#103b6e] transition shadow-xs font-mono"
+                        />
+                        <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400 font-mono">%</span>
+                      </div>
+                    </div>
+                    <div className="flex items-end">
+                      <button
+                        type="submit"
+                        className="w-full sm:w-auto h-[38px] px-5 bg-linear-to-r from-[#103b6e] via-[#2052a0] to-[#7835d6] text-white font-montserrat font-bold text-xs rounded-xl shadow-xs hover:opacity-95 active:scale-98 transition flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+                      >
+                        <Plus className="w-4 h-4" />
+                        <span>Agregar Impuesto</span>
+                      </button>
+                    </div>
+                  </form>
+
+                  <div className="border border-slate-150 rounded-2xl overflow-hidden bg-white shadow-2xs">
+                    <table className="w-full text-left text-xs border-collapse">
+                      <thead>
+                        <tr className="bg-slate-50 border-b border-slate-150 text-[10px] font-black uppercase text-slate-400 tracking-wider font-montserrat">
+                          <th className="px-4 py-3.5">Impuesto</th>
+                          <th className="px-4 py-3.5 text-center">Porcentaje (%)</th>
+                          <th className="px-4 py-3.5 text-center">Estado</th>
+                          <th className="px-4 py-3.5 text-right">Acciones</th>
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-gray-100 bg-white">
-                        <tr>
-                          <td className="px-3 py-2 font-bold text-gray-900 flex items-center gap-1.5">
-                            <span>🇺🇸</span> Dólar Americano
-                          </td>
-                          <td className="px-3 py-2 font-mono font-bold text-gray-600">USD</td>
-                          <td className="px-3 py-2 font-mono font-bold text-gray-900">$</td>
-                          <td className="px-3 py-2 font-mono font-black text-gray-900">1.0000</td>
-                          <td className="px-3 py-2 font-mono font-bold text-emerald-600">$ 50.00</td>
-                          <td className="px-3 py-2 text-right">
-                            <span className="px-2 py-0.5 bg-gray-100 text-gray-700 rounded-md font-bold text-[10px]">
-                              Base Global
-                            </span>
-                          </td>
-                        </tr>
-                        <tr>
-                          <td className="px-3 py-2 font-bold text-gray-900 flex items-center gap-1.5">
-                            <span>🇻🇪</span> Bolívar Venezolano
-                          </td>
-                          <td className="px-3 py-2 font-mono font-bold text-gray-600">VES</td>
-                          <td className="px-3 py-2 font-mono font-bold text-gray-900">Bs.</td>
-                          <td className="px-3 py-2 font-mono font-black text-blue-600">
-                            {(currencyRates.VES || 45.5).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
-                          </td>
-                          <td className="px-3 py-2 font-mono font-bold text-blue-700">
-                            Bs. {(50 * (currencyRates.VES || 45.5)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                          </td>
-                          <td className="px-3 py-2 text-right">
-                            <span className="px-2 py-0.5 bg-blue-50 text-blue-700 rounded-md font-bold text-[10px]">
-                              Oficial BCV
-                            </span>
-                          </td>
-                        </tr>
-                        <tr>
-                          <td className="px-3 py-2 font-bold text-gray-900 flex items-center gap-1.5">
-                            <span>🇪🇺</span> Euro
-                          </td>
-                          <td className="px-3 py-2 font-mono font-bold text-gray-600">EUR</td>
-                          <td className="px-3 py-2 font-mono font-bold text-gray-900">€</td>
-                          <td className="px-3 py-2 font-mono font-black text-indigo-600">
-                            {(currencyRates.EUR || 0.92).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
-                          </td>
-                          <td className="px-3 py-2 font-mono font-bold text-indigo-700">
-                            {(50 * (currencyRates.EUR || 0.92)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €
-                          </td>
-                          <td className="px-3 py-2 text-right">
-                            <span className="px-2 py-0.5 bg-indigo-50 text-indigo-700 rounded-md font-bold text-[10px]">
-                              Divisa
-                            </span>
-                          </td>
-                        </tr>
-                        <tr>
-                          <td className="px-3 py-2 font-bold text-gray-900 flex items-center gap-1.5">
-                            <span>🇨🇴</span> Peso Colombiano
-                          </td>
-                          <td className="px-3 py-2 font-mono font-bold text-gray-600">COP</td>
-                          <td className="px-3 py-2 font-mono font-bold text-gray-900">COP$</td>
-                          <td className="px-3 py-2 font-mono font-black text-amber-600">
-                            {(currencyRates.COP || 4100).toLocaleString('es-VE', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}
-                          </td>
-                          <td className="px-3 py-2 font-mono font-bold text-amber-700">
-                            COP$ {(50 * (currencyRates.COP || 4100)).toLocaleString('es-VE', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
-                          </td>
-                          <td className="px-3 py-2 text-right">
-                            <span className="px-2 py-0.5 bg-amber-50 text-amber-700 rounded-md font-bold text-[10px]">
-                              Divisa
-                            </span>
-                          </td>
-                        </tr>
+                      <tbody className="divide-y divide-slate-100">
+                        {adminTaxes.length === 0 ? (
+                          <tr>
+                            <td colSpan={4} className="px-4 py-8 text-center text-slate-400 font-medium text-xs">
+                              No hay tasas de impuestos configuradas actualmente. Agregue una nueva arriba.
+                            </td>
+                          </tr>
+                        ) : (
+                          adminTaxes.map(tax => (
+                            <tr key={tax.id} className="hover:bg-slate-50/70 transition">
+                              <td className="px-4 py-3.5">
+                                <div className="flex items-center gap-2">
+                                  <div className="w-6 h-6 rounded-lg bg-blue-50 text-[#103b6e] flex items-center justify-center shrink-0">
+                                    <Percent className="w-3 h-3" />
+                                  </div>
+                                  <span className="font-bold text-slate-800 font-montserrat">{tax.name}</span>
+                                </div>
+                              </td>
+                              <td className="px-4 py-3.5 text-center">
+                                <span className="font-mono font-bold text-slate-800 bg-slate-100 px-2.5 py-1 rounded-lg text-xs border border-slate-200">
+                                  {tax.rate}%
+                                </span>
+                              </td>
+                              <td className="px-4 py-3.5 text-center">
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggleTax(tax)}
+                                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider font-montserrat transition cursor-pointer ${
+                                    tax.is_active 
+                                      ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100' 
+                                      : 'bg-slate-100 text-slate-400 border border-slate-200 hover:bg-slate-200'
+                                  }`}
+                                  title={tax.is_active ? 'Haga clic para desactivar' : 'Haga clic para activar'}
+                                >
+                                  <span className={`w-1.5 h-1.5 rounded-full ${tax.is_active ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+                                  <span>{tax.is_active ? 'Vigente' : 'Inactivo'}</span>
+                                </button>
+                              </td>
+                              <td className="px-4 py-3.5 text-right">
+                                <div className="flex items-center justify-end gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => setEditingTax({ ...tax })}
+                                    className="px-2.5 py-1.5 bg-blue-50 hover:bg-blue-100 text-[#005da9] text-[11px] font-bold rounded-lg transition cursor-pointer flex items-center gap-1 active:scale-95"
+                                    title="Modificar nombre, porcentaje o estado"
+                                  >
+                                    <Edit3 className="w-3.5 h-3.5" />
+                                    <span>Modificar</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setTaxToDelete(tax)}
+                                    className="px-2.5 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 text-[11px] font-bold rounded-lg transition cursor-pointer flex items-center gap-1 active:scale-95"
+                                    title="Eliminar impuesto"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                    <span>Eliminar</span>
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          ))
+                        )}
                       </tbody>
                     </table>
                   </div>
                 </div>
               </div>
 
-              {/* TAXES MANAGEMENT */}
-              <div className="space-y-4">
-                <span className="text-xs font-black text-gray-800 uppercase block">Gestión de Impuestos Vigentes</span>
-                
-                {taxMessage && (
-                  <div className={`p-3 text-xs font-bold rounded-lg flex items-center gap-2 ${
-                    taxMessage.type === 'success' ? 'bg-emerald-50 text-emerald-800' : 'bg-rose-50 text-rose-800'
-                  }`}>
-                    <span>{taxMessage.text}</span>
-                  </div>
-                )}
-
-                <form onSubmit={handleAddTax} className="grid grid-cols-1 md:grid-cols-3 gap-3 bg-gray-50 p-3.5 rounded-xl border border-gray-200">
-                  <input
-                    type="text"
-                    placeholder="Nombre del Impuesto (ej: IVA Reducido)"
-                    value={newTaxName}
-                    onChange={(e) => setNewTaxName(e.target.value)}
-                    className="p-2.5 bg-white border border-gray-200 rounded-lg text-xs font-bold"
-                  />
-                  <input
-                    type="text"
-                    placeholder="Porcentaje (ej: 8)"
-                    value={newTaxRate}
-                    onChange={(e) => setNewTaxRate(e.target.value)}
-                    className="p-2.5 bg-white border border-gray-200 rounded-lg text-xs font-bold"
-                  />
-                  <button
-                    type="submit"
-                    className="bg-[#005da9] hover:bg-[#004a87] text-white rounded-lg text-xs font-black cursor-pointer flex items-center justify-center gap-1"
-                  >
-                    <Plus className="w-4 h-4" />
-                    <span>Agregar Impuesto</span>
-                  </button>
-                </form>
-
-                <div className="border border-gray-150 rounded-2xl overflow-hidden bg-white shadow-3xs">
-                  <table className="w-full text-left text-xs border-collapse">
-                    <thead>
-                      <tr className="bg-gray-50 border-b border-gray-150 text-[10px] font-black uppercase text-gray-400">
-                        <th className="px-4 py-2.5">Impuesto</th>
-                        <th className="px-4 py-2.5 text-center">Porcentaje (%)</th>
-                        <th className="px-4 py-2.5 text-center">Estado</th>
-                        <th className="px-4 py-2.5 text-right">Acción</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-gray-100">
-                      {adminTaxes.map(tax => (
-                        <tr key={tax.id}>
-                          <td className="px-4 py-3 font-bold text-gray-800">{tax.name}</td>
-                          <td className="px-4 py-3 text-center font-mono font-bold">{tax.rate}%</td>
-                          <td className="px-4 py-3 text-center">
-                            <span className={`px-2 py-0.5 rounded-full text-[9px] font-black ${
-                              tax.is_active ? 'bg-emerald-50 text-emerald-700' : 'bg-gray-100 text-gray-400'
-                            }`}>
-                              {tax.is_active ? 'Vigente' : 'Inactivo'}
-                            </span>
-                          </td>
-                          <td className="px-4 py-3 text-right">
-                            <button
-                              type="button"
-                              onClick={() => handleToggleTax(tax)}
-                              className={`text-xs font-bold ${
-                                tax.is_active ? 'text-gray-400 hover:text-gray-600' : 'text-[#005da9] hover:text-[#004a87]'
-                              } cursor-pointer`}
-                            >
-                              {tax.is_active ? 'Desactivar' : 'Habilitar'}
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
               {/* 💳 GESTIÓN DE MÉTODOS DE PAGO */}
-              <div className="space-y-4 pt-4 border-t border-gray-150">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="card-minimalist bg-white border border-slate-200 rounded-[16px] p-6 mb-5 shadow-2xs">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
                   <div>
-                    <span className="text-xs font-black text-gray-800 uppercase flex items-center gap-1.5">
+                    <span className="text-xs font-black text-gray-800 uppercase flex items-center gap-1.5 font-montserrat">
                       <CreditCard className="w-4 h-4 text-[#005da9]" />
                       <span>Configuración de Métodos de Pago</span>
                     </span>
@@ -1998,7 +2638,20 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
                   <button
                     type="button"
                     onClick={handleOpenAddPaymentMethod}
-                    className="px-4 py-2 bg-[#005da9] hover:bg-[#004a87] text-white text-xs font-bold rounded-xl flex items-center justify-center gap-1.5 shadow-xs transition cursor-pointer shrink-0"
+                    className="btn-guardar flex items-center justify-center gap-2"
+                    style={{
+                      background: 'linear-gradient(90deg, #103b6e 0%, #2052a0 50%, #7835d6 100%)',
+                      color: '#ffffff',
+                      fontWeight: 700,
+                      borderRadius: '9999px',
+                      padding: '12px 32px',
+                      border: 'none',
+                      cursor: 'pointer',
+                      textTransform: 'uppercase',
+                      fontSize: '14px',
+                      boxShadow: '0px 4px 10px rgba(0, 0, 0, 0.15)',
+                      transition: 'transform 0.2s ease, opacity 0.2s ease'
+                    }}
                   >
                     <Plus className="w-4 h-4" />
                     <span>Incorporar Método</span>
@@ -2170,11 +2823,6 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
           {/* TAB 4: INVENTARIO */}
           {configSubTab === 'inventario' && (
             <div className="space-y-6">
-              <div className="border-b border-gray-100 pb-3">
-                <h4 className="text-sm font-black text-gray-800 uppercase tracking-wider">📦 Control de Stock y Catálogo Virtual</h4>
-                <p className="text-xs text-gray-400">Personalice los umbrales de reabastecimiento, bloquee de ventas sin stock y edite la vitrina digital externa.</p>
-              </div>
-
               {/* PARAMETERS */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
@@ -2206,90 +2854,6 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
                     }`} />
                   </button>
                 </div>
-              </div>
-
-              {/* ADVERTISING MODULE INTEGRATION */}
-              <div className="pt-4 border-t border-gray-100 space-y-4">
-                <h5 className="text-xs font-extrabold text-gray-800 uppercase flex items-center gap-1.5">
-                  <Megaphone className="w-4 h-4 text-[#FF9900]" />
-                  <span>Vitrinas de Publicidad (Landing & Banners)</span>
-                </h5>
-
-                <div className="flex gap-2 p-1.5 bg-gray-100 rounded-xl border border-gray-200">
-                  <button
-                    onClick={() => setAdSubTab('landing')}
-                    className={`flex-1 py-2 text-center text-xs font-black rounded-lg transition ${
-                      adSubTab === 'landing' ? 'bg-[#005da9] text-white' : 'text-gray-600 hover:text-gray-800'
-                    }`}
-                  >
-                    Editar Landing Page
-                  </button>
-                  <button
-                    onClick={() => setAdSubTab('banner')}
-                    className={`flex-1 py-2 text-center text-xs font-black rounded-lg transition ${
-                      adSubTab === 'banner' ? 'bg-[#005da9] text-white' : 'text-gray-600 hover:text-gray-800'
-                    }`}
-                  >
-                    Banners Principales
-                  </button>
-                </div>
-
-                {adSaveSuccessMsg && (
-                  <div className="p-3 bg-emerald-50 text-emerald-800 text-xs font-bold rounded-lg border border-emerald-200">
-                    {adSaveSuccessMsg}
-                  </div>
-                )}
-
-                {adSubTab === 'landing' && (
-                  <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-3">
-                    <div>
-                      <label className="block text-[10px] font-bold text-gray-600 uppercase mb-1">Título Promocional</label>
-                      <input
-                        type="text"
-                        value={landingConfigState.title}
-                        onChange={(e) => setLandingConfigState({ ...landingConfigState, title: e.target.value })}
-                        className="w-full p-2.5 bg-white border border-gray-200 rounded-lg text-xs font-bold text-gray-800"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[10px] font-bold text-gray-600 uppercase mb-1">Subtítulo / Mensaje descriptivo</label>
-                      <textarea
-                        rows={2}
-                        value={landingConfigState.subtitle}
-                        onChange={(e) => setLandingConfigState({ ...landingConfigState, subtitle: e.target.value })}
-                        className="w-full p-2.5 bg-white border border-gray-200 rounded-lg text-xs font-medium text-gray-800"
-                      />
-                    </div>
-                    <div className="flex justify-end">
-                      <button
-                        onClick={handleSaveLandingConfig}
-                        className="px-4 py-2 bg-[#005da9] hover:bg-[#004a87] text-white text-xs font-black rounded-lg transition"
-                      >
-                        Sincronizar Landing
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {adSubTab === 'banner' && (
-                  <div className="space-y-2">
-                    <span className="text-[11px] font-bold text-gray-500 block">Listado de Pantallas Cargadas:</span>
-                    <div className="divide-y divide-gray-100 bg-white border border-gray-200 rounded-xl overflow-hidden shadow-3xs">
-                      {bannerSlidesList.map((slide, idx) => (
-                        <div key={slide.id || idx} className="p-3 flex items-center justify-between gap-4 hover:bg-gray-50/50">
-                          <div className="flex items-center gap-3">
-                            <img src={slide.image_url} className="w-12 h-10 object-cover rounded-lg border" referrerPolicy="no-referrer" />
-                            <div>
-                              <span className="text-xs font-black text-gray-800">{slide.title}</span>
-                              <p className="text-[10px] text-gray-400 font-medium">{slide.subtitle}</p>
-                            </div>
-                          </div>
-                          <span className="text-xs font-bold text-gray-400">Orden {slide.sort_order}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
               </div>
             </div>
           )}
@@ -3061,8 +3625,438 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
 
             </div>
           )}
+
+          {/* TAB 9: RESPALDO INTEGRAL Y DEPURACIÓN DE DATOS */}
+          {configSubTab === 'mantenimiento' && (
+            <div className="space-y-6">
+              <div className="border-b border-gray-100 pb-3 flex items-center justify-between">
+                <div>
+                  <h4 className="text-sm font-black text-gray-900 uppercase tracking-wider flex items-center gap-2">
+                    <Database className="w-4 h-4 text-emerald-600" />
+                    <span>Respaldo y Mantenimiento de Bases de Datos</span>
+                  </h4>
+                  <p className="text-xs text-gray-500 font-medium mt-0.5">
+                    Descargue una copia de seguridad íntegra de toda la información de su negocio (catálogo, operaciones, finanzas, clientes y configuración) y gestione el mantenimiento del sistema.
+                  </p>
+                </div>
+                <div className="px-3 py-1 bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-black rounded-full uppercase tracking-wider flex items-center gap-1">
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  <span>Seguridad y Datos</span>
+                </div>
+              </div>
+
+              {/* 💾 NOTIFICACIÓN DE RESPALDO DESCARGADO */}
+              {backupDownloadMsg && (
+                <div className="p-4 bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-2xl space-y-1 animate-scaleUp">
+                  <div className="flex items-center gap-2 font-bold text-xs">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                    <span>¡Respaldo descargado exitosamente a su dispositivo!</span>
+                  </div>
+                  <p className="text-[11px] text-emerald-800 font-medium">
+                    Archivo generado: <span className="font-mono font-bold bg-white px-1.5 py-0.5 rounded border border-emerald-200">{backupDownloadMsg.filename}</span> ({backupDownloadMsg.count} registros totales respaldados a las {backupDownloadMsg.timestamp}).
+                  </p>
+                </div>
+              )}
+
+              {/* 1. SECCIÓN PRINCIPAL: DESCARGA DE RESPALDO TOTAL */}
+              <div className="p-6 bg-linear-to-br from-slate-900 via-slate-800 to-[#1D3557] rounded-3xl text-white shadow-xl border border-slate-700 relative overflow-hidden space-y-4">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <div className="inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-500/20 border border-emerald-400/30 rounded-full text-emerald-300 text-[11px] font-extrabold uppercase tracking-wider">
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Copia de Seguridad Completa</span>
+                    </div>
+                    <h3 className="text-base font-black text-white tracking-wide">
+                      Exportar Respaldo de Todos los Registros y Operaciones
+                    </h3>
+                    <p className="text-xs text-slate-300 font-medium max-w-2xl">
+                      Genera un archivo estructurado estándar <code className="text-[#40E0D0] font-mono font-bold">.JSON</code> descargable con el 100% de la información comercial, contable, inventarios, clientes y configuraciones de su sistema.
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleDownloadFullBackup}
+                    disabled={isExportingBackup}
+                    className="px-6 py-3.5 bg-emerald-500 hover:bg-emerald-600 active:scale-95 text-slate-950 font-black text-xs rounded-2xl shadow-lg hover:shadow-emerald-500/30 transition-all flex items-center gap-2.5 shrink-0 cursor-pointer border border-emerald-400 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isExportingBackup ? (
+                      <>
+                        <RefreshCw className="w-4 h-4 animate-spin text-slate-950" />
+                        <span>Generando y Empaquetando...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Download className="w-4 h-4 text-slate-950" />
+                        <span>Descargar Respaldo Completo (.JSON)</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {/* DETALLE DE LO QUE CONTIENE EL RESPALDO */}
+                <div className="pt-3 border-t border-slate-700/80 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                  <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700 space-y-1">
+                    <span className="text-[11px] font-bold text-emerald-300 block">📦 Catálogo y Stock</span>
+                    <p className="text-[10px] text-slate-300">Productos, códigos de barra, costos, precios, categorías y marcas.</p>
+                  </div>
+                  <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700 space-y-1">
+                    <span className="text-[11px] font-bold text-sky-300 block">🧾 Operaciones y Ventas</span>
+                    <p className="text-[10px] text-slate-300">Facturas, notas de entrega, pedidos e-commerce, compras y cotizaciones.</p>
+                  </div>
+                  <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700 space-y-1">
+                    <span className="text-[11px] font-bold text-amber-300 block">🏦 Finanzas y Cuentas</span>
+                    <p className="text-[10px] text-slate-300">Cuentas bancarias, transferencias, CxC, CxP, gastos fijos y caja chica.</p>
+                  </div>
+                  <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700 space-y-1">
+                    <span className="text-[11px] font-bold text-purple-300 block">⚙️ Configuración y Directorios</span>
+                    <p className="text-[10px] text-slate-300">Clientes, proveedores, usuarios, sedes, terminales, impuestos y tasas.</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* 2. SECCIÓN DE DEPURACIÓN / LIMPIEZA DE TRANSACCIONES */}
+              <div className="border-t border-gray-100 pt-4 space-y-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h5 className="text-sm font-black text-gray-900 uppercase tracking-wider flex items-center gap-2">
+                      <Trash2 className="w-4 h-4 text-rose-600" />
+                      <span>Depuración y Limpieza de Operaciones Realizadas</span>
+                    </h5>
+                    <p className="text-xs text-gray-500 font-medium mt-0.5">
+                      Permite vaciar de forma segura las operaciones históricas (ventas, pedidos, notas de entrega, cuentas bancarias, CxC y CxP) conservando el inventario, catálogo, clientes, usuarios y configuraciones.
+                    </p>
+                  </div>
+                  <div className="px-3 py-1 bg-rose-50 border border-rose-200 text-rose-700 text-[10px] font-black rounded-full uppercase tracking-wider">
+                    Acción Administrativa
+                  </div>
+                </div>
+
+                {cleanResult && (
+                  <div className="p-4 bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-2xl space-y-2">
+                    <div className="flex items-center gap-2 font-bold text-xs">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                      <span>¡Limpieza completada exitosamente!</span>
+                    </div>
+                    <ul className="text-[11px] text-emerald-800 space-y-1 list-disc list-inside">
+                      {Object.entries(cleanResult.details).map(([k, v]) => (
+                        <li key={k}>
+                          <strong>{k}:</strong> {String(v)}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* COMPARATIVE CARDS: PURGED VS PRESERVED */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* 1. SE ELIMINAN / PURGAN */}
+                  <div className="p-5 bg-rose-50/50 rounded-2xl border border-rose-200 space-y-3">
+                    <div className="flex items-center gap-2 text-rose-900 font-black text-xs uppercase tracking-wide">
+                      <AlertTriangle className="w-4 h-4 text-rose-600" />
+                      <span>Datos y Operaciones que se Purgarán (0)</span>
+                    </div>
+                    <p className="text-[11px] text-rose-700 font-medium">
+                      Se borrarán las operaciones registradas para reiniciar la contabilidad y transacciones desde cero:
+                    </p>
+                    <ul className="text-xs text-rose-950 font-semibold space-y-2">
+                      <li className="flex items-start gap-2">
+                        <span className="text-rose-600 font-bold">•</span>
+                        <span><strong>Ventas y Facturas:</strong> Histórico de facturas emitidas y anuladas.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-rose-600 font-bold">•</span>
+                        <span><strong>Notas de Entrega:</strong> Borradores y comprobantes de entrega.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-rose-600 font-bold">•</span>
+                        <span><strong>Pedidos (Orders):</strong> Pedidos de tienda física y catálogo e-commerce.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-rose-600 font-bold">•</span>
+                        <span><strong>Cuentas Bancarias:</strong> Movimientos/transferencias bancarias y saldos reseteados a $0.00 / Bs. 0.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-rose-600 font-bold">•</span>
+                        <span><strong>Cuentas por Cobrar (CxC):</strong> Saldos pendientes y pagos de clientes.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-rose-600 font-bold">•</span>
+                        <span><strong>Cuentas por Pagar (CxP):</strong> Saldos pendientes y pagos a proveedores.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-rose-600 font-bold">•</span>
+                        <span><strong>Caja Chica:</strong> Operaciones de ingresos/egresos y sesiones históricas.</span>
+                      </li>
+                    </ul>
+                  </div>
+
+                  {/* 2. SE MANTIENEN 100% INTACTOS */}
+                  <div className="p-5 bg-emerald-50/50 rounded-2xl border border-emerald-200 space-y-3">
+                    <div className="flex items-center gap-2 text-emerald-900 font-black text-xs uppercase tracking-wide">
+                      <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                      <span>Datos que se CONSERVAN Íntegros</span>
+                    </div>
+                    <p className="text-[11px] text-emerald-700 font-medium">
+                      Su configuración maestra, catálogo e información estructural no sufrirán ningún cambio:
+                    </p>
+                    <ul className="text-xs text-emerald-950 font-semibold space-y-2">
+                      <li className="flex items-start gap-2">
+                        <span className="text-emerald-600 font-bold">✓</span>
+                        <span><strong>Catálogo de Productos:</strong> Artículos, códigos de barra, costos y precios.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-emerald-600 font-bold">✓</span>
+                        <span><strong>Categorías y Marcas:</strong> Estructura completa de clasificación.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-emerald-600 font-bold">✓</span>
+                        <span><strong>Directorio de Clientes:</strong> Datos de contacto, RIF/Cédula y teléfonos.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-emerald-600 font-bold">✓</span>
+                        <span><strong>Directorio de Proveedores:</strong> Contactos y fichas de proveedores.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-emerald-600 font-bold">✓</span>
+                        <span><strong>Cuentas Bancarias Registradas:</strong> Cuentas bancarias listas para operar.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-emerald-600 font-bold">✓</span>
+                        <span><strong>Usuarios y Contraseñas:</strong> Accesos y roles de administradores/cajeros.</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-emerald-600 font-bold">✓</span>
+                        <span><strong>Sedes, Cajas y Parámetros:</strong> Sucursales, impuestos y diseño de tickets.</span>
+                      </li>
+                    </ul>
+                  </div>
+                </div>
+
+                {/* ACTION TRIGGER BOX */}
+                <div className="p-5 bg-slate-900 rounded-3xl text-white flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-xl">
+                  <div>
+                    <h5 className="text-sm font-black tracking-wide text-white flex items-center gap-2">
+                      <RefreshCw className="w-4 h-4 text-amber-400" />
+                      <span>Ejecutar Limpieza Exclusiva de Operaciones</span>
+                    </h5>
+                    <p className="text-xs text-slate-300 font-medium mt-1">
+                      Esta acción vacía únicamente las operaciones transaccionales y reinicia los contadores de ventas y balances. Recuerde descargar un respaldo antes si desea conservar copias históricas.
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCleanConfirmText('');
+                      setShowCleanModal(true);
+                    }}
+                    className="px-5 py-3 bg-rose-600 hover:bg-rose-700 text-white font-black text-xs rounded-xl shadow-lg hover:shadow-rose-600/30 transition-all flex items-center gap-2 shrink-0 cursor-pointer border border-rose-500"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    <span>Limpiar Operaciones Realizadas</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
-      </div>
+
+      {/* 💾 MODAL DE RESPALDO Y COPIA DE SEGURIDAD GENERADA */}
+      {showBackupModal && backupModalData && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4 text-left font-poppins">
+          <div className="bg-white rounded-3xl border border-emerald-200 w-full max-w-xl p-6 shadow-2xl relative space-y-4 animate-scaleUp">
+            <div className="flex items-center justify-between pb-3 border-b border-gray-100">
+              <div className="flex items-center gap-3">
+                <div className="w-11 h-11 rounded-2xl bg-emerald-100 text-emerald-600 flex items-center justify-center shrink-0">
+                  <Database className="w-6 h-6" />
+                </div>
+                <div>
+                  <h4 className="text-sm font-black text-gray-900 flex items-center gap-2">
+                    <span>¡Respaldo Completo Generado con Éxito!</span>
+                  </h4>
+                  <p className="text-[11px] text-emerald-700 font-bold">
+                    El archivo .JSON se ha descargado a su dispositivo.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowBackupModal(false)}
+                className="p-1.5 text-gray-400 hover:text-gray-600 rounded-xl hover:bg-gray-100 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-3 bg-slate-900 text-white rounded-2xl space-y-1">
+              <span className="text-[10px] uppercase tracking-wider text-emerald-400 font-black">Nombre del archivo:</span>
+              <p className="text-xs font-mono font-bold text-slate-100 break-all select-all">
+                {backupModalData.filename}
+              </p>
+            </div>
+
+            {/* RESUMEN DE REGISTROS PROCESADOS */}
+            <div className="space-y-2">
+              <span className="text-[11px] font-extrabold text-gray-700 uppercase tracking-wide">Registros empaquetados en este respaldo:</span>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
+                <div className="p-2.5 bg-gray-50 rounded-xl border border-gray-100 flex items-center justify-between">
+                  <span className="text-gray-600 font-semibold">📦 Productos:</span>
+                  <span className="font-mono font-black text-slate-900">{backupModalData.summary.productos || 0}</span>
+                </div>
+                <div className="p-2.5 bg-gray-50 rounded-xl border border-gray-100 flex items-center justify-between">
+                  <span className="text-gray-600 font-semibold">🧾 Ventas/Facturas:</span>
+                  <span className="font-mono font-black text-slate-900">{backupModalData.summary.ventas_facturas || 0}</span>
+                </div>
+                <div className="p-2.5 bg-gray-50 rounded-xl border border-gray-100 flex items-center justify-between">
+                  <span className="text-gray-600 font-semibold">🚚 Notas Entrega:</span>
+                  <span className="font-mono font-black text-slate-900">{backupModalData.summary.notas_entrega || 0}</span>
+                </div>
+                <div className="p-2.5 bg-gray-50 rounded-xl border border-gray-100 flex items-center justify-between">
+                  <span className="text-gray-600 font-semibold">🛒 Pedidos:</span>
+                  <span className="font-mono font-black text-slate-900">{backupModalData.summary.pedidos || 0}</span>
+                </div>
+                <div className="p-2.5 bg-gray-50 rounded-xl border border-gray-100 flex items-center justify-between">
+                  <span className="text-gray-600 font-semibold">🏦 Cuentas Banco:</span>
+                  <span className="font-mono font-black text-slate-900">{backupModalData.summary.cuentas_bancarias || 0}</span>
+                </div>
+                <div className="p-2.5 bg-gray-50 rounded-xl border border-gray-100 flex items-center justify-between">
+                  <span className="text-gray-600 font-semibold">💰 Cuentas x Cobrar:</span>
+                  <span className="font-mono font-black text-slate-900">{backupModalData.summary.cuentas_por_cobrar || 0}</span>
+                </div>
+                <div className="p-2.5 bg-gray-50 rounded-xl border border-gray-100 flex items-center justify-between">
+                  <span className="text-gray-600 font-semibold">📑 Cuentas x Pagar:</span>
+                  <span className="font-mono font-black text-slate-900">{backupModalData.summary.cuentas_por_pagar || 0}</span>
+                </div>
+                <div className="p-2.5 bg-gray-50 rounded-xl border border-gray-100 flex items-center justify-between">
+                  <span className="text-gray-600 font-semibold">👥 Clientes:</span>
+                  <span className="font-mono font-black text-slate-900">{backupModalData.summary.clientes || 0}</span>
+                </div>
+                <div className="p-2.5 bg-gray-50 rounded-xl border border-gray-100 flex items-center justify-between">
+                  <span className="text-gray-600 font-semibold">🏢 Proveedores:</span>
+                  <span className="font-mono font-black text-slate-900">{backupModalData.summary.proveedores || 0}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="p-3 bg-amber-50 rounded-2xl border border-amber-200 text-amber-900 text-xs flex items-start gap-2">
+              <HelpCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <p className="text-[11px] font-medium leading-relaxed">
+                Si su navegador bloqueó la descarga automática, haga clic en <strong>"Descargar Archivo Nuevamente"</strong> o utilice el botón de <strong>"Copiar JSON"</strong> para guardar los datos manualmente en un archivo de texto.
+              </p>
+            </div>
+
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2 pt-2 border-t border-gray-100">
+              <button
+                type="button"
+                onClick={handleCopyBackupToClipboard}
+                className={`px-4 py-2.5 text-xs font-bold rounded-xl border transition flex items-center justify-center gap-2 cursor-pointer ${
+                  copiedBackup
+                    ? 'bg-emerald-600 text-white border-emerald-600'
+                    : 'bg-gray-100 hover:bg-gray-200 text-gray-800 border-gray-200'
+                }`}
+              >
+                {copiedBackup ? (
+                  <>
+                    <Check className="w-4 h-4 text-white" />
+                    <span>¡JSON Copiado al Portapapeles!</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-4 h-4 text-gray-600" />
+                    <span>Copiar JSON</span>
+                  </>
+                )}
+              </button>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowBackupModal(false)}
+                  className="px-4 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold rounded-xl transition cursor-pointer"
+                >
+                  Cerrar
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDirectDownloadAgain}
+                  className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black rounded-xl shadow-md transition flex items-center justify-center gap-2 cursor-pointer shadow-emerald-600/30"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Descargar Archivo Nuevamente</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 🧹 MODAL DE CONFIRMACIÓN: LIMPIEZA DE OPERACIONES */}
+      {showCleanModal && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4 text-left font-poppins">
+          <div className="bg-white rounded-3xl border border-rose-200 w-full max-w-lg p-6 shadow-2xl relative space-y-4 animate-scaleUp">
+            <div className="flex items-center gap-3 pb-3 border-b border-gray-100">
+              <div className="w-11 h-11 rounded-2xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-6 h-6" />
+              </div>
+              <div>
+                <h4 className="text-sm font-black text-gray-900">¿Confirmar Limpieza de Operaciones?</h4>
+                <p className="text-[11px] text-gray-500 font-medium">Esta acción eliminará todas las transacciones realizadas (ventas, pedidos, notas de entrega, movimientos bancarios, CxC y CxP).</p>
+              </div>
+            </div>
+
+            <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-2xl space-y-2 text-xs">
+              <p className="font-bold text-rose-900 flex items-center gap-1.5">
+                <span>⚠️ Por favor escribe</span>
+                <span className="font-mono bg-white px-2 py-0.5 rounded border border-rose-300 text-rose-700 font-black">LIMPIAR</span>
+                <span>para habilitar la confirmación:</span>
+              </p>
+              <input
+                type="text"
+                value={cleanConfirmText}
+                onChange={(e) => setCleanConfirmText(e.target.value.toUpperCase())}
+                placeholder="Escribe LIMPIAR aquí"
+                className="w-full p-2.5 bg-white border border-rose-300 rounded-xl text-xs font-bold text-rose-900 focus:outline-rose-500"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={isCleaning}
+                onClick={() => {
+                  setShowCleanModal(false);
+                  setCleanConfirmText('');
+                }}
+                className="px-4 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold rounded-xl transition cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={cleanConfirmText !== 'LIMPIAR' || isCleaning}
+                onClick={handleExecuteOperationalClean}
+                className={`px-5 py-2.5 text-white text-xs font-black rounded-xl shadow-xs transition flex items-center gap-2 ${
+                  cleanConfirmText === 'LIMPIAR' && !isCleaning
+                    ? 'bg-rose-600 hover:bg-rose-700 cursor-pointer shadow-rose-600/30'
+                    : 'bg-rose-300 cursor-not-allowed opacity-60'
+                }`}
+              >
+                {isCleaning ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span>Limpiando base de datos...</span>
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="w-4 h-4" />
+                    <span>Sí, Limpiar Todas las Operaciones</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 📍 MODAL: CREAR / EDITAR SEDE */}
       {showBranchModal && (
@@ -3422,9 +4416,372 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
         </div>
       )}
 
-      {/* 💳 MODAL: INCORPORAR / MODIFICAR MÉTODO DE PAGO */}
-      {showPaymentMethodModal && editingPaymentMethod && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 text-left">
+      {/* 💳 MODAL: MÉTODOS DE PAGO DEL SISTEMA (MATCHING USER REFERENCE) */}
+      {showPaymentMethodModal && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 text-left font-poppins">
+          <div className="bg-white rounded-3xl border border-gray-150 w-full max-w-xl p-6 shadow-2xl relative space-y-4 max-h-[92vh] overflow-y-auto animate-scaleUp">
+            {/* MODAL HEADER */}
+            <div className="flex items-center justify-between border-b border-gray-100 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-full bg-[#103b6e]/10 text-[#103b6e] flex items-center justify-center font-black">
+                  <CreditCard className="w-4 h-4 text-[#103b6e]" />
+                </div>
+                <h4 className="text-sm sm:text-base font-montserrat font-extrabold text-[#1D3557]">
+                  Métodos de Pago del Sistema
+                </h4>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowPaymentMethodModal(false)}
+                className="p-1.5 text-gray-400 hover:text-gray-600 rounded-lg cursor-pointer transition"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* DESCRIPTION */}
+            <p className="text-xs text-gray-600 leading-relaxed">
+              Aquí puede ver todos los métodos de cobro registrados en el sistema y a cuál cuenta bancaria están fijados actualmente.
+            </p>
+
+            {paymentMethodMsg && (
+              <div className={`p-3 rounded-xl text-xs font-bold flex items-center gap-2 ${
+                paymentMethodMsg.type === 'success' ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-rose-50 text-rose-800 border border-rose-200'
+              }`}>
+                {paymentMethodMsg.type === 'success' ? <Check className="w-4 h-4 shrink-0 text-emerald-600" /> : <AlertTriangle className="w-4 h-4 shrink-0 text-rose-600" />}
+                <span>{paymentMethodMsg.text}</span>
+              </div>
+            )}
+
+            {/* FORM CONTAINER: REGISTRAR NUEVO MÉTODO DE PAGO */}
+            <form onSubmit={handleCreateManagerPaymentMethod} className="bg-[#f8fafd] border border-[#e2e8f0] p-4 sm:p-5 rounded-2xl space-y-3.5">
+              <div className="text-[11px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wide">
+                REGISTRAR NUEVO MÉTODO DE PAGO:
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-bold text-gray-600 uppercase mb-1">
+                  NOMBRE DEL MÉTODO *
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="Ej: Pago móvil Banesco, Zelle Empresa"
+                  value={mgrNewName}
+                  onChange={(e) => setMgrNewName(e.target.value)}
+                  className="w-full px-3 py-2 bg-white border border-gray-250 rounded-xl text-xs font-medium text-gray-800 placeholder-gray-400 focus:border-[#103b6e] focus:ring-1 focus:ring-[#103b6e] transition outline-none"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="block text-[10px] font-bold text-gray-600 uppercase mb-1">
+                    MONEDA
+                  </label>
+                  <select
+                    value={mgrNewCurrency}
+                    onChange={(e) => setMgrNewCurrency(e.target.value as any)}
+                    className="w-full px-3 py-2 bg-white border border-gray-250 rounded-xl text-xs font-medium text-gray-800 focus:border-[#103b6e] transition outline-none cursor-pointer"
+                  >
+                    {systemCurrencies && systemCurrencies.length > 0 ? (
+                      systemCurrencies.map((c) => (
+                        <option key={c.code} value={c.code}>
+                          {c.name} ({c.symbol || c.code} - {c.code})
+                        </option>
+                      ))
+                    ) : (
+                      <>
+                        <option value="VES">Bolívares (VES)</option>
+                        <option value="USD">Dólares (USD)</option>
+                        <option value="EUR">Euros (EUR)</option>
+                        <option value="COP">Pesos Colombianos (COP)</option>
+                      </>
+                    )}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] font-bold text-gray-600 uppercase mb-1">
+                    TIPO
+                  </label>
+                  <select
+                    value={mgrNewType}
+                    onChange={(e) => setMgrNewType(e.target.value as any)}
+                    className="w-full px-3 py-2 bg-white border border-gray-250 rounded-xl text-xs font-medium text-gray-800 focus:border-[#103b6e] transition outline-none cursor-pointer"
+                  >
+                    <option value="movil">Pago Móvil</option>
+                    <option value="efectivo">Efectivo</option>
+                    <option value="transferencia">Transferencia</option>
+                    <option value="punto">Punto de Venta</option>
+                    <option value="digital">Digital (Zelle/Binance)</option>
+                    <option value="otro">Otro</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] font-bold text-gray-600 uppercase mb-1">
+                    FIJAR A CUENTA
+                  </label>
+                  <select
+                    value={mgrTargetAccountId}
+                    onChange={(e) => setMgrTargetAccountId(e.target.value)}
+                    className="w-full px-3 py-2 bg-white border border-gray-250 rounded-xl text-xs font-medium text-gray-800 focus:border-[#103b6e] transition outline-none cursor-pointer"
+                  >
+                    <option value="">-- Sin fijar aún --</option>
+                    {bankAccounts.map((acc) => (
+                      <option key={acc.id} value={acc.id}>
+                        {acc.name} ({acc.currency})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={isRegisteringMethod}
+                className="w-full mt-2 py-2.5 bg-[#1D3557] hover:bg-[#152741] text-white font-montserrat font-extrabold text-xs rounded-xl transition cursor-pointer shadow-xs flex items-center justify-center gap-2 active:scale-98 disabled:opacity-50"
+              >
+                {isRegisteringMethod ? (
+                  <RefreshCw className="w-4 h-4 animate-spin text-white" />
+                ) : null}
+                <span>Registrar método en el sistema</span>
+              </button>
+            </form>
+
+            {/* LIST: MÉTODOS Y CUENTAS VINCULADAS */}
+            <div className="space-y-2 pt-1">
+              <div className="text-[11px] font-montserrat font-extrabold text-[#2B2D42]/70 uppercase tracking-wide">
+                MÉTODOS Y CUENTAS VINCULADAS
+              </div>
+
+              {loadingPaymentMethods ? (
+                <div className="p-6 text-center text-xs text-gray-400 font-medium">
+                  Cargando métodos de pago...
+                </div>
+              ) : paymentMethodsList.length === 0 ? (
+                <div className="p-4 text-center text-xs text-gray-400 font-medium bg-slate-50 rounded-xl border border-dashed border-gray-200">
+                  No hay métodos de pago registrados en el sistema.
+                </div>
+              ) : (
+                <div className="max-h-64 overflow-y-auto space-y-2.5 pr-1">
+                  {paymentMethodsList.map((pm) => {
+                    const bound = getMethodBoundAccount(pm);
+                    const isMovil = pm.type === 'movil' || pm.name.toLowerCase().includes('movil') || pm.name.toLowerCase().includes('móvil');
+                    const isEfectivo = pm.type === 'efectivo' || pm.name.toLowerCase().includes('efectivo');
+                    
+                    return (
+                      <div
+                        key={pm.id}
+                        className="bg-white border border-gray-200 rounded-xl p-3 flex items-center justify-between shadow-2xs hover:border-slate-300 transition"
+                      >
+                        <div className="flex items-center gap-3">
+                          <div
+                            className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
+                              isMovil
+                                ? 'bg-purple-50 text-[#7928CA]'
+                                : isEfectivo
+                                ? 'bg-emerald-50 text-emerald-600'
+                                : 'bg-blue-50 text-[#005da9]'
+                            }`}
+                          >
+                            {isMovil ? (
+                              <Smartphone className="w-4 h-4" />
+                            ) : isEfectivo ? (
+                              <Banknote className="w-4 h-4" />
+                            ) : (
+                              <Landmark className="w-4 h-4" />
+                            )}
+                          </div>
+                          <div>
+                            <p className="font-montserrat font-bold text-xs text-gray-800">
+                              {pm.name}
+                            </p>
+                            <p className="text-[10px] text-gray-400 font-bold tracking-wider uppercase">
+                              {pm.currency} • {pm.type.toUpperCase()}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div>
+                          {bound.isBound ? (
+                            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-bold bg-slate-100 text-[#1D3557] border border-slate-200">
+                              <Lock className="w-3 h-3 text-[#1D3557]" />
+                              <span>Fijado a: {bound.accountName}</span>
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-medium bg-slate-50 text-slate-500 border border-slate-200">
+                              <Unlock className="w-3 h-3 text-slate-400" />
+                              <span>Disponible (Sin cuenta)</span>
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* MODAL FOOTER */}
+            <div className="flex items-center justify-end pt-3 border-t border-gray-100">
+              <button
+                type="button"
+                onClick={() => setShowPaymentMethodModal(false)}
+                className="px-6 py-2 bg-white hover:bg-slate-50 text-slate-700 font-montserrat font-bold text-xs rounded-xl border border-slate-200 transition cursor-pointer shadow-2xs active:scale-98"
+              >
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 🏷️ MODAL: MODIFICAR IMPUESTO */}
+      {editingTax && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 text-left font-poppins">
+          <div className="bg-white rounded-3xl border border-gray-150 w-full max-w-md p-6 shadow-2xl relative space-y-4 animate-scaleUp">
+            <div className="flex items-center justify-between border-b border-gray-100 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-blue-50 text-[#103b6e] flex items-center justify-center font-black">
+                  <Percent className="w-5 h-5" />
+                </div>
+                <div>
+                  <h4 className="text-sm font-black text-gray-900 font-montserrat">
+                    Modificar Impuesto
+                  </h4>
+                  <p className="text-[11px] text-gray-500">Actualice la tasa porcentual o el estado del impuesto.</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingTax(null)}
+                className="p-1 text-gray-400 hover:text-gray-600 rounded-lg cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveEditedTax} className="space-y-3.5">
+              <div>
+                <label className="block text-[10px] font-black text-gray-600 uppercase mb-1 font-montserrat">
+                  Nombre del Impuesto *
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="Ej: IVA General, IVA Reducido"
+                  value={editingTax.name}
+                  onChange={(e) => setEditingTax({ ...editingTax, name: e.target.value })}
+                  className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:bg-white focus:border-[#103b6e] transition outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-black text-gray-600 uppercase mb-1 font-montserrat">
+                  Porcentaje Impositivo (%) *
+                </label>
+                <div className="relative">
+                  <input
+                    type="number"
+                    step="any"
+                    min="0"
+                    required
+                    placeholder="Ej: 16"
+                    value={editingTax.rate}
+                    onChange={(e) => setEditingTax({ ...editingTax, rate: parseFloat(e.target.value) || 0 })}
+                    className="w-full p-2.5 pr-8 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:bg-white focus:border-[#103b6e] transition outline-none font-mono"
+                  />
+                  <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-bold text-gray-400 font-mono">%</span>
+                </div>
+              </div>
+
+              <div className="p-3 bg-slate-50 rounded-2xl border border-slate-200">
+                <label className="flex items-center gap-2.5 cursor-pointer text-xs font-bold text-gray-800">
+                  <input
+                    type="checkbox"
+                    checked={editingTax.is_active}
+                    onChange={(e) => setEditingTax({ ...editingTax, is_active: e.target.checked })}
+                    className="w-4 h-4 rounded text-[#103b6e] focus:ring-0"
+                  />
+                  <div>
+                    <span className="font-montserrat">Impuesto Vigente (Activo)</span>
+                    <p className="text-[10px] font-normal text-gray-500">Disponible para cálculos de facturación y notas de entrega.</p>
+                  </div>
+                </label>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-3 border-t border-gray-100">
+                <button
+                  type="button"
+                  onClick={() => setEditingTax(null)}
+                  className="px-4 py-2 bg-gray-150 hover:bg-gray-200 text-gray-700 text-xs font-bold rounded-xl transition cursor-pointer"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingTax}
+                  className="px-5 py-2 bg-[#103b6e] hover:bg-[#0c2e56] text-white text-xs font-bold rounded-xl shadow-xs transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  <Save className="w-4 h-4" />
+                  <span>{isSavingTax ? 'Guardando...' : 'Guardar Cambios'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ⚠️ MODAL CONFIRMACIÓN: ELIMINAR IMPUESTO */}
+      {taxToDelete && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 text-left font-poppins">
+          <div className="bg-white rounded-3xl border border-rose-150 w-full max-w-md p-6 shadow-2xl relative space-y-4 animate-scaleUp">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h4 className="text-sm font-black text-gray-900 font-montserrat">¿Eliminar Impuesto?</h4>
+                <p className="text-xs text-gray-500 font-medium">Esta acción eliminará el impuesto de forma permanente.</p>
+              </div>
+            </div>
+
+            <div className="p-3.5 bg-rose-50/70 border border-rose-200 rounded-2xl space-y-1 text-xs">
+              <p className="font-bold text-rose-900 font-montserrat">
+                {taxToDelete.name} — <span className="font-mono">{taxToDelete.rate}%</span>
+              </p>
+              <p className="text-[11px] text-rose-700">
+                Estado: {taxToDelete.is_active ? 'Vigente' : 'Inactivo'}
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-gray-100">
+              <button
+                type="button"
+                disabled={isDeletingTax}
+                onClick={() => setTaxToDelete(null)}
+                className="px-4 py-2 bg-gray-150 hover:bg-gray-200 text-gray-700 text-xs font-bold rounded-xl transition cursor-pointer disabled:opacity-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingTax}
+                onClick={handleConfirmDeleteTax}
+                className="px-5 py-2 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-xl shadow-xs transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                <Trash2 className="w-4 h-4" />
+                <span>{isDeletingTax ? 'Eliminando...' : 'Sí, Eliminar Impuesto'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 💳 MODAL: MODIFICAR MÉTODO DE PAGO INDIVIDUAL */}
+      {showEditSingleModal && editingPaymentMethod && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 text-left font-poppins">
           <div className="bg-white rounded-3xl border border-gray-150 w-full max-w-xl p-6 shadow-2xl relative space-y-4 max-h-[90vh] overflow-y-auto animate-scaleUp">
             <div className="flex items-center justify-between border-b border-gray-100 pb-3">
               <div className="flex items-center gap-2.5">
@@ -3433,15 +4790,15 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
                 </div>
                 <div>
                   <h4 className="text-sm font-black text-gray-900">
-                    {editingPaymentMethod.id ? 'Modificar Método de Pago' : 'Incorporar Nuevo Método de Pago'}
+                    Modificar Método de Pago
                   </h4>
-                  <p className="text-[11px] text-gray-500">Configure los datos, moneda y condiciones de pago para los clientes y cajeros.</p>
+                  <p className="text-[11px] text-gray-500">Configure los datos, moneda y condiciones de cobro.</p>
                 </div>
               </div>
               <button
                 type="button"
                 onClick={() => {
-                  setShowPaymentMethodModal(false);
+                  setShowEditSingleModal(false);
                   setEditingPaymentMethod(null);
                 }}
                 className="p-1 text-gray-400 hover:text-gray-600 rounded-lg cursor-pointer"
@@ -3498,11 +4855,20 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
                     onChange={(e) => setEditingPaymentMethod({ ...editingPaymentMethod, currency: e.target.value as any })}
                     className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:bg-white focus:border-[#005da9] transition outline-none"
                   >
-                    <option value="VES">Bolívares (Bs. / VES)</option>
-                    <option value="USD">Dólares (USD $)</option>
-                    <option value="EUR">Euros (€ / EUR)</option>
-                    <option value="COP">Pesos Colombianos (COP)</option>
-                    <option value="MULTIMONEDA">Multimoneda (Acepta Varias)</option>
+                    {systemCurrencies && systemCurrencies.length > 0 ? (
+                      systemCurrencies.map((c) => (
+                        <option key={c.code} value={c.code}>
+                          {c.name} ({c.symbol || c.code} - {c.code})
+                        </option>
+                      ))
+                    ) : (
+                      <>
+                        <option value="VES">Bolívares (Bs. / VES)</option>
+                        <option value="USD">Dólares (USD $)</option>
+                        <option value="EUR">Euros (€ / EUR)</option>
+                        <option value="COP">Pesos Colombianos (COP)</option>
+                      </>
+                    )}
                   </select>
                 </div>
               </div>
@@ -3514,17 +4880,6 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
                   placeholder="Ej: Banesco 0134-xxxx | CI: V-12345678 | Tlf: 0412-1234567 | Titular: Papelería Bella Vista"
                   value={editingPaymentMethod.account_details || ''}
                   onChange={(e) => setEditingPaymentMethod({ ...editingPaymentMethod, account_details: e.target.value })}
-                  className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-medium text-gray-800 focus:bg-white focus:border-[#005da9] transition outline-none"
-                />
-              </div>
-
-              <div>
-                <label className="block text-[10px] font-black text-gray-600 uppercase mb-1">Instrucciones para el Cliente o Cajero</label>
-                <input
-                  type="text"
-                  placeholder="Ej: Adjuntar captura o indicar número de comprobante de 6 dígitos."
-                  value={editingPaymentMethod.instructions || ''}
-                  onChange={(e) => setEditingPaymentMethod({ ...editingPaymentMethod, instructions: e.target.value })}
                   className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-medium text-gray-800 focus:bg-white focus:border-[#005da9] transition outline-none"
                 />
               </div>
@@ -3566,7 +4921,7 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
                 <button
                   type="button"
                   onClick={() => {
-                    setShowPaymentMethodModal(false);
+                    setShowEditSingleModal(false);
                     setEditingPaymentMethod(null);
                   }}
                   className="px-4 py-2.5 bg-gray-150 hover:bg-gray-200 text-gray-700 text-xs font-bold rounded-xl transition cursor-pointer"
@@ -3586,7 +4941,216 @@ export const SystemConfigPanel: React.FC<SystemConfigPanelProps> = ({
         </div>
       )}
 
-      {/* ⚠️ MODAL CONFIRMACIÓN: ELIMINAR MÉTODO DE PAGO */}
+      {/* 🪙 MODAL: CREAR / MODIFICAR MONEDA PRINCIPAL */}
+      {showCurrencyModal && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 text-left font-poppins">
+          <div className="bg-white rounded-3xl border border-gray-150 w-full max-w-lg p-6 shadow-2xl relative space-y-4 max-h-[90vh] overflow-y-auto animate-scaleUp">
+            <div className="flex items-center justify-between border-b border-gray-100 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-blue-50 text-[#005da9] flex items-center justify-center font-black">
+                  <Coins className="w-5 h-5" />
+                </div>
+                <div>
+                  <h4 className="text-sm font-black text-gray-900 font-montserrat">
+                    {editingCurrency ? 'Modificar Moneda' : 'Crear Nueva Moneda'}
+                  </h4>
+                  <p className="text-[11px] text-gray-500 font-medium">Configuración de parámetros y tasa de cambio en Supabase.</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowCurrencyModal(false);
+                  setEditingCurrency(null);
+                }}
+                className="p-1 text-gray-400 hover:text-gray-600 rounded-lg cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveCurrencyModal} className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[10px] font-black text-gray-600 uppercase mb-1 font-montserrat">Código ISO *</label>
+                  <input
+                    type="text"
+                    required
+                    maxLength={6}
+                    placeholder="Ej: VES, EUR, BRL, CLP"
+                    value={currencyForm.code}
+                    onChange={(e) => setCurrencyForm({ ...currencyForm, code: e.target.value.toUpperCase() })}
+                    disabled={editingCurrency?.code === 'USD'}
+                    className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:bg-white focus:border-[#005da9] transition outline-none font-mono uppercase disabled:bg-gray-100 disabled:text-gray-400"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] font-black text-gray-600 uppercase mb-1 font-montserrat">Código País / Tag</label>
+                  <input
+                    type="text"
+                    maxLength={4}
+                    placeholder="Ej: VE, US, EU, BR"
+                    value={currencyForm.country_code}
+                    onChange={(e) => setCurrencyForm({ ...currencyForm, country_code: e.target.value.toUpperCase() })}
+                    className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:bg-white focus:border-[#005da9] transition outline-none font-mono uppercase"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[10px] font-black text-gray-600 uppercase mb-1 font-montserrat">Nombre Descriptivo *</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="Ej: Bolívar Digital, Euro Europeo, Real Brasileño"
+                  value={currencyForm.name}
+                  onChange={(e) => setCurrencyForm({ ...currencyForm, name: e.target.value })}
+                  className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:bg-white focus:border-[#005da9] transition outline-none"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[10px] font-black text-gray-600 uppercase mb-1 font-montserrat">Símbolo Divisa *</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Ej: $, Bs., €, R$, COP$"
+                    value={currencyForm.symbol}
+                    onChange={(e) => setCurrencyForm({ ...currencyForm, symbol: e.target.value })}
+                    className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:bg-white focus:border-[#005da9] transition outline-none font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] font-black text-gray-600 uppercase mb-1 font-montserrat">Tasa de Cambio (1 USD =) *</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Ej: 842.20"
+                    value={currencyForm.rate}
+                    onChange={(e) => setCurrencyForm({ ...currencyForm, rate: e.target.value })}
+                    disabled={editingCurrency?.code === 'USD'}
+                    className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:bg-white focus:border-[#005da9] transition outline-none font-mono disabled:bg-gray-100 disabled:text-gray-400"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[10px] font-black text-gray-600 uppercase mb-1 font-montserrat">Posición del Símbolo</label>
+                  <select
+                    value={currencyForm.position}
+                    onChange={(e) => setCurrencyForm({ ...currencyForm, position: e.target.value as 'prefix' | 'suffix' })}
+                    className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:bg-white focus:border-[#005da9] transition outline-none"
+                  >
+                    <option value="prefix">Prefijo (Ej: $ 100.00)</option>
+                    <option value="suffix">Sufijo (Ej: 100.00 Bs.)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[10px] font-black text-gray-600 uppercase mb-1 font-montserrat">Número de Decimales</label>
+                  <select
+                    value={currencyForm.decimals}
+                    onChange={(e) => setCurrencyForm({ ...currencyForm, decimals: Number(e.target.value) })}
+                    className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:bg-white focus:border-[#005da9] transition outline-none font-mono"
+                  >
+                    <option value={0}>0 Decimales (100)</option>
+                    <option value={2}>2 Decimales (100.00)</option>
+                    <option value={4}>4 Decimales (100.0000)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="pt-1">
+                <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-gray-700">
+                  <input
+                    type="checkbox"
+                    checked={currencyForm.is_active}
+                    onChange={(e) => setCurrencyForm({ ...currencyForm, is_active: e.target.checked })}
+                    className="w-4 h-4 rounded text-[#005da9] focus:ring-0"
+                  />
+                  <span>Moneda Habilitada y Activa en el Sistema</span>
+                </label>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-3 border-t border-gray-100">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowCurrencyModal(false);
+                    setEditingCurrency(null);
+                  }}
+                  className="px-4 py-2.5 bg-gray-150 hover:bg-gray-200 text-gray-700 text-xs font-bold rounded-xl transition cursor-pointer"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingCurrency}
+                  className="px-5 py-2.5 bg-[#005da9] hover:bg-[#004a87] disabled:opacity-50 text-white text-xs font-bold rounded-xl shadow-xs transition flex items-center gap-1.5 cursor-pointer font-montserrat"
+                >
+                  {isSavingCurrency ? (
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Save className="w-4 h-4" />
+                  )}
+                  <span>{isSavingCurrency ? 'Guardando...' : 'Guardar en Supabase'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ⚠️ MODAL CONFIRMACIÓN: ELIMINAR MONEDA */}
+      {currencyToDelete && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 text-left font-poppins">
+          <div className="bg-white rounded-3xl border border-rose-150 w-full max-w-md p-6 shadow-2xl relative space-y-4 animate-scaleUp">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h4 className="text-sm font-black text-gray-900 font-montserrat">¿Eliminar Moneda?</h4>
+                <p className="text-xs text-gray-500 font-medium">Esta acción eliminará la moneda de la base de datos Supabase.</p>
+              </div>
+            </div>
+
+            <div className="p-3.5 bg-rose-50/70 border border-rose-200 rounded-2xl space-y-1 text-xs">
+              <p className="font-bold text-rose-900 font-montserrat">
+                {currencyToDelete.name} ({currencyToDelete.code}) — {currencyToDelete.symbol}
+              </p>
+              <p className="text-[11px] text-rose-700 font-mono">
+                Tasa registrada: 1 USD = {currencyToDelete.rate} {currencyToDelete.symbol}
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={isDeletingCurrency}
+                onClick={() => setCurrencyToDelete(null)}
+                className="px-4 py-2.5 bg-gray-150 hover:bg-gray-200 text-gray-700 text-xs font-bold rounded-xl transition cursor-pointer disabled:opacity-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingCurrency}
+                onClick={handleDeleteCurrencyConfirm}
+                className="px-5 py-2.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-xl shadow-xs transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                {isDeletingCurrency ? (
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Trash2 className="w-4 h-4" />
+                )}
+                <span>{isDeletingCurrency ? 'Eliminando...' : 'Sí, Eliminar Moneda'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {paymentMethodToDelete && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 text-left">
           <div className="bg-white rounded-3xl border border-rose-150 w-full max-w-md p-6 shadow-2xl relative space-y-4 animate-scaleUp">

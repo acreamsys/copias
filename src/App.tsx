@@ -6,7 +6,7 @@
 import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from 'react';
 import { 
   Package, CheckCircle2, AlertTriangle, 
-  Settings, Phone, ArrowUp, ArrowRight, Info, ShieldAlert, Lock, Bell, ClipboardList, ShoppingCart, Clock, Globe, Home, Search, User, DollarSign, LayoutDashboard
+  Settings, Phone, ArrowUp, ArrowRight, Info, ShieldAlert, Lock, Bell, ClipboardList, ShoppingCart, Clock, Globe, Home, Search, User, DollarSign, LayoutDashboard, RefreshCw
 } from 'lucide-react';
 import { Category, Brand, Product, ProductImage, CartItem, Order, StoreUser, AdminMenuType } from './types';
 import { dbService } from './lib/supabase.ts';
@@ -14,21 +14,26 @@ import Navbar from './components/Navbar.tsx';
 import Sidebar from './components/Sidebar.tsx';
 import ProductCard from './components/ProductCard.tsx';
 import AmazonCarousel from './components/AmazonCarousel.tsx';
-import { CurrencyCode, DEFAULT_RATES, getSavedCurrency, saveCurrency } from './lib/currency';
+import { CurrencyCode, DEFAULT_RATES, getCachedCurrencyRates, saveCachedCurrencyRates, getSavedCurrency, saveCurrency } from './lib/currency';
 import { useI18n } from './lib/i18n.ts';
+import { BcvRatePromptModal, checkBcvExchangeRate, BcvQuote } from './components/BcvRatePromptModal.tsx';
+import { ManualBcvRateModal } from './components/ManualBcvRateModal.tsx';
+import { shouldCheckBcvRate, recordBcvCheckTimestamp, isRateDismissedRecently, getActiveAutoBcvSlot } from './lib/bcvRateChecker';
+import { lazyWithRetry } from './lib/lazyWithRetry.ts';
+import { ErrorBoundary } from './components/ErrorBoundary.tsx';
 
-// 🚀 Lazy-Loaded Heavy Components & Modals for Instant Page Speed
-const AdminPanel = lazy(() => import('./components/AdminPanel.tsx'));
-const ProductDetailModal = lazy(() => import('./components/ProductDetailModal.tsx'));
-const SettingsModal = lazy(() => import('./components/SettingsModal.tsx'));
-const CartDrawer = lazy(() => import('./components/CartDrawer.tsx'));
-const InfoModal = lazy(() => import('./components/InfoModal.tsx'));
-const OrderTrackingModal = lazy(() => import('./components/OrderTrackingModal.tsx'));
-const TortaTresLechesLanding = lazy(() => import('./components/TortaTresLechesLanding.tsx'));
-const BarcodeScannerModal = lazy(() => import('./components/BarcodeScannerModal.tsx'));
-const LoginModal = lazy(() => import('./components/LoginModal.tsx'));
-const CustomerDashboardModal = lazy(() => import('./components/CustomerDashboardModal.tsx'));
-const MobileCurrencyModal = lazy(() => import('./components/MobileCurrencyModal.tsx'));
+// 🚀 Lazy-Loaded Heavy Components & Modals with Auto-Retry
+const AdminPanel = lazyWithRetry(() => import('./components/AdminPanel.tsx'));
+const ProductDetailModal = lazyWithRetry(() => import('./components/ProductDetailModal.tsx'));
+const SettingsModal = lazyWithRetry(() => import('./components/SettingsModal.tsx'));
+const CartDrawer = lazyWithRetry(() => import('./components/CartDrawer.tsx'));
+const InfoModal = lazyWithRetry(() => import('./components/InfoModal.tsx'));
+const OrderTrackingModal = lazyWithRetry(() => import('./components/OrderTrackingModal.tsx'));
+const TortaTresLechesLanding = lazyWithRetry(() => import('./components/TortaTresLechesLanding.tsx'));
+const BarcodeScannerModal = lazyWithRetry(() => import('./components/BarcodeScannerModal.tsx'));
+const LoginModal = lazyWithRetry(() => import('./components/LoginModal.tsx'));
+const CustomerDashboardModal = lazyWithRetry(() => import('./components/CustomerDashboardModal.tsx'));
+const MobileCurrencyModal = lazyWithRetry(() => import('./components/MobileCurrencyModal.tsx'));
 
 const ModalSuspenseFallback = () => (
   <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs select-none pointer-events-none">
@@ -49,51 +54,111 @@ const AdminSuspenseFallback = () => (
 
 export default function App() {
   const { t } = useI18n();
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Display toast utility (Short duration: default 1800ms)
+  const triggerToast = useCallback((message: string, duration = 1800) => {
+    setToastMessage(message);
+    if (toastTimeoutRef.current) {
+      clearTimeout(toastTimeoutRef.current);
+    }
+    toastTimeoutRef.current = setTimeout(() => {
+      setToastMessage(null);
+    }, duration);
+  }, []);
+
   // Multi-Currency State
   const [activeCurrency, setActiveCurrency] = useState<CurrencyCode>('VES');
-  const [currencyRates, setCurrencyRates] = useState<Record<CurrencyCode, number>>(DEFAULT_RATES);
+  const [currencyRates, setCurrencyRates] = useState<Record<CurrencyCode, number>>(getCachedCurrencyRates);
 
   const handleCurrencyChange = useCallback((newCurrency: CurrencyCode) => {
     setActiveCurrency(newCurrency);
     // Deliberately not saving to localStorage so it always resets to VES on reload
   }, []);
 
-  // Listen for currency change events from any part of the app
+  // Listen for currency change events and real-time BCV updates from any part of the app
   useEffect(() => {
     const handleCustomCurrencyEvent = (e: any) => {
       if (e.detail && ['USD', 'VES', 'EUR', 'COP'].includes(e.detail)) {
         setActiveCurrency(e.detail as CurrencyCode);
       }
     };
+
+    const handleBcvRateUpdated = (e: any) => {
+      const newRate = Number(e?.detail?.rate);
+      if (newRate && newRate > 0) {
+        setCurrencyRates(prev => {
+          if (Math.abs(prev.VES - newRate) < 0.0001) return prev;
+          const updated = { ...prev, VES: newRate };
+          saveCachedCurrencyRates(updated);
+          return updated;
+        });
+      }
+    };
+
     window.addEventListener('bellavista_currency_changed', handleCustomCurrencyEvent);
+    window.addEventListener('bellavista_bcv_rate_updated', handleBcvRateUpdated);
     return () => {
       window.removeEventListener('bellavista_currency_changed', handleCustomCurrencyEvent);
+      window.removeEventListener('bellavista_bcv_rate_updated', handleBcvRateUpdated);
     };
   }, []);
 
-  // Load currency rates from database on mount
+  // Load currency rates from database on mount and check live official BCV rate
   useEffect(() => {
     const loadRates = async () => {
       try {
-        const newRates = { ...DEFAULT_RATES };
+        const newRates = { ...getCachedCurrencyRates() };
         
-        // 1. Load general currency rates
+        // 1. Load general currency rates from Supabase
         const rates = await dbService.getAllCurrencyRates();
         if (rates && rates.length > 0) {
           rates.forEach((r: any) => {
-            if (r.code in newRates) {
-              newRates[r.code as CurrencyCode] = r.rate;
+            if (r.code in newRates && Number(r.rate) > 0) {
+              newRates[r.code as CurrencyCode] = Number(r.rate);
             }
           });
         }
 
         // 2. Query and overlay the latest specific BCV rate from the bcv_rates table
         const latestBcv = await dbService.getLatestBcvRate();
-        if (latestBcv && latestBcv.rate) {
-          newRates.VES = latestBcv.rate;
+        if (latestBcv && Number(latestBcv.rate) > 0) {
+          newRates.VES = Number(latestBcv.rate);
         }
 
-        setCurrencyRates(newRates);
+        saveCachedCurrencyRates(newRates);
+        setCurrencyRates({ ...newRates });
+
+        // 3. Verificación inmediata en tiempo real con la página oficial del BCV / Tasa Futura:
+        // "solo se debe actualizar cuando la tasa sea menor a la especificada en la pagina oficial o sea menor a la tasa futura."
+        try {
+          const res = await fetch('/api/bcv/rates');
+          if (res.ok) {
+            const data = await res.json();
+            if (data && typeof data.usdRate === 'number' && data.usdRate > 0) {
+              const officialBcvRate = data.usdRate;
+              const isFuture = !!data.isFutureRate;
+
+              if (newRates.VES < officialBcvRate - 0.005) {
+                const updatedFinalRate = Number(officialBcvRate.toFixed(4));
+                const reason = isFuture ? 'BCV Tasa Futura (Inicio)' : 'BCV Oficial (Inicio)';
+
+                // Grabar en tiempo real en Supabase en las tablas correspondientes
+                await dbService.updateCurrencyRate('VES', updatedFinalRate, reason);
+
+                newRates.VES = updatedFinalRate;
+                saveCachedCurrencyRates(newRates);
+                setCurrencyRates({ ...newRates });
+
+                window.dispatchEvent(new CustomEvent('bellavista_bcv_rate_updated', { detail: { rate: updatedFinalRate, auto: true } }));
+                window.dispatchEvent(new CustomEvent('bellavista_settings_updated'));
+              }
+            }
+          }
+        } catch (bcvFetchErr) {
+          console.warn("Verificación de tasa oficial al iniciar:", bcvFetchErr);
+        }
       } catch (err) {
         console.error("Error loading currency rates:", err);
       }
@@ -107,118 +172,232 @@ export default function App() {
     ratesRef.current = currencyRates;
   }, [currencyRates]);
 
-  const checkAndAutoUpdateDolarRate = useCallback(async () => {
+  const [bcvQuote, setBcvQuote] = useState<BcvQuote | null>(null);
+  const [showManualBcvModal, setShowManualBcvModal] = useState<boolean>(false);
+  const [manualBcvSuggestedRate, setManualBcvSuggestedRate] = useState<number | null>(null);
+
+  /**
+   * Ejecución automática de cambio de tasa a las 20:00 y a las 00:00 (Hora de Venezuela / Caracas UTC-4):
+   * Si la tasa oficial del BCV es mayor a la que tiene el sistema, la actualiza automáticamente.
+   * De lo contrario, mantiene la vigente guardada en la base de datos.
+   */
+  const checkAndApplyAutoBcvAtScheduledHours = useCallback(async () => {
     try {
-      // 1. Get current America/Caracas date and time via robust timezone-independent math (UTC-4)
-      const now = new Date();
-      const utcTime = now.getTime() + (now.getTimezoneOffset() * 60 * 1000);
-      const caracasOffset = -4 * 60 * 60 * 1000;
-      const caracasTime = new Date(utcTime + caracasOffset);
-      
-      const year = caracasTime.getUTCFullYear();
-      const month = caracasTime.getUTCMonth() + 1;
-      const day = caracasTime.getUTCDate();
-      const hour = caracasTime.getUTCHours();
-      const minute = caracasTime.getUTCMinutes();
-      
-      // Checkpoints requested: "8:00 am, 11:50am, 2:30am, 6:00pm, 8:30 pm"
-      // Represented in 24h format:
-      // 2:30 am -> "02:30"
-      // 8:00 am -> "08:00"
-      // 11:50 am -> "11:50"
-      // 6:00 pm -> "18:00"
-      // 8:30 pm -> "20:30"
-      const checkTimes = ["02:30", "08:00", "11:50", "18:00", "20:30"];
-      
-      const formatDateStr = (y: number, m: number, d: number) => {
-        return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-      };
-      
-      let latestCheckpointKey = "";
-      const todayStr = formatDateStr(year, month, day);
-      
-      // Find today's passed checkpoints
-      const passedToday = checkTimes.filter(t => {
-        const [ch, cm] = t.split(":").map(Number);
-        if (hour > ch) return true;
-        if (hour === ch && minute >= cm) return true;
-        return false;
-      });
-      
-      if (passedToday.length > 0) {
-        const lastT = passedToday[passedToday.length - 1];
-        latestCheckpointKey = `dolar_checkpoint_${todayStr}_${lastT}`;
-      } else {
-        // None passed today, get yesterday's last checkpoint (20:30)
-        const yesterday = new Date(utcTime - (24 * 60 * 60 * 1000) + caracasOffset);
-        const yYear = yesterday.getUTCFullYear();
-        const yMonth = yesterday.getUTCMonth() + 1;
-        const yDay = yesterday.getUTCDate();
-        
-        const yesterdayStr = formatDateStr(yYear, yMonth, yDay);
-        latestCheckpointKey = `dolar_checkpoint_${yesterdayStr}_20:30`;
-      }
-      
-      // Check if we have already successfully run the check for this checkpoint
-      const lastChecked = localStorage.getItem('copias_bellavista_last_dolar_checkpoint');
-      if (lastChecked === latestCheckpointKey) {
+      const activeSlot = getActiveAutoBcvSlot();
+      if (!activeSlot.slotId) return; // Fuera de ventana de 20:00 o 00:00
+
+      const slotProcessed = localStorage.getItem(activeSlot.slotKey);
+      if (slotProcessed) {
+        // Ya fue evaluado para este slot y fecha
         return;
       }
-      
-      console.log(`Checking official dollar rate from DolarAPI for checkpoint: ${latestCheckpointKey}`);
-      const res = await fetch('https://ve.dolarapi.com/v1/dolares');
-      if (!res.ok) {
-        throw new Error(`DolarAPI response error: ${res.status}`);
-      }
-      
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        const oficial = data.find((item: any) => item && item.fuente === 'oficial');
-        if (oficial && typeof oficial.promedio === 'number') {
-          const fetchedRate = oficial.promedio;
-          const currentDbVES = ratesRef.current.VES;
-          
-          if (fetchedRate > currentDbVES) {
-            console.log(`New higher official dollar rate detected! Current DB: ${currentDbVES}, New Fetch: ${fetchedRate}. Updating database & local state to the higher value...`);
-            try {
-              await dbService.updateCurrencyRate('VES', fetchedRate, 'Sistema (DolarAPI Auto)');
-            } catch (dbErr) {
-              console.warn("Could not save new rate to DB (unauthenticated guest session or RLS policy), updating UI locally:", dbErr);
-            }
-            
-            setCurrencyRates(prev => ({
-              ...prev,
-              VES: fetchedRate
-            }));
-          } else {
-            console.log(`Current DB dollar rate (${currentDbVES}) is greater than or equal to official rate (${fetchedRate}). Keeping the higher value.`);
+
+      // Obtener tasa oficial del BCV
+      let bcvRate: number | null = null;
+      try {
+        const res = await fetch('/api/bcv/rates');
+        if (res.ok) {
+          const data = await res.json();
+          if (data && typeof data.usdRate === 'number' && data.usdRate > 0) {
+            bcvRate = data.usdRate;
           }
-          
-          localStorage.setItem('copias_bellavista_last_dolar_checkpoint', latestCheckpointKey);
+        }
+      } catch (e) {
+        console.warn('Error fetching auto BCV rate:', e);
+      }
+
+      if (!bcvRate) {
+        try {
+          const res = await fetch('https://ve.dolarapi.com/v1/dolares/oficial');
+          if (res.ok) {
+            const data = await res.json();
+            if (data && typeof data.promedio === 'number' && data.promedio > 0) {
+              bcvRate = data.promedio;
+            }
+          }
+        } catch (e) {
+          console.warn('Error fetching fallback auto BCV rate:', e);
+        }
+      }
+
+      if (!bcvRate || bcvRate <= 0) return;
+
+      const currentVES = ratesRef.current.VES;
+
+      // REGLA: Si la tasa BCV es mayor a la del sistema, se actualiza automáticamente.
+      // De lo contrario, se mantiene la vigente guardada en la base de datos.
+      if (bcvRate > currentVES + 0.005) {
+        const finalRate = Number(bcvRate.toFixed(4));
+        await dbService.updateCurrencyRate('VES', finalRate, `BCV Auto (${activeSlot.slotLabel})`);
+        await dbService.updateBcvRate(finalRate, `Sistema Automático (${activeSlot.slotLabel})`);
+
+        setCurrencyRates(prev => ({ ...prev, VES: finalRate }));
+        window.dispatchEvent(new CustomEvent('bellavista_bcv_rate_updated', { detail: { rate: finalRate, auto: true } }));
+        window.dispatchEvent(new CustomEvent('bellavista_settings_updated'));
+
+        localStorage.setItem(activeSlot.slotKey, `updated_${finalRate}`);
+        triggerToast(`⚡ Tasa BCV actualizada en automático (${activeSlot.slotLabel}): Bs. ${finalRate.toFixed(2)} (Mayor a la anterior Bs. ${currentVES.toFixed(2)})`);
+      } else {
+        // Si no es mayor, mantener la vigente guardada en la base de datos
+        localStorage.setItem(activeSlot.slotKey, `maintained_${currentVES}`);
+      }
+    } catch (e) {
+      console.warn('Error executing scheduled BCV auto update:', e);
+    }
+  }, [triggerToast]);
+
+  const checkAndPromptBcvRate = useCallback(async (force = false) => {
+    try {
+      // 1. Ejecutar verificación automática de horario programado (20:00 / 00:00)
+      await checkAndApplyAutoBcvAtScheduledHours();
+
+      // 2. Si no es forzado manualmente, verificar si ya se cumplió el intervalo de 1 hora
+      if (!shouldCheckBcvRate(force)) {
+        return;
+      }
+
+      // Registrar timestamp de la verificación de esta hora
+      recordBcvCheckTimestamp();
+
+      // 3. Consultar tasa real del BCV oficial
+      let bcvData: any = null;
+      try {
+        const res = await fetch('/api/bcv/rates');
+        if (res.ok) {
+          bcvData = await res.json();
+        }
+      } catch (e) {
+        console.warn('Error fetching /api/bcv/rates:', e);
+      }
+
+      if (!bcvData || typeof bcvData.usdRate !== 'number' || bcvData.usdRate <= 0) {
+        try {
+          const resFallback = await fetch('https://ve.dolarapi.com/v1/dolares/oficial');
+          if (resFallback.ok) {
+            const fb = await resFallback.json();
+            if (fb && typeof fb.promedio === 'number' && fb.promedio > 0) {
+              bcvData = {
+                usdRate: fb.promedio,
+                isFutureRate: false,
+                valueDate: fb.fechaActualizacion
+              };
+            }
+          }
+        } catch (fbErr) {
+          console.warn('Error fallback BCV:', fbErr);
+        }
+      }
+
+      if (!bcvData || !bcvData.usdRate || bcvData.usdRate <= 0) {
+        if (force) {
+          triggerToast('No se pudo conectar con el portal oficial del BCV en este instante');
+        }
+        return;
+      }
+
+      const currentVES = ratesRef.current.VES;
+      const officialRate = bcvData.usdRate;
+      const isFuture = !!bcvData.isFutureRate;
+
+      // REGLA FUNDAMENTAL:
+      // "solo se debe actualizar cuando la tasa sea menor a la especificada en la pagina oficial o sea menor a la tasa futura.
+      // repara esto en tiempo real, no simules datos."
+      if (currentVES < officialRate - 0.005) {
+        const finalRate = Number(officialRate.toFixed(4));
+        const origin = isFuture ? 'BCV Tasa Futura' : 'BCV Oficial';
+
+        // Grabar en tiempo real en Supabase en las tablas correspondientes
+        await dbService.updateCurrencyRate('VES', finalRate, origin);
+
+        setCurrencyRates(prev => {
+          const updated = { ...prev, VES: finalRate };
+          saveCachedCurrencyRates(updated);
+          return updated;
+        });
+
+        window.dispatchEvent(new CustomEvent('bellavista_bcv_rate_updated', { detail: { rate: finalRate, auto: true } }));
+        window.dispatchEvent(new CustomEvent('bellavista_settings_updated'));
+
+        triggerToast(`⚡ Tasa BCV actualizada en tiempo real en Supabase: Bs. ${finalRate.toFixed(2)}${isFuture ? ' (Tasa Futura Oficial)' : ''}`);
+      } else {
+        // La tasa del sistema es mayor o igual a la oficial o futura: se mantiene la vigente
+        if (force) {
+          triggerToast(`La tasa del sistema (Bs. ${Number(currentVES).toFixed(2)}) está al día y vigente frente al BCV oficial (Bs. ${Number(officialRate).toFixed(2)})`);
         }
       }
     } catch (e) {
-      console.error("Error auto-updating dollar rate:", e);
+      console.warn('Error al consultar tasa BCV:', e);
+      if (force) {
+        triggerToast('No se pudo consultar el BCV en este momento');
+      }
     }
-  }, []);
+  }, [checkAndApplyAutoBcvAtScheduledHours, triggerToast]);
 
-  // Auto-Update Dolar Rate on Mount and periodic intervals + Normalize database emails to lowercase
+  // Auto-Consultar Tasa BCV al ingresar a la página, cada hora o al realizar procedimientos
   useEffect(() => {
     dbService.normalizeAllUserEmailsToLowerCase();
 
+    // 1. Consulta inicial al ingresar a la página (1.2s tras montar componentes)
     const initialTimer = setTimeout(() => {
-      checkAndAutoUpdateDolarRate();
-    }, 2000);
+      checkAndPromptBcvRate(false);
+    }, 1200);
 
+    // 2. Verificación periódica cada hora (revisa cada 5 minutos si ya transcurrió la hora)
     const intervalTimer = setInterval(() => {
-      checkAndAutoUpdateDolarRate();
-    }, 60000);
+      checkAndPromptBcvRate(false);
+    }, 5 * 60 * 1000);
+
+    // 3. Verificación al realizar cualquier procedimiento en el sistema
+    const handleProcedure = () => {
+      checkAndPromptBcvRate(false);
+    };
+    window.addEventListener('bellavista_procedure_executed', handleProcedure);
+
+    // 4. Verificación en interacciones de usuario (ventas, cobros, navegación, botones)
+    let lastInteractionTime = 0;
+    const handleUserInteraction = () => {
+      const now = Date.now();
+      // Throttling ligero para no evaluar en cada milisegundo: una vez cada 20 segundos
+      if (now - lastInteractionTime > 20000) {
+        lastInteractionTime = now;
+        checkAndPromptBcvRate(false);
+      }
+    };
+    window.addEventListener('click', handleUserInteraction, { passive: true });
+
+    // 5. Verificación al reenfocar o volver a la pestaña
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        checkAndPromptBcvRate(false);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    // 6. Consulta manual desde el botón en el Navbar
+    const handleTriggerBcvCheck = () => {
+      checkAndPromptBcvRate(true);
+    };
+    window.addEventListener('bellavista_check_bcv_rate', handleTriggerBcvCheck);
+
+    // 7. Apertura de pantalla para solicitud de cambio manual de tasa BCV
+    const handleOpenManualBcv = (e: any) => {
+      if (e?.detail?.rate) {
+        setManualBcvSuggestedRate(e.detail.rate);
+      }
+      setShowManualBcvModal(true);
+    };
+    window.addEventListener('bellavista_open_manual_bcv_modal', handleOpenManualBcv);
 
     return () => {
       clearTimeout(initialTimer);
       clearInterval(intervalTimer);
+      window.removeEventListener('bellavista_procedure_executed', handleProcedure);
+      window.removeEventListener('click', handleUserInteraction);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('bellavista_check_bcv_rate', handleTriggerBcvCheck);
+      window.removeEventListener('bellavista_open_manual_bcv_modal', handleOpenManualBcv);
     };
-  }, [checkAndAutoUpdateDolarRate]);
+  }, [checkAndPromptBcvRate]);
 
   // Update a currency rate and persist to database
   const updateCurrencyRate = async (code: string, rate: number) => {
@@ -226,32 +405,34 @@ export default function App() {
       let finalRate = rate;
       if (code === 'VES') {
         try {
-          const res = await fetch('https://ve.dolarapi.com/v1/dolares');
+          const res = await fetch('/api/bcv/rates');
           if (res.ok) {
             const data = await res.json();
-            if (Array.isArray(data)) {
-              const oficial = data.find((item: any) => item && item.fuente === 'oficial');
-              if (oficial && typeof oficial.promedio === 'number') {
-                const fetchedRate = oficial.promedio;
-                if (fetchedRate > rate) {
-                  finalRate = fetchedRate;
-                  alert(`Aviso: La tasa oficial de DolarAPI (Bs. ${fetchedRate.toFixed(2)}) es superior a la ingresada (Bs. ${rate.toFixed(2)}). Se mantendrá la tasa de mayor valor (Bs. ${fetchedRate.toFixed(2)}) en el sistema.`);
-                } else {
-                  console.log(`Tasa ingresada (${rate}) es mayor o igual a la de DolarAPI (${fetchedRate}). Manteniendo la de mayor valor.`);
-                }
+            if (data && typeof data.usdRate === 'number' && data.usdRate > 0) {
+              const officialRate = data.usdRate;
+              const isFuture = !!data.isFutureRate;
+              if (rate < officialRate - 0.0001) {
+                finalRate = officialRate;
+                alert(`Aviso: Por regla oficial, la tasa no puede ser menor a la especificada en el portal del BCV (Bs. ${officialRate.toFixed(2)})${isFuture ? ' o tasa futura' : ''}. Se establecerá en Bs. ${finalRate.toFixed(2)}.`);
               }
             }
           }
         } catch (apiErr) {
-          console.warn("No se pudo consultar DolarAPI para comparación de tasa, guardando la ingresada:", apiErr);
+          console.warn("No se pudo consultar portal BCV para comparación de tasa, guardando la ingresada:", apiErr);
         }
       }
 
       await dbService.updateCurrencyRate(code, finalRate, 'Pedro (Admin)');
-      setCurrencyRates(prev => ({
-        ...prev,
-        [code as CurrencyCode]: finalRate
-      }));
+      setCurrencyRates(prev => {
+        const updated = {
+          ...prev,
+          [code as CurrencyCode]: finalRate
+        };
+        saveCachedCurrencyRates(updated);
+        return updated;
+      });
+      window.dispatchEvent(new CustomEvent('bellavista_bcv_rate_updated', { detail: { rate: finalRate, code } }));
+      window.dispatchEvent(new CustomEvent('bellavista_settings_updated'));
     } catch (err) {
       console.error("Error updating currency rate:", err);
       alert("Error al actualizar la tasa de cambio.");
@@ -365,19 +546,6 @@ export default function App() {
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showBackToTop, setShowBackToTop] = useState(false);
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const toastTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-
-  // Display toast utility (Short duration: default 1800ms)
-  const triggerToast = (message: string, duration = 1800) => {
-    setToastMessage(message);
-    if (toastTimeoutRef.current) {
-      clearTimeout(toastTimeoutRef.current);
-    }
-    toastTimeoutRef.current = setTimeout(() => {
-      setToastMessage(null);
-    }, duration);
-  };
 
   // User Authentication State
   const [currentUser, setCurrentUser] = useState<StoreUser | null>(() => {
@@ -638,6 +806,7 @@ export default function App() {
       setBrands(brs || []);
       setProductImages(imgs || []);
       setAllProductsForCarousel(prods || []);
+      setProducts(prods || []);
     } catch (e) {
       console.error("Error loading application data:", e);
     }
@@ -1080,31 +1249,65 @@ export default function App() {
 
         {isAdminView ? (
           /* ADMINISTRATIVE MODULE VIEW */
-          <Suspense fallback={<AdminSuspenseFallback />}>
-            <AdminPanel
-              products={products}
-              categories={categories}
-              brands={brands}
-              productImages={productImages}
-              onRefreshData={handleRefreshAdminData}
-              activeRole={activeRole}
-              currentUser={currentUser}
-              initialTab={adminTab}
-              initialMenu={adminMenu}
-              onTabChange={(tab) => setAdminTab(tab)}
-              onMenuChange={(menu) => setAdminMenu(menu)}
-              activeCurrency={activeCurrency}
-              onCurrencyChange={handleCurrencyChange}
-              currencyRates={currencyRates}
-              onUpdateCurrencyRate={updateCurrencyRate}
-              isLandingActive={isLandingActive}
-              onToggleLandingActive={(val) => {
-                setIsLandingActive(val);
-                localStorage.setItem('copias_bellavista_landing_active', String(val));
-              }}
-              onLogout={handleLogout}
-            />
-          </Suspense>
+          <ErrorBoundary
+            componentName="Panel de Administración"
+            fallback={(error, reset) => (
+              <div className="min-h-[450px] flex flex-col items-center justify-center p-8 bg-white dark:bg-slate-900 rounded-3xl border border-gray-200 dark:border-gray-800 shadow-sm text-center select-none animate-fadeIn my-4 max-w-xl mx-auto">
+                <div className="w-14 h-14 bg-amber-50 dark:bg-amber-950/40 rounded-2xl flex items-center justify-center text-[#FF9900] mb-4 border border-amber-200 dark:border-amber-800/60">
+                  <RefreshCw className="w-7 h-7 animate-pulse" />
+                </div>
+                <h3 className="text-base font-black uppercase tracking-wide text-slate-900 dark:text-slate-100">
+                  Carga del Panel Administrativo
+                </h3>
+                <p className="text-xs text-slate-500 mt-2 leading-relaxed max-w-md">
+                  Se produjo una pausa temporal de red al descargar los módulos administrativos. Haz clic para reintentar o regresar a la tienda.
+                </p>
+                <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+                  <button
+                    type="button"
+                    onClick={reset}
+                    className="px-5 py-2.5 bg-[#FF9900] hover:bg-[#e68a00] text-[#131921] font-black text-xs uppercase tracking-wider rounded-xl shadow-md transition flex items-center gap-2 cursor-pointer active:scale-95"
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                    Reintentar Conexión
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsAdminView(false)}
+                    className="px-5 py-2.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-bold text-xs rounded-xl transition cursor-pointer"
+                  >
+                    Volver a la Tienda
+                  </button>
+                </div>
+              </div>
+            )}
+          >
+            <Suspense fallback={<AdminSuspenseFallback />}>
+              <AdminPanel
+                products={products}
+                categories={categories}
+                brands={brands}
+                productImages={productImages}
+                onRefreshData={handleRefreshAdminData}
+                activeRole={activeRole}
+                currentUser={currentUser}
+                initialTab={adminTab}
+                initialMenu={adminMenu}
+                onTabChange={(tab) => setAdminTab(tab as any)}
+                onMenuChange={(menu) => setAdminMenu(menu)}
+                activeCurrency={activeCurrency}
+                onCurrencyChange={handleCurrencyChange}
+                currencyRates={currencyRates}
+                onUpdateCurrencyRate={updateCurrencyRate}
+                isLandingActive={isLandingActive}
+                onToggleLandingActive={(val) => {
+                  setIsLandingActive(val);
+                  localStorage.setItem('copias_bellavista_landing_active', String(val));
+                }}
+                onLogout={handleLogout}
+              />
+            </Suspense>
+          </ErrorBoundary>
         ) : (
           /* PUBLIC MARKETPLACE VIEW */
           <>
@@ -1251,9 +1454,11 @@ export default function App() {
                       {products.map((product) => {
                         const category = categories.find(c => c.id === product.category_id);
                         const brand = brands.find(b => b.id === product.brand_id);
-                        const associatedImages = productImages
-                          .filter(img => img.product_id === product.id)
-                          .map(img => img.image_url);
+                        const associatedImages = [
+                          ...productImages.filter(img => img.product_id === product.id).map(img => img.image_url),
+                          product.technical_sheet_url,
+                          (product as any).image_url
+                        ].filter(Boolean) as string[];
 
                         return (
                           <ProductCard
@@ -1737,6 +1942,42 @@ export default function App() {
           />
         </Suspense>
       )}
+      {/* 🇻🇪 Modal de Aviso y Confirmación de Tasa Oficial BCV */}
+      {bcvQuote && (
+        <BcvRatePromptModal
+          quote={bcvQuote}
+          onClose={() => setBcvQuote(null)}
+          onOpenManualModal={() => {
+            setManualBcvSuggestedRate(bcvQuote.rate);
+            setShowManualBcvModal(true);
+          }}
+          onRateUpdated={(newRate) => {
+            setCurrencyRates(prev => ({
+              ...prev,
+              VES: newRate
+            }));
+          }}
+          triggerToast={triggerToast}
+        />
+      )}
+
+      {/* 🇻🇪 Pantalla / Modal para Solicitar el Cambio Manual de la Tasa BCV */}
+      <ManualBcvRateModal
+        isOpen={showManualBcvModal}
+        currentRate={currencyRates.VES}
+        suggestedRate={manualBcvSuggestedRate || bcvQuote?.rate}
+        onClose={() => {
+          setShowManualBcvModal(false);
+          setManualBcvSuggestedRate(null);
+        }}
+        onRateUpdated={(newRate) => {
+          setCurrencyRates(prev => ({
+            ...prev,
+            VES: newRate
+          }));
+        }}
+        triggerToast={triggerToast}
+      />
     </div>
   );
 }

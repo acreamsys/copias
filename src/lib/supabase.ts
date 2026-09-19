@@ -11,62 +11,142 @@ import {
   DiscountCode, LoyaltySettings, LoyaltyReward, StoreUser, WishlistItem, 
   BannerSlide, LandingConfig, HomeCarouselCardItem, Quote, QuoteItem, Tax, 
   PaymentMethodConfig, Invoice,
-  ReportModuleConfig, BusinessProfile, BusinessBranch, BusinessTerminal 
+  ReportModuleConfig, BusinessProfile, BusinessBranch, BusinessTerminal,
+  ProductMovementLog, SystemCurrency 
 } from '../types';
 import { sortProductsByPriority } from './searchUtils';
+import { notifyProcedureExecuted } from './bcvRateChecker';
+import { getCachedCurrencyRates, saveCachedCurrencyRates, DEFAULT_RATES, registerDynamicCurrency } from './currency';
 
-// Helper to robustly parse items that may be stringified or double-stringified
-const parseInvoiceItems = (itemsVal: any): any[] => {
-  if (Array.isArray(itemsVal)) return itemsVal;
-  if (!itemsVal) return [];
-  try {
-    let parsed = typeof itemsVal === 'string' ? JSON.parse(itemsVal) : itemsVal;
-    let limit = 5; // Prevent infinite loop in case of weird cycles
-    while (typeof parsed === 'string' && limit > 0) {
-      parsed = JSON.parse(parsed);
-      limit--;
+// Helper to robustly parse items that may be stringified or double-stringified, and normalize all product/item fields
+export const parseInvoiceItems = (itemsVal: any, fallbackInvoice?: any): any[] => {
+  let list: any[] = [];
+  if (Array.isArray(itemsVal)) {
+    list = itemsVal;
+  } else if (itemsVal) {
+    try {
+      let parsed = typeof itemsVal === 'string' ? JSON.parse(itemsVal) : itemsVal;
+      let limit = 5; // Prevent infinite loop in case of weird cycles
+      while (typeof parsed === 'string' && limit > 0) {
+        parsed = JSON.parse(parsed);
+        limit--;
+      }
+      if (Array.isArray(parsed)) {
+        list = parsed;
+      } else if (parsed && typeof parsed === 'object') {
+        list = [parsed];
+      }
+    } catch (e) {
+      console.error("Error parsing invoice items:", e);
     }
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    console.error("Error parsing invoice items:", e);
-    return [];
   }
-};
 
-// Read configuration from localStorage or initial environment
-const getInitialSettings = (): SystemSettings => {
-  const defaultUrl = 'https://absmxrciaasihyqpinlm.supabase.co';
-  const defaultKey = 'sb_publishable_rn_0iwmTGj_z1ZaneXBdpw_eSvlUIU_';
-  try {
-    const saved = localStorage.getItem('copias_bellavista_settings');
-    if (saved) {
-      const parsed = JSON.parse(saved);
+  // Normalize each item to ensure all name/sku/price/total fields are consistently populated
+  let normalized = list.map((it: any, index: number) => {
+    if (!it || typeof it !== 'object') {
       return {
-        supabaseUrl: parsed.supabaseUrl || (import.meta as any).env.VITE_SUPABASE_URL || defaultUrl,
-        supabaseAnonKey: parsed.supabaseAnonKey || (import.meta as any).env.VITE_SUPABASE_ANON_KEY || defaultKey,
-        useSupabase: parsed.useSupabase !== undefined ? parsed.useSupabase === true : true
+        id: `item-${index}`,
+        product_id: `prod-${index}`,
+        name: String(it || 'Producto / Servicio'),
+        sku: '',
+        qty: 1,
+        price: 0,
+        price_usd: 0,
+        total: 0,
+        subtotal: 0,
+        tax_id: 'exento',
+        tax_rate: 0,
+        tax_amount: 0
       };
     }
-  } catch (e) {
-    console.error("Error reading settings", e);
+    const name = it.name || it.product_name || it.nombre || it.concept || it.description || it.descripcion || it.title || `Producto ${index + 1}`;
+    const qty = Number(it.qty ?? it.quantity ?? it.cantidad ?? it.cant ?? 1) || 1;
+    const price = Number(it.price ?? it.price_usd ?? it.precio ?? it.precio_usd ?? it.unit_price ?? it.cost ?? (it.total && qty ? it.total / qty : 0)) || 0;
+    const total = Number(it.total ?? it.subtotal ?? it.monto ?? (price * qty)) || (price * qty);
+    const sku = it.sku || it.code || it.codigo || it.product_id || '';
+    const taxRate = Number(it.tax_rate ?? (it.tax_id && it.tax_id !== 'exento' ? 16 : 0)) || 0;
+    const taxId = it.tax_id || (taxRate > 0 ? 'iva-16' : 'exento');
+    const taxAmount = Number(it.tax_amount ?? (total * (taxRate / 100))) || 0;
+
+    return {
+      id: it.id || `item-${index}-${Date.now()}`,
+      product_id: it.product_id || it.id || `item-${index}`,
+      name,
+      sku,
+      qty,
+      price,
+      price_usd: price,
+      total,
+      subtotal: total,
+      tax_id: taxId,
+      tax_rate: taxRate,
+      tax_amount: taxAmount
+    };
+  });
+
+  // If no items were parsed but we have invoice metadata (e.g. from cash register or summary flash sales), generate a fallback line item
+  if (normalized.length === 0 && fallbackInvoice) {
+    const totalVal = Number(fallbackInvoice.total ?? fallbackInvoice.subtotal ?? fallbackInvoice.amount ?? 0);
+    const subtotalVal = Number(fallbackInvoice.subtotal ?? fallbackInvoice.total ?? totalVal);
+    const isNota = fallbackInvoice.document_type === 'nota_entrega' || (fallbackInvoice.control_number && String(fallbackInvoice.control_number).startsWith('NE-'));
+    const rawConcept = fallbackInvoice.notes || fallbackInvoice.concept || fallbackInvoice.description || '';
+    
+    // Clean concept if it's a technical cash op string like "Venta Flash - Factura FAC-1408 (Consumidor final)"
+    let conceptName = rawConcept;
+    const matchTech = conceptName.match(/^Venta Flash\s*-\s*(?:Factura|Nota de Entrega)\s+[A-Z0-9-]+\s*(?:\([^)]*\))?\s*(?:-\s*(.*))?$/i);
+    if (matchTech) {
+      conceptName = matchTech[1]?.trim() || (isNota ? 'Servicios de Copiado e Impresión' : 'Venta de Productos y Papelería');
+    } else if (conceptName.toLowerCase().startsWith('venta factura') || conceptName.toLowerCase().startsWith('venta nota')) {
+      conceptName = isNota ? 'Servicios de Copiado e Impresión' : 'Venta de Productos y Papelería';
+    }
+    if (!conceptName) {
+      conceptName = isNota ? 'Nota de Entrega - Servicios / Productos' : 'Factura de Venta - Papelería y Servicios';
+    }
+
+    if (totalVal > 0 || conceptName) {
+      normalized = [{
+        id: `fallback-item-1`,
+        product_id: 'flash-default',
+        name: conceptName,
+        sku: 'VENTA-FLASH',
+        qty: 1,
+        price: subtotalVal || totalVal,
+        price_usd: subtotalVal || totalVal,
+        total: totalVal,
+        subtotal: subtotalVal,
+        tax_id: Number(fallbackInvoice.iva || 0) > 0 ? 'iva-16' : 'exento',
+        tax_rate: Number(fallbackInvoice.iva || 0) > 0 ? 16 : 0,
+        tax_amount: Number(fallbackInvoice.iva || 0)
+      }];
+    }
   }
 
-  const envUrl = (import.meta as any).env.VITE_SUPABASE_URL;
-  const envKey = (import.meta as any).env.VITE_SUPABASE_ANON_KEY;
-
-  return {
-    supabaseUrl: envUrl || defaultUrl,
-    supabaseAnonKey: envKey || defaultKey,
-    useSupabase: true
-  };
+  return normalized;
 };
 
-export const currentSettings = getInitialSettings();
+// Helper to validate whether a string is a valid HTTP or HTTPS URL
+export const isValidHttpUrl = (str: string): boolean => {
+  if (!str || typeof str !== 'string') return false;
+  const trimmed = str.trim();
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) return false;
+  try {
+    const url = new URL(trimmed);
+    return (url.protocol === 'http:' || url.protocol === 'https:') && Boolean(url.hostname);
+  } catch {
+    return false;
+  }
+};
 
-// Helper to sanitize Supabase URL (strips trailing slashes and /rest/v1 if present)
-const sanitizeSupabaseUrl = (url: string): string => {
-  if (!url) return '';
+// Helper to sanitize Supabase URL (strips trailing slashes, /rest/v1, and ensures http/https scheme)
+export const sanitizeSupabaseUrl = (url: string): string => {
+  if (!url || typeof url !== 'string') return '';
   let cleaned = url.trim();
+  if (!cleaned) return '';
+
+  // If missing protocol, prepend https://
+  if (!cleaned.startsWith('http://') && !cleaned.startsWith('https://')) {
+    cleaned = 'https://' + cleaned;
+  }
   if (cleaned.endsWith('/')) {
     cleaned = cleaned.slice(0, -1);
   }
@@ -79,19 +159,125 @@ const sanitizeSupabaseUrl = (url: string): string => {
   return cleaned;
 };
 
-// Initialize actual Supabase client optionally
-export const supabase = (currentSettings.useSupabase && currentSettings.supabaseUrl && currentSettings.supabaseAnonKey)
-  ? createClient(sanitizeSupabaseUrl(currentSettings.supabaseUrl), currentSettings.supabaseAnonKey)
-  : null;
+const DEFAULT_SUPABASE_URL = 'https://absmxrciaasihyqpinlm.supabase.co';
+const DEFAULT_SUPABASE_KEY = 'sb_publishable_rn_0iwmTGj_z1ZaneXBdpw_eSvlUIU_';
 
-// Initial Local Storage setup for settings only
+// Read configuration from localStorage or initial environment
+const getInitialSettings = (): SystemSettings => {
+  try {
+    const saved = localStorage.getItem('copias_bellavista_settings');
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      const rawUrl = parsed.supabaseUrl ? String(parsed.supabaseUrl).trim() : '';
+      const sanitized = sanitizeSupabaseUrl(rawUrl);
+      const validUrl = isValidHttpUrl(sanitized) ? sanitized : DEFAULT_SUPABASE_URL;
+      const rawKey = parsed.supabaseAnonKey ? String(parsed.supabaseAnonKey).trim() : '';
+      const validKey = rawKey || DEFAULT_SUPABASE_KEY;
+
+      return {
+        supabaseUrl: validUrl,
+        supabaseAnonKey: validKey,
+        useSupabase: parsed.useSupabase !== undefined ? parsed.useSupabase === true : true
+      };
+    }
+  } catch (e) {
+    console.error("Error reading settings", e);
+  }
+
+  const envUrl = (import.meta as any).env.VITE_SUPABASE_URL;
+  const envKey = (import.meta as any).env.VITE_SUPABASE_ANON_KEY;
+  const sanitizedEnv = envUrl ? sanitizeSupabaseUrl(String(envUrl).trim()) : '';
+
+  return {
+    supabaseUrl: isValidHttpUrl(sanitizedEnv) ? sanitizedEnv : DEFAULT_SUPABASE_URL,
+    supabaseAnonKey: envKey ? String(envKey).trim() : DEFAULT_SUPABASE_KEY,
+    useSupabase: true
+  };
+};
+
+export const currentSettings = getInitialSettings();
+
+// Safe initialization of Supabase client preventing uncaught errors if URL is invalid
+const createSafeSupabaseClient = () => {
+  if (!currentSettings.useSupabase) return null;
+
+  const targetUrl = sanitizeSupabaseUrl(currentSettings.supabaseUrl);
+  const targetKey = (currentSettings.supabaseAnonKey || '').trim();
+
+  if (isValidHttpUrl(targetUrl) && targetKey) {
+    try {
+      return createClient(targetUrl, targetKey);
+    } catch (e) {
+      console.warn("Error creating Supabase client with configured URL, falling back to default:", e);
+    }
+  }
+
+  // Fallback to default verified URL and key
+  if (isValidHttpUrl(DEFAULT_SUPABASE_URL) && DEFAULT_SUPABASE_KEY) {
+    try {
+      return createClient(DEFAULT_SUPABASE_URL, DEFAULT_SUPABASE_KEY);
+    } catch (fallbackError) {
+      console.error("Critical error creating fallback Supabase client:", fallbackError);
+    }
+  }
+
+  return null;
+};
+
+// Initialize actual Supabase client safely
+export const supabase = createSafeSupabaseClient();
+
+// Setup real-time listener for currency_rates and bcv_rates to update in real time across the app
+if (supabase && typeof window !== 'undefined') {
+  try {
+    supabase
+      .channel('realtime_bcv_and_currency_rates')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'currency_rates' }, (payload: any) => {
+        if (payload.new && payload.new.code === 'VES' && payload.new.rate) {
+          const newRate = Number(payload.new.rate);
+          const cached = getCachedCurrencyRates();
+          cached.VES = newRate;
+          saveCachedCurrencyRates(cached);
+          window.dispatchEvent(new CustomEvent('bellavista_bcv_rate_updated', { detail: { rate: newRate } }));
+        }
+      })
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'bcv_rates' }, (payload: any) => {
+        if (payload.new && payload.new.rate) {
+          const newRate = Number(payload.new.rate);
+          const cached = getCachedCurrencyRates();
+          cached.VES = newRate;
+          saveCachedCurrencyRates(cached);
+          window.dispatchEvent(new CustomEvent('bellavista_bcv_rate_updated', { detail: { rate: newRate } }));
+        }
+      })
+      .subscribe();
+  } catch (err) {
+    console.warn('Could not initialize realtime listener for BCV rates:', err);
+  }
+}
+
+// Initial Local Storage setup for settings and repair if corrupted
 const initializeLocalDb = () => {
-  if (!localStorage.getItem('copias_bellavista_settings')) {
-    localStorage.setItem('copias_bellavista_settings', JSON.stringify({
-      supabaseUrl: 'https://absmxrciaasihyqpinlm.supabase.co',
-      supabaseAnonKey: 'sb_publishable_rn_0iwmTGj_z1ZaneXBdpw_eSvlUIU_',
-      useSupabase: true
-    }));
+  try {
+    const saved = localStorage.getItem('copias_bellavista_settings');
+    if (!saved) {
+      localStorage.setItem('copias_bellavista_settings', JSON.stringify({
+        supabaseUrl: DEFAULT_SUPABASE_URL,
+        supabaseAnonKey: DEFAULT_SUPABASE_KEY,
+        useSupabase: true
+      }));
+    } else {
+      const parsed = JSON.parse(saved);
+      const sanitized = sanitizeSupabaseUrl(parsed.supabaseUrl || '');
+      if (!isValidHttpUrl(sanitized)) {
+        console.warn("Invalid supabaseUrl found in localStorage, repairing with default credentials.");
+        parsed.supabaseUrl = DEFAULT_SUPABASE_URL;
+        if (!parsed.supabaseAnonKey) parsed.supabaseAnonKey = DEFAULT_SUPABASE_KEY;
+        localStorage.setItem('copias_bellavista_settings', JSON.stringify(parsed));
+      }
+    }
+  } catch (e) {
+    console.warn("Notice checking settings in localStorage:", e);
   }
 };
 
@@ -126,11 +312,81 @@ const rebuildAddressWithExtras = (
   return `${cleanAddress}${serializedExtra}`.trim();
 };
 
+// Helpers to serialize and deserialize client email and address within the phone field
+const parsePhoneExtras = (phoneStr: string) => {
+  const raw = (phoneStr || '').trim();
+  let phone = raw;
+  let email = '';
+  let address = '';
+
+  const emailMatch = raw.match(/\|\s*email:\s*([^|\n]+)/i);
+  if (emailMatch) {
+    email = emailMatch[1].trim().toLowerCase();
+  }
+
+  const addressMatch = raw.match(/\|\s*address:\s*([^|\n]+)/i);
+  if (addressMatch) {
+    address = addressMatch[1].trim();
+  }
+
+  // Clean phone by removing any "| email:..." and "| address:..."
+  phone = raw
+    .replace(/\|\s*email:[^|]*/gi, '')
+    .replace(/\|\s*address:[^|]*/gi, '')
+    .trim();
+
+  return { phone, email, address };
+};
+
+const serializePhoneWithExtras = (phone: string, email?: string, address?: string) => {
+  const parsed = parsePhoneExtras(phone || '');
+  const cleanPhone = (parsed.phone || '').trim();
+  const cleanEmail = (email !== undefined ? email : parsed.email || '').trim().toLowerCase();
+  const cleanAddress = (address !== undefined ? address : parsed.address || '').trim();
+
+  let res = cleanPhone;
+  if (cleanEmail) {
+    res += ` | email:${cleanEmail}`;
+  }
+  if (cleanAddress) {
+    res += ` | address:${cleanAddress}`;
+  }
+  return res;
+};
+
 // ==========================================
 // DB SERVICE METHODS (REAL DATABASE)
 // ==========================================
 
+export function isUUID(str?: string): boolean {
+  if (!str) return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
+}
+
+export function getDefaultPermissionsForRole(role?: string): string[] {
+  const r = (role || '').toLowerCase();
+  if (r === 'gerente' || r === 'admin' || r === 'administrador' || r === 'propietario') {
+    return ['orders', 'sales', 'products', 'caja', 'clientes', 'proveedores', 'compras', 'reportes', 'settings', 'marketing'];
+  }
+  if (r === 'cajero' || r === 'vendedor') {
+    return ['orders', 'sales', 'caja', 'clientes'];
+  }
+  if (r === 'despachador') {
+    return ['products'];
+  }
+  if (r === 'repartidor') {
+    return ['orders'];
+  }
+  return ['orders', 'sales', 'products', 'caja', 'clientes'];
+}
+
 export const dbService = {
+  supabase,
+
+  getDefaultPermissionsForRole(role?: string): string[] {
+    return getDefaultPermissionsForRole(role);
+  },
+
   // Get active settings
   getSettings(): SystemSettings {
     return getInitialSettings();
@@ -359,8 +615,33 @@ export const dbService = {
         const meta = storedMeta[p.id] || {};
         const metaLoc = (meta.location && !isForbiddenLoc(meta.location)) ? meta.location : null;
         const dbLoc = (p.location && !isForbiddenLoc(p.location)) ? p.location : null;
+
+        const dbCost = (p.cost_price !== undefined && p.cost_price !== null && Number(p.cost_price) > 0) ? Number(p.cost_price) : null;
+        const metaCost = (meta.cost_price !== undefined && meta.cost_price !== null) ? Number(meta.cost_price) : null;
+        const costPrice = dbCost ?? metaCost ?? (p.cost_price !== undefined && p.cost_price !== null ? Number(p.cost_price) : 0);
+
+        const dbMargin1 = (p.margin_1 !== undefined && p.margin_1 !== null && Number(p.margin_1) > 0) ? Number(p.margin_1) : null;
+        const metaMargin1 = (meta.margin_1 !== undefined && meta.margin_1 !== null) ? Number(meta.margin_1) : null;
+        const margin1 = dbMargin1 ?? metaMargin1 ?? (p.margin_1 !== undefined && p.margin_1 !== null ? Number(p.margin_1) : 30);
+
+        const dbMargin2 = (p.margin_2 !== undefined && p.margin_2 !== null && Number(p.margin_2) > 0) ? Number(p.margin_2) : null;
+        const metaMargin2 = (meta.margin_2 !== undefined && meta.margin_2 !== null) ? Number(meta.margin_2) : null;
+        const margin2 = dbMargin2 ?? metaMargin2 ?? (p.margin_2 !== undefined && p.margin_2 !== null ? Number(p.margin_2) : 30);
+
+        const dbMargin3 = (p.margin_3 !== undefined && p.margin_3 !== null && Number(p.margin_3) > 0) ? Number(p.margin_3) : null;
+        const metaMargin3 = (meta.margin_3 !== undefined && meta.margin_3 !== null) ? Number(meta.margin_3) : null;
+        const margin3 = dbMargin3 ?? metaMargin3 ?? (p.margin_3 !== undefined && p.margin_3 !== null ? Number(p.margin_3) : 30);
+
         return {
           ...p,
+          cost_price: costPrice,
+          margin_1: margin1,
+          margin_2: margin2,
+          margin_3: margin3,
+          selected_margin_type: p.selected_margin_type || meta.selected_margin_type || 1,
+          unit: p.unit || (p as any).units || meta.unit || meta.units || 'Unidad',
+          units: (p as any).units || p.unit || meta.units || meta.unit || 'Unidad',
+          barcode_qr: p.barcode_qr || meta.barcode_qr || '',
           location: metaLoc || dbLoc || 'Tienda Bella Vista (SP-01)',
           critical_stock: meta.critical_stock !== undefined ? meta.critical_stock : (p.critical_stock !== undefined && p.critical_stock !== null ? p.critical_stock : 5),
           expiration_date: meta.expiration_date !== undefined ? meta.expiration_date : (p.expiration_date || null),
@@ -420,8 +701,33 @@ export const dbService = {
         const meta = storedMeta[p.id] || {};
         const metaLoc = (meta.location && !isForbiddenLoc(meta.location)) ? meta.location : null;
         const dbLoc = (p.location && !isForbiddenLoc(p.location)) ? p.location : null;
+
+        const dbCost = (p.cost_price !== undefined && p.cost_price !== null && Number(p.cost_price) > 0) ? Number(p.cost_price) : null;
+        const metaCost = (meta.cost_price !== undefined && meta.cost_price !== null) ? Number(meta.cost_price) : null;
+        const costPrice = dbCost ?? metaCost ?? (p.cost_price !== undefined && p.cost_price !== null ? Number(p.cost_price) : 0);
+
+        const dbMargin1 = (p.margin_1 !== undefined && p.margin_1 !== null && Number(p.margin_1) > 0) ? Number(p.margin_1) : null;
+        const metaMargin1 = (meta.margin_1 !== undefined && meta.margin_1 !== null) ? Number(meta.margin_1) : null;
+        const margin1 = dbMargin1 ?? metaMargin1 ?? (p.margin_1 !== undefined && p.margin_1 !== null ? Number(p.margin_1) : 30);
+
+        const dbMargin2 = (p.margin_2 !== undefined && p.margin_2 !== null && Number(p.margin_2) > 0) ? Number(p.margin_2) : null;
+        const metaMargin2 = (meta.margin_2 !== undefined && meta.margin_2 !== null) ? Number(meta.margin_2) : null;
+        const margin2 = dbMargin2 ?? metaMargin2 ?? (p.margin_2 !== undefined && p.margin_2 !== null ? Number(p.margin_2) : 30);
+
+        const dbMargin3 = (p.margin_3 !== undefined && p.margin_3 !== null && Number(p.margin_3) > 0) ? Number(p.margin_3) : null;
+        const metaMargin3 = (meta.margin_3 !== undefined && meta.margin_3 !== null) ? Number(meta.margin_3) : null;
+        const margin3 = dbMargin3 ?? metaMargin3 ?? (p.margin_3 !== undefined && p.margin_3 !== null ? Number(p.margin_3) : 30);
+
         return {
           ...p,
+          cost_price: costPrice,
+          margin_1: margin1,
+          margin_2: margin2,
+          margin_3: margin3,
+          selected_margin_type: p.selected_margin_type || meta.selected_margin_type || 1,
+          unit: p.unit || (p as any).units || meta.unit || meta.units || 'Unidad',
+          units: (p as any).units || p.unit || meta.units || meta.unit || 'Unidad',
+          barcode_qr: p.barcode_qr || meta.barcode_qr || '',
           location: metaLoc || dbLoc || 'Tienda Bella Vista (SP-01)',
           critical_stock: meta.critical_stock !== undefined ? meta.critical_stock : (p.critical_stock !== undefined && p.critical_stock !== null ? p.critical_stock : 5),
           expiration_date: meta.expiration_date !== undefined ? meta.expiration_date : (p.expiration_date || null),
@@ -463,6 +769,14 @@ export const dbService = {
     
     if (newProduct.id) {
       this.saveStoredProductMeta(newProduct.id, {
+        cost_price: newProduct.cost_price !== undefined && newProduct.cost_price !== null ? Number(newProduct.cost_price) : 0,
+        margin_1: newProduct.margin_1 !== undefined && newProduct.margin_1 !== null ? Number(newProduct.margin_1) : 30,
+        margin_2: newProduct.margin_2 !== undefined && newProduct.margin_2 !== null ? Number(newProduct.margin_2) : 30,
+        margin_3: newProduct.margin_3 !== undefined && newProduct.margin_3 !== null ? Number(newProduct.margin_3) : 30,
+        selected_margin_type: newProduct.selected_margin_type ?? 1,
+        barcode_qr: (newProduct as any).barcode_qr || '',
+        unit: (newProduct as any).unit || (newProduct as any).units || 'Unidad',
+        units: (newProduct as any).units || (newProduct as any).unit || 'Unidad',
         location: newProduct.location,
         critical_stock: newProduct.critical_stock,
         expiration_date: newProduct.expiration_date,
@@ -474,7 +788,17 @@ export const dbService = {
     try {
       const { data, error } = await supabase.from('products').insert([newProduct]).select();
       if (error) throw error;
-      return data[0] as Product;
+      const returnedCost = (data[0].cost_price !== undefined && data[0].cost_price !== null && Number(data[0].cost_price) > 0)
+        ? Number(data[0].cost_price)
+        : (newProduct.cost_price !== undefined && newProduct.cost_price !== null ? Number(newProduct.cost_price) : 0);
+
+      return {
+        ...data[0],
+        cost_price: returnedCost,
+        margin_1: (data[0].margin_1 !== undefined && data[0].margin_1 !== null && Number(data[0].margin_1) > 0) ? Number(data[0].margin_1) : (newProduct.margin_1 ?? 30),
+        unit: data[0].unit || (newProduct as any).unit || (newProduct as any).units || 'Unidad',
+        units: data[0].units || (newProduct as any).units || (newProduct as any).unit || 'Unidad'
+      } as Product;
     } catch (err: any) {
       if (err && (err.code === '42703' || (err.message && (err.message.includes('barcode_qr') || err.message.includes('cost_price') || err.message.includes('margin') || err.message.includes('unit') || err.message.includes('tax_id') || err.message.includes('tax_rate') || err.message.includes('expiration_date') || err.message.includes('critical_stock') || err.message.includes('location'))))) {
         const fallback = { ...newProduct };
@@ -496,12 +820,19 @@ export const dbService = {
         if (!fbErr && fbData && fbData[0]) {
           return {
             ...fbData[0],
+            cost_price: newProduct.cost_price ?? 0,
+            margin_1: newProduct.margin_1 ?? 30,
+            margin_2: newProduct.margin_2 ?? 30,
+            margin_3: newProduct.margin_3 ?? 30,
+            selected_margin_type: newProduct.selected_margin_type ?? 1,
+            barcode_qr: (newProduct as any).barcode_qr || null,
             tax_id: newProduct.tax_id,
             tax_rate: newProduct.tax_rate,
             expiration_date: newProduct.expiration_date,
             critical_stock: newProduct.critical_stock,
             location: newProduct.location,
-            unit: (newProduct as any).unit || (newProduct as any).units || 'Unidad'
+            unit: (newProduct as any).unit || (newProduct as any).units || 'Unidad',
+            units: (newProduct as any).units || (newProduct as any).unit || 'Unidad'
           } as Product;
         }
 
@@ -533,6 +864,14 @@ export const dbService = {
 
     if (id) {
       this.saveStoredProductMeta(id, {
+        cost_price: updatedFields.cost_price !== undefined && updatedFields.cost_price !== null ? Number(updatedFields.cost_price) : undefined,
+        margin_1: updatedFields.margin_1 !== undefined && updatedFields.margin_1 !== null ? Number(updatedFields.margin_1) : undefined,
+        margin_2: updatedFields.margin_2 !== undefined && updatedFields.margin_2 !== null ? Number(updatedFields.margin_2) : undefined,
+        margin_3: updatedFields.margin_3 !== undefined && updatedFields.margin_3 !== null ? Number(updatedFields.margin_3) : undefined,
+        selected_margin_type: updatedFields.selected_margin_type,
+        barcode_qr: (updatedFields as any).barcode_qr,
+        unit: (updatedFields as any).unit || (updatedFields as any).units,
+        units: (updatedFields as any).units || (updatedFields as any).unit,
         location: updatedFields.location,
         critical_stock: updatedFields.critical_stock,
         expiration_date: updatedFields.expiration_date,
@@ -544,7 +883,17 @@ export const dbService = {
     try {
       const { data, error } = await supabase.from('products').update(updatedFields).eq('id', id).select();
       if (error) throw error;
-      return data[0] as Product;
+      const returnedCost = (data[0].cost_price !== undefined && data[0].cost_price !== null && Number(data[0].cost_price) > 0)
+        ? Number(data[0].cost_price)
+        : (updatedFields.cost_price !== undefined && updatedFields.cost_price !== null ? Number(updatedFields.cost_price) : (data[0].cost_price ? Number(data[0].cost_price) : 0));
+
+      return {
+        ...data[0],
+        cost_price: returnedCost,
+        margin_1: (data[0].margin_1 !== undefined && data[0].margin_1 !== null && Number(data[0].margin_1) > 0) ? Number(data[0].margin_1) : (updatedFields.margin_1 !== undefined ? Number(updatedFields.margin_1) : (data[0].margin_1 ? Number(data[0].margin_1) : 30)),
+        unit: data[0].unit || (updatedFields as any).unit || (updatedFields as any).units || 'Unidad',
+        units: data[0].units || (updatedFields as any).units || (updatedFields as any).unit || 'Unidad'
+      } as Product;
     } catch (err: any) {
       if (err && (err.code === '42703' || (err.message && (err.message.includes('barcode_qr') || err.message.includes('cost_price') || err.message.includes('margin') || err.message.includes('unit') || err.message.includes('tax_id') || err.message.includes('tax_rate') || err.message.includes('expiration_date') || err.message.includes('critical_stock') || err.message.includes('location'))))) {
         const fallback = { ...updatedFields };
@@ -566,12 +915,19 @@ export const dbService = {
         if (!fbErr && fbData && fbData[0]) {
           return {
             ...fbData[0],
+            cost_price: updatedFields.cost_price !== undefined && updatedFields.cost_price !== null ? Number(updatedFields.cost_price) : (fbData[0].cost_price ? Number(fbData[0].cost_price) : 0),
+            margin_1: updatedFields.margin_1 !== undefined && updatedFields.margin_1 !== null ? Number(updatedFields.margin_1) : (fbData[0].margin_1 ? Number(fbData[0].margin_1) : 30),
+            margin_2: updatedFields.margin_2 !== undefined && updatedFields.margin_2 !== null ? Number(updatedFields.margin_2) : (fbData[0].margin_2 ? Number(fbData[0].margin_2) : 30),
+            margin_3: updatedFields.margin_3 !== undefined && updatedFields.margin_3 !== null ? Number(updatedFields.margin_3) : (fbData[0].margin_3 ? Number(fbData[0].margin_3) : 30),
+            selected_margin_type: updatedFields.selected_margin_type,
+            barcode_qr: (updatedFields as any).barcode_qr || null,
             tax_id: updatedFields.tax_id,
             tax_rate: updatedFields.tax_rate,
             expiration_date: updatedFields.expiration_date,
             critical_stock: updatedFields.critical_stock,
             location: updatedFields.location,
-            unit: (updatedFields as any).unit || (updatedFields as any).units || 'Unidad'
+            unit: (updatedFields as any).unit || (updatedFields as any).units || 'Unidad',
+            units: (updatedFields as any).units || (updatedFields as any).unit || 'Unidad'
           } as Product;
         }
 
@@ -626,6 +982,170 @@ export const dbService = {
     const { error } = await supabase.from('product_images').delete().eq('id', id);
     if (error) throw error;
     return true;
+  },
+
+  async setProductImagesForProduct(productId: string, imageUrls: string[]): Promise<ProductImage[]> {
+    if (!supabase) return [];
+    try {
+      // 1. Delete previous images for this product
+      const { error: delError } = await supabase.from('product_images').delete().eq('product_id', productId);
+      if (delError) {
+        console.warn("Notice deleting existing product images:", delError);
+      }
+
+      // 2. Insert new images
+      const imagesToInsert = imageUrls
+        .map(u => u.trim())
+        .filter(u => u !== '')
+        .slice(0, 3)
+        .map((url, idx) => ({
+          id: crypto.randomUUID(),
+          product_id: productId,
+          image_url: url,
+          sort_order: idx + 1
+        }));
+
+      if (imagesToInsert.length === 0) {
+        return [];
+      }
+
+      const { data, error: insError } = await supabase.from('product_images').insert(imagesToInsert).select();
+      if (insError) {
+        console.error("Error inserting product images:", insError);
+        return [];
+      }
+      return (data || []) as ProductImage[];
+    } catch (err) {
+      console.error("setProductImagesForProduct error:", err);
+      return [];
+    }
+  },
+
+  async uploadProductImageFile(file: File): Promise<string> {
+    if (supabase) {
+      try {
+        const fileExt = file.name.split('.').pop() || 'png';
+        const fileName = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}.${fileExt}`;
+        const filePath = `products/${fileName}`;
+        const { data, error } = await supabase.storage.from('products').upload(filePath, file, {
+          cacheControl: '3600',
+          upsert: true
+        });
+        if (!error && data) {
+          const { data: publicUrlData } = supabase.storage.from('products').getPublicUrl(filePath);
+          if (publicUrlData?.publicUrl) {
+            return publicUrlData.publicUrl;
+          }
+        }
+      } catch (err) {
+        console.warn("Supabase Storage bucket upload fallback to local canvas optimization:", err);
+      }
+    }
+
+    // Client-side image optimization to high quality webp/jpeg Data URI
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const result = e.target?.result as string;
+        if (!result) {
+          resolve('');
+          return;
+        }
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          let width = img.width;
+          let height = img.height;
+          const maxDim = 800;
+          if (width > maxDim || height > maxDim) {
+            if (width > height) {
+              height = Math.round((height * maxDim) / width);
+              width = maxDim;
+            } else {
+              width = Math.round((width * maxDim) / height);
+              height = maxDim;
+            }
+          }
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(img, 0, 0, width, height);
+            const optimized = canvas.toDataURL('image/webp', 0.85);
+            resolve(optimized);
+          } else {
+            resolve(result);
+          }
+        };
+        img.onerror = () => resolve(result);
+        img.src = result;
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  },
+
+  // Product Inventory Movements & Audit Log Operations
+  async getProductMovements(productId?: string): Promise<ProductMovementLog[]> {
+    let list: ProductMovementLog[] = [];
+    try {
+      const local = localStorage.getItem('copias_bellavista_product_movements');
+      if (local) {
+        list = JSON.parse(local);
+      }
+    } catch (e) {
+      list = [];
+    }
+
+    if (supabase) {
+      try {
+        let query = supabase.from('product_movements').select('*').order('created_at', { ascending: false });
+        if (productId) {
+          query = query.eq('product_id', productId);
+        }
+        const { data, error } = await query;
+        if (!error && data && data.length > 0) {
+          // Merge with local movements to guarantee no loss
+          const remoteIds = new Set(data.map((m: any) => m.id));
+          const combined = [...data, ...list.filter(m => !remoteIds.has(m.id))];
+          combined.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+          return productId ? combined.filter(m => m.product_id === productId) : combined;
+        }
+      } catch (err) {
+        // Table may not exist yet in Supabase, gracefully use local list
+      }
+    }
+
+    if (productId) {
+      return list.filter(m => m.product_id === productId);
+    }
+    return list;
+  },
+
+  async recordProductMovement(movement: ProductMovementLog): Promise<ProductMovementLog> {
+    const logItem: ProductMovementLog = {
+      ...movement,
+      id: movement.id || crypto.randomUUID(),
+      created_at: movement.created_at || new Date().toISOString()
+    };
+
+    try {
+      const current = await this.getProductMovements();
+      const updated = [logItem, ...current.filter(m => m.id !== logItem.id)];
+      localStorage.setItem('copias_bellavista_product_movements', JSON.stringify(updated));
+    } catch (e) {
+      console.warn("Could not save product movement to localStorage:", e);
+    }
+
+    if (supabase) {
+      try {
+        await supabase.from('product_movements').insert([logItem]);
+      } catch (err) {
+        // Fallback silently if table doesn't exist
+      }
+    }
+
+    return logItem;
   },
 
   // Helper for offline orders fallback
@@ -1150,6 +1670,17 @@ export const dbService = {
     if (error) {
       throw error;
     }
+
+    // Persist to local cache immediately and trigger application-wide real-time event
+    if (code === 'VES') {
+      const cached = getCachedCurrencyRates();
+      cached.VES = rate;
+      saveCachedCurrencyRates(cached);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('bellavista_bcv_rate_updated', { detail: { rate, code } }));
+      }
+    }
+
     return data ? data[0] : null;
   },
 
@@ -1189,20 +1720,36 @@ export const dbService = {
         }
 
         if (fetchedData && fetchedData.length > 0) {
-          apiInvoices = fetchedData.map(inv => ({
-            ...inv,
-            id: inv.id || inv.control_number || (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `inv-${Date.now()}`),
-            control_number: inv.control_number || inv.numero || inv.invoice_number || `FAC-${inv.id}`,
-            document_type: inv.document_type || (inv.control_number && inv.control_number.toString().startsWith('NE-') ? 'nota_entrega' : 'factura'),
-            customer_name: inv.customer_name || inv.cliente || inv.nombre_cliente || 'Consumidor final',
-            payment_method: inv.payment_method || inv.metodo_pago || 'Efectivo',
-            subtotal: parseFloat(String(inv.subtotal ?? inv.total ?? 0)) || 0,
-            iva: parseFloat(String(inv.iva ?? 0)) || 0,
-            total: parseFloat(String(inv.total ?? inv.subtotal ?? 0)) || 0,
-            items: parseInvoiceItems(inv.items),
-            notes: inv.notes || inv.notas || '',
-            created_at: inv.created_at || inv.fecha || new Date().toISOString()
-          }));
+          apiInvoices = fetchedData.map(inv => {
+            const rawItems = inv.items || inv.products || inv.detalles || inv.line_items || inv.items_detail;
+            const meta = (inv.taxes_detail && typeof inv.taxes_detail === 'object' && inv.taxes_detail.meta) ? inv.taxes_detail.meta : {};
+            const taxesArr = Array.isArray(inv.taxes_detail) 
+              ? inv.taxes_detail 
+              : (inv.taxes_detail && Array.isArray(inv.taxes_detail.taxes) ? inv.taxes_detail.taxes : []);
+
+            return {
+              ...inv,
+              id: inv.id || inv.control_number || (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `inv-${Date.now()}`),
+              control_number: inv.control_number || inv.numero || inv.invoice_number || `FAC-${inv.id}`,
+              document_type: inv.document_type || (inv.control_number && inv.control_number.toString().startsWith('NE-') ? 'nota_entrega' : 'factura'),
+              customer_name: inv.customer_name || inv.cliente || inv.nombre_cliente || 'Consumidor final',
+              customer_document: inv.customer_document || meta.customer_document || '',
+              customer_phone: inv.customer_phone || meta.customer_phone || '',
+              customer_email: inv.customer_email || meta.customer_email || '',
+              customer_address: inv.customer_address || meta.customer_address || '',
+              payment_method: inv.payment_method || inv.metodo_pago || 'Efectivo',
+              subtotal: parseFloat(String(inv.subtotal ?? inv.total ?? 0)) || 0,
+              discount: parseFloat(String(inv.discount ?? meta.discount ?? 0)) || 0,
+              discount_code: inv.discount_code || meta.discount_code || '',
+              iva: parseFloat(String(inv.iva ?? 0)) || 0,
+              igtf: parseFloat(String(inv.igtf ?? meta.igtf ?? 0)) || 0,
+              total: parseFloat(String(inv.total ?? inv.subtotal ?? 0)) || 0,
+              items: parseInvoiceItems(rawItems, inv),
+              taxes_detail: taxesArr,
+              notes: inv.notes || meta.notes || inv.notas || '',
+              created_at: inv.created_at || inv.fecha || new Date().toISOString()
+            };
+          });
         }
       } catch (e) {
         console.warn('Error in getInvoices (Supabase):', e);
@@ -1220,15 +1767,50 @@ export const dbService = {
       console.error('Error loading local invoices:', e);
     }
 
-    // Merge both lists, avoiding duplicates by control_number or id
+    // Merge both lists, preserving full product items and avoiding duplicates by control_number or id
     const mergedMap = new Map<string, any>();
     localInvoices.forEach(inv => {
       const key = (inv.control_number || inv.id || '').toString().trim().toUpperCase();
-      if (key) mergedMap.set(key, inv);
+      if (key) {
+        mergedMap.set(key, {
+          ...inv,
+          items: parseInvoiceItems(inv.items, inv)
+        });
+      }
     });
+
+    const isFallbackItems = (items: any[]) => {
+      if (!items || items.length === 0) return true;
+      const first = items[0];
+      if (!first) return true;
+      if (first.sku === 'VENTA-FLASH') return true;
+      const n = (first.name || '').toLowerCase();
+      if (n.includes('venta flash -') || n.startsWith('venta factura') || n.startsWith('venta nota')) return true;
+      return false;
+    };
+
     apiInvoices.forEach(inv => {
       const key = (inv.control_number || inv.id || '').toString().trim().toUpperCase();
-      if (key) mergedMap.set(key, inv);
+      if (key) {
+        const existing = mergedMap.get(key);
+        if (existing) {
+          const existingItems = parseInvoiceItems(existing.items, existing);
+          const newItems = parseInvoiceItems(inv.items, inv);
+          // Prefer whichever has real, non-fallback product items
+          const bestItems = !isFallbackItems(newItems) ? newItems : (!isFallbackItems(existingItems) ? existingItems : newItems);
+          
+          mergedMap.set(key, {
+            ...existing,
+            ...inv,
+            items: bestItems
+          });
+        } else {
+          mergedMap.set(key, {
+            ...inv,
+            items: parseInvoiceItems(inv.items, inv)
+          });
+        }
+      }
     });
 
     // 3. Scan cash operations (cash_ops) to recover any historical POS invoices that were registered in Cash but missing from table
@@ -1255,8 +1837,12 @@ export const dbService = {
               subtotal: parseFloat(String(op.amount || 0)) || 0,
               iva: 0,
               total: parseFloat(String(op.amount || 0)) || 0,
-              items: [],
-              notes: `${concept} (Sincronizado de arqueo de caja)`,
+              items: parseInvoiceItems([], {
+                total: op.amount,
+                notes: isNota ? 'Servicios de Copiado e Impresión' : 'Venta de Productos y Papelería',
+                document_type: isNota ? 'nota_entrega' : 'factura'
+              }),
+              notes: `${concept} (Sincronizado)`,
               created_at: op.created_at || new Date().toISOString()
             };
             mergedMap.set(docCode, recoveredInvoice);
@@ -1269,7 +1855,7 @@ export const dbService = {
 
     const resultList = Array.from(mergedMap.values()).map(inv => ({
       ...inv,
-      items: parseInvoiceItems(inv.items)
+      items: parseInvoiceItems(inv.items, inv)
     })).sort((a, b) => {
       const dateA = new Date(a.created_at || 0).getTime();
       const dateB = new Date(b.created_at || 0).getTime();
@@ -1286,13 +1872,57 @@ export const dbService = {
     return resultList;
   },
 
-  async createInvoice(invoice: any): Promise<any> {
-    const docType = invoice.document_type || 'factura';
+  async getInvoiceByControlOrId(identifier: string): Promise<any | null> {
+    if (!identifier) return null;
+    const cleanId = identifier.toString().trim();
+    if (supabase) {
+      try {
+        const { data, error } = await supabase
+          .from('invoices')
+          .select('*')
+          .or(`control_number.eq.${cleanId},id.eq.${cleanId}`)
+          .limit(1);
+        if (!error && data && data.length > 0) {
+          const inv = data[0];
+          const rawItems = inv.items || inv.products || inv.detalles || inv.line_items;
+          const meta = (inv.taxes_detail && typeof inv.taxes_detail === 'object' && inv.taxes_detail.meta) ? inv.taxes_detail.meta : {};
+          return {
+            ...inv,
+            id: inv.id,
+            control_number: inv.control_number || cleanId,
+            document_type: inv.document_type || (cleanId.startsWith('NE-') ? 'nota_entrega' : 'factura'),
+            customer_name: inv.customer_name || 'Consumidor final',
+            customer_document: inv.customer_document || meta.customer_document || '',
+            customer_phone: inv.customer_phone || meta.customer_phone || '',
+            customer_email: inv.customer_email || meta.customer_email || '',
+            customer_address: inv.customer_address || meta.customer_address || '',
+            payment_method: inv.payment_method || 'Efectivo',
+            subtotal: parseFloat(String(inv.subtotal ?? inv.total ?? 0)) || 0,
+            discount: parseFloat(String(inv.discount ?? meta.discount ?? 0)) || 0,
+            discount_code: inv.discount_code || meta.discount_code || '',
+            iva: parseFloat(String(inv.iva ?? 0)) || 0,
+            igtf: parseFloat(String(inv.igtf ?? meta.igtf ?? 0)) || 0,
+            total: parseFloat(String(inv.total ?? inv.subtotal ?? 0)) || 0,
+            items: parseInvoiceItems(rawItems, inv),
+            notes: inv.notes || meta.notes || '',
+            created_at: inv.created_at || new Date().toISOString()
+          };
+        }
+      } catch (err) {
+        console.warn('Error fetching invoice by identifier:', err);
+      }
+    }
+    return null;
+  },
 
-    // Generate strict consecutive control number based on MAX existing number
-    let calculatedControlNumber = '';
+  getNextInvoiceControlNumber(docType: string = 'factura'): string {
     try {
-      const allInvoices = await this.getInvoices();
+      let localInvoicesList: any[] = [];
+      try {
+        const saved = localStorage.getItem('copias_bellavista_local_invoices');
+        if (saved) localInvoicesList = JSON.parse(saved);
+      } catch (e) {}
+
       let cashOpsList: any[] = [];
       try {
         const savedOps = localStorage.getItem('copias_bellavista_cash_ops');
@@ -1312,55 +1942,80 @@ export const dbService = {
         }
       } catch (e) {}
 
-      const foundNumbers: number[] = [configuredBase];
+      let maxExistingNum = 0;
 
       if (docType === 'nota_entrega') {
-        // Collect from invoices
-        allInvoices.forEach(i => {
-          const code = (i.control_number || '').toString().toUpperCase();
-          const match = code.match(/NE-(\d+)/);
-          if (match) foundNumbers.push(parseInt(match[1], 10));
+        localInvoicesList.forEach((i: any) => {
+          const code = (i.control_number || i.invoice_number || '').toString().toUpperCase();
+          const match = code.match(/(?:NE-?|\b)(\d+)/);
+          if (match && (code.includes('NE') || i.document_type === 'nota_entrega')) {
+            const val = parseInt(match[1], 10);
+            if (!isNaN(val) && val > maxExistingNum) maxExistingNum = val;
+          }
         });
-        // Collect from cash ops
         cashOpsList.forEach(op => {
-          const match = (op.concept || '').match(/NE-(\d+)/i);
-          if (match) foundNumbers.push(parseInt(match[1], 10));
+          const concept = (op.concept || '').toString().toUpperCase();
+          const match = concept.match(/NE-?(\d+)/);
+          if (match) {
+            const val = parseInt(match[1], 10);
+            if (!isNaN(val) && val > maxExistingNum) maxExistingNum = val;
+          }
         });
 
-        const maxNum = Math.max(...foundNumbers, 1000);
-        calculatedControlNumber = `NE-${maxNum + 1}`;
+        const nextNum = maxExistingNum >= configuredBase ? maxExistingNum + 1 : configuredBase;
+        return `NE-${nextNum}`;
       } else {
-        // Collect from invoices
-        allInvoices.forEach(i => {
-          const code = (i.control_number || '').toString().toUpperCase();
-          const match = code.match(/FAC-(\d+)/);
-          if (match) foundNumbers.push(parseInt(match[1], 10));
+        localInvoicesList.forEach((i: any) => {
+          const code = (i.control_number || i.invoice_number || '').toString().toUpperCase();
+          const match = code.match(/(?:FAC-?|\b)(\d+)/);
+          if (match && (code.includes('FAC') || i.document_type !== 'nota_entrega')) {
+            const val = parseInt(match[1], 10);
+            if (!isNaN(val) && val > maxExistingNum) maxExistingNum = val;
+          }
         });
-        // Collect from cash ops
         cashOpsList.forEach(op => {
-          const match = (op.concept || '').match(/FAC-(\d+)/i);
-          if (match) foundNumbers.push(parseInt(match[1], 10));
+          const concept = (op.concept || '').toString().toUpperCase();
+          const match = concept.match(/FAC-?(\d+)/);
+          if (match) {
+            const val = parseInt(match[1], 10);
+            if (!isNaN(val) && val > maxExistingNum) maxExistingNum = val;
+          }
         });
 
-        const maxNum = Math.max(...foundNumbers, 1000);
-        calculatedControlNumber = `FAC-${maxNum + 1}`;
+        const nextNum = maxExistingNum >= configuredBase ? maxExistingNum + 1 : configuredBase;
+        return `FAC-${nextNum}`;
       }
     } catch (e) {
       const prefix = docType === 'nota_entrega' ? 'NE' : 'FAC';
-      calculatedControlNumber = `${prefix}-${Date.now().toString().slice(-4)}`;
+      return `${prefix}-1001`;
     }
+  },
+
+  async createInvoice(invoice: any): Promise<any> {
+    const docType = invoice.document_type || 'factura';
+    const calculatedControlNumber = invoice.control_number || this.getNextInvoiceControlNumber(docType);
+    const normalizedItems = parseInvoiceItems(invoice.items, invoice);
+
+    const isUuid = (id: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id || '');
+    const validId = (invoice.id && isUuid(invoice.id))
+      ? invoice.id
+      : (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : 'f' + Math.random().toString(16).substring(2, 10) + '-0000-4000-8000-' + Date.now().toString(16).padStart(12, '0').slice(-12));
 
     const newInvoice = {
-      id: invoice.id || (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `local-inv-${Date.now()}-${Math.floor(Math.random() * 10000)}`),
+      id: validId,
       ...invoice,
       document_type: docType,
-      control_number: invoice.control_number || calculatedControlNumber,
+      control_number: calculatedControlNumber,
+      items: normalizedItems,
       created_at: invoice.created_at || new Date().toISOString()
     };
 
     let savedInvoice = newInvoice;
 
-    // Immediately save locally to guarantee no data loss
+    // Notificar procedimiento para chequeo horario de tasa BCV futura
+    notifyProcedureExecuted();
+
+    // Immediately save locally to guarantee zero latency and no data loss
     try {
       const saved = localStorage.getItem('copias_bellavista_local_invoices');
       const localInvoices = saved ? JSON.parse(saved) : [];
@@ -1372,33 +2027,153 @@ export const dbService = {
 
     if (supabase) {
       try {
-        let { data, error } = await supabase.from('invoices').insert([newInvoice]).select();
-        
-        // If column document_type doesn't exist in Supabase table yet, retry without document_type field
-        if (error && (error.code === '42703' || error.message?.includes('document_type'))) {
-          console.warn("Supabase column 'document_type' not found in invoices table. Retrying insert without column:", error);
-          const { document_type, ...invoiceWithoutDocType } = newInvoice;
-          const retryRes = await supabase.from('invoices').insert([invoiceWithoutDocType]).select();
-          data = retryRes.data;
-          error = retryRes.error;
-        }
+        const taxesDetailObj = {
+          taxes: Array.isArray(invoice.taxes_detail) ? invoice.taxes_detail : [],
+          meta: {
+            customer_document: invoice.customer_document || '',
+            customer_phone: invoice.customer_phone || '',
+            customer_email: invoice.customer_email || '',
+            customer_address: invoice.customer_address || '',
+            notes: invoice.notes || '',
+            discount: Number(invoice.discount || 0),
+            discount_code: invoice.discount_code || '',
+            igtf: Number(invoice.igtf || 0),
+            bcv_rate: Number(invoice.bcv_rate || 0)
+          }
+        };
 
+        const supabasePayload = {
+          id: validId,
+          control_number: calculatedControlNumber,
+          customer_name: newInvoice.customer_name || 'Consumidor final',
+          payment_method: newInvoice.payment_method || 'Efectivo',
+          subtotal: Number(newInvoice.subtotal ?? newInvoice.total ?? 0),
+          iva: Number(newInvoice.iva ?? 0),
+          total: Number(newInvoice.total ?? newInvoice.subtotal ?? 0),
+          items: normalizedItems,
+          taxes_detail: taxesDetailObj,
+          document_type: docType,
+          currency_code: newInvoice.currency_code || 'USD',
+          currency_rates_snapshot: newInvoice.currency_rates_snapshot || null,
+          totals_by_currency: newInvoice.totals_by_currency || null,
+          split_payments: newInvoice.split_payments || null,
+          bcv_rate: Number(newInvoice.bcv_rate || 0),
+          created_at: newInvoice.created_at
+        };
+
+        const { data, error } = await supabase.from('invoices').upsert([supabasePayload], { onConflict: 'id' }).select();
+        
         if (!error && data && data[0]) {
-          savedInvoice = { ...newInvoice, ...data[0] };
-        } else {
-          console.warn("Supabase insert invoice notice:", error);
+          savedInvoice = {
+            ...newInvoice,
+            ...data[0],
+            customer_document: newInvoice.customer_document || taxesDetailObj.meta.customer_document,
+            customer_phone: newInvoice.customer_phone || taxesDetailObj.meta.customer_phone,
+            customer_email: newInvoice.customer_email || taxesDetailObj.meta.customer_email,
+            customer_address: newInvoice.customer_address || taxesDetailObj.meta.customer_address,
+            notes: newInvoice.notes || taxesDetailObj.meta.notes,
+            discount: newInvoice.discount ?? taxesDetailObj.meta.discount,
+            discount_code: newInvoice.discount_code || taxesDetailObj.meta.discount_code,
+            igtf: newInvoice.igtf ?? taxesDetailObj.meta.igtf
+          };
+        } else if (error) {
+          console.warn("Supabase upsert invoice notice:", error);
         }
       } catch (e) {
         console.warn("Supabase insert invoice exception:", e);
       }
     }
 
-    // Sync client from invoice
     try {
-      await this.syncClientFromOrder(newInvoice.customer_name, '');
-    } catch (syncErr) {
-      console.error("Error syncing client from invoice:", syncErr);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('bellavista_invoices_updated'));
+      }
+    } catch (evErr) {}
+
+    // 📋 Auto-registrar cuenta por cobrar (CxC) si la venta contiene pago a crédito / Cuentas por Cobrar
+    try {
+      const isSplit = Array.isArray(newInvoice.split_payments) && newInvoice.split_payments.length > 0;
+      let creditUsd = 0;
+      let immediatePaidUsd = 0;
+      let immediatePaidVes = 0;
+
+      if (isSplit) {
+        newInvoice.split_payments.forEach((p: any) => {
+          const isCxCPart = p.bankAccountId === 'cxc-virtual' || 
+                            p.bank_account_id === 'cxc-virtual' ||
+                            p.bankAccountId === 'cxc' ||
+                            (p.method && (p.method.toLowerCase().includes('cuentas por cobrar') || p.method.toLowerCase().includes('crédito') || p.method.toLowerCase().includes('credito')));
+          if (isCxCPart) {
+            creditUsd += Number(p.amount_usd || p.amount || 0);
+          } else {
+            immediatePaidUsd += Number(p.amount_usd || (p.currency === 'USD' ? p.amount : 0) || 0);
+            immediatePaidVes += Number(p.amount_ves || (p.currency === 'VES' ? p.amount : 0) || 0);
+          }
+        });
+      } else {
+        const methodStr = (newInvoice.payment_method || '').toLowerCase();
+        if (methodStr.includes('crédito') || methodStr.includes('credito') || methodStr.includes('cuentas por cobrar') || methodStr.includes('cxc')) {
+          creditUsd = Number(newInvoice.total) || 0;
+        }
+      }
+
+      if (creditUsd > 0.001) {
+        const invNum = newInvoice.control_number || `FAC-${newInvoice.id.substring(0, 6)}`;
+        const clientName = (newInvoice.customer_name || 'Cliente').trim();
+        const clientPhone = (newInvoice.customer_phone || '').trim();
+        const clientDoc = (newInvoice.customer_document || '').trim();
+        const entityName = clientPhone ? `${clientName} ${clientPhone}` : clientName;
+
+        const cxcRecord: AccountReceivable = {
+          id: `cxc-${newInvoice.id}`,
+          invoice_id: newInvoice.id,
+          invoice_number: invNum,
+          subject: `Crédito por Venta - Factura #${invNum}`,
+          entity_name: entityName || 'Consumidor final',
+          client_name: entityName || 'Consumidor final',
+          customer_name: clientName || 'Consumidor final',
+          customer_phone: clientPhone,
+          customer_document: clientDoc,
+          description: `Crédito registrado vía ${newInvoice.document_type === 'nota_entrega' ? 'Nota de Entrega' : 'Factura'} #${invNum}`,
+          total_amount: Number(newInvoice.total) || creditUsd,
+          paid_amount: Number(immediatePaidUsd.toFixed(2)),
+          remaining_amount: Number(creditUsd.toFixed(2)),
+          currency: 'USD',
+          bcv_rate: newInvoice.bcv_rate || 40,
+          status: (creditUsd <= 0.001 ? 'cobrado' : (immediatePaidUsd > 0 ? 'parcial' : 'pendiente')) as any,
+          issue_date: newInvoice.created_at || new Date().toISOString(),
+          due_date: new Date(new Date(newInvoice.created_at || Date.now()).getTime() + 15 * 24 * 60 * 60 * 1000).toISOString(),
+          created_at: newInvoice.created_at || new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        };
+
+        await this.saveAccountReceivable(cxcRecord).catch(err => console.warn("Error saving auto CxC:", err));
+
+        if (immediatePaidUsd > 0) {
+          const initPay: AccountReceivablePayment = {
+            id: `pay-init-${newInvoice.id}`,
+            account_receivable_id: cxcRecord.id,
+            cxc_id: cxcRecord.id,
+            amount: Number(immediatePaidUsd.toFixed(2)),
+            amount_bs: Number(immediatePaidVes.toFixed(2)) || null,
+            payment_method: 'Abono Inicial Venta',
+            payment_date: newInvoice.created_at || new Date().toISOString(),
+            reference: `ABONO-INICIAL #${invNum}`,
+            notes: `Abono inicial al procesar factura #${invNum}`,
+            created_by: 'Sistema',
+            created_at: newInvoice.created_at || new Date().toISOString()
+          };
+          await this.recordInitialAccountReceivablePayment(initPay).catch(() => {});
+        }
+      }
+    } catch (cxcErr) {
+      console.warn("Notice checking CxC from invoice:", cxcErr);
     }
+
+    // Sync client asynchronously (non-blocking)
+    this.syncClientFromOrder(newInvoice.customer_name, '').catch(syncErr => {
+      console.warn("Async error syncing client from invoice:", syncErr);
+    });
 
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('bellavista_invoices_updated'));
@@ -1571,220 +2346,341 @@ export const dbService = {
   },
 
   async getClients(): Promise<any[]> {
-    let apiClients: any[] = [];
-    if (supabase) {
-      try {
-        let fetchedData: any[] | null = null;
+    const clientsList: any[] = [];
+    const clientDebtMap = new Map<string, number>();
+    let arDataLoaded = false;
 
-        // 1. Try querying 'clients' table with order
-        try {
-          const { data, error } = await supabase
-            .from('clients')
-            .select('*')
-            .order('created_at', { ascending: false });
-          if (!error && data && data.length > 0) {
-            fetchedData = data;
-          } else if (error) {
-            // Retry without order in case created_at column does not exist
-            const retry = await supabase.from('clients').select('*');
-            if (!retry.error && retry.data && retry.data.length > 0) {
-              fetchedData = retry.data;
-            }
-          }
-        } catch (e) {
-          console.warn('Error fetching from clients table:', e);
-        }
+    // Helper functions for matching
+    const normalizeDocKey = (d?: string): string => {
+      if (!d) return '';
+      return String(d).replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+    };
 
-        // 2. If 'clients' table yielded no records or failed, try 'clientes'
-        if (!fetchedData || fetchedData.length === 0) {
-          try {
-            const { data: dClientes, error: errClientes } = await supabase.from('clientes').select('*');
-            if (!errClientes && dClientes && dClientes.length > 0) {
-              fetchedData = dClientes;
-            }
-          } catch (e) {
-            // Ignore
-          }
-        }
+    const normalizeNameKey = (n?: string): string => {
+      if (!n) return '';
+      return String(n).trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    };
 
-        // 3. If still empty, try 'customers'
-        if (!fetchedData || fetchedData.length === 0) {
-          try {
-            const { data: dCustomers, error: errCustomers } = await supabase.from('customers').select('*');
-            if (!errCustomers && dCustomers && dCustomers.length > 0) {
-              fetchedData = dCustomers;
-            }
-          } catch (e) {
-            // Ignore
-          }
-        }
+    const normalizePhoneKey = (p?: string): string => {
+      if (!p) return '';
+      const digits = String(p).replace(/\D/g, '');
+      return digits.length >= 7 ? digits.slice(-7) : digits;
+    };
 
-        if (fetchedData && fetchedData.length > 0) {
-          apiClients = fetchedData.map(c => {
-            let phone = c.phone || c.telefono || '';
-            let email = c.email || c.correo || '';
-            if (phone.includes(' | email:')) {
-              const parts = phone.split(' | email:');
-              phone = parts[0].trim();
-              if (!email) email = parts[1].trim();
+    // Load set of permanently deleted clients
+    let deletedClientsSet = new Set<string>();
+    try {
+      const deletedRaw = localStorage.getItem('copias_bellavista_deleted_clients');
+      if (deletedRaw) {
+        const deletedArr = JSON.parse(deletedRaw);
+        if (Array.isArray(deletedArr)) {
+          deletedArr.forEach((item: any) => {
+            if (typeof item === 'string') {
+              deletedClientsSet.add(item.toLowerCase().trim());
+              deletedClientsSet.add(normalizeDocKey(item));
+            } else if (item && typeof item === 'object') {
+              if (item.id) deletedClientsSet.add(String(item.id).trim().toLowerCase());
+              if (item.name) deletedClientsSet.add(normalizeNameKey(item.name));
+              if (item.document) deletedClientsSet.add(normalizeDocKey(item.document));
             }
-            return {
-              ...c,
-              id: c.id,
-              name: c.name || c.nombre || c.razon_social || c.cliente || 'Cliente',
-              document: c.document || c.documento || c.cedula || c.rif || '',
-              phone,
-              email: email ? email.trim().toLowerCase() : '',
-              correo: email ? email.trim().toLowerCase() : '',
-              code: c.code || c.codigo || '',
-              type: c.type || c.tipo || 'Natural',
-              credit_usd: Number(c.credit_usd ?? c.credito ?? c.saldo ?? 0),
-              created_at: c.created_at || c.fecha || new Date().toISOString()
-            };
           });
         }
+      }
+    } catch (e) {
+      console.warn("Error reading deleted clients list:", e);
+    }
 
-        // 4. Also merge any users registered with role 'Cliente' from store_users
-        try {
-          const { data: suData } = await supabase.from('store_users').select('*').ilike('role', 'Cliente');
-          if (suData && suData.length > 0) {
-            suData.forEach(u => {
-              const uEmail = (u.email || u.correo || '').trim().toLowerCase();
-              const uDoc = u.document || u.documento || u.cedula || u.rif || '';
-              const alreadyExists = apiClients.some(existing => 
-                (u.id && existing.id === u.id) ||
-                (uDoc && existing.document && existing.document.toLowerCase() === uDoc.toLowerCase()) ||
-                (uEmail && (existing.email === uEmail || existing.correo === uEmail))
-              );
-              if (!alreadyExists) {
-                apiClients.push({
-                  id: u.id,
-                  name: u.name || u.nombre || 'Cliente',
-                  document: uDoc,
-                  doc_type: u.doc_type || 'V',
-                  doc_number: u.doc_number || uDoc,
-                  phone: u.phone || u.telefono || '',
-                  email: uEmail,
-                  correo: uEmail,
-                  code: u.client_code || u.code || '',
-                  type: (u.doc_type === 'J' || u.doc_type === 'G') ? 'Jurídico' : 'Natural',
-                  credit_usd: Number(u.credit_usd || 0),
-                  created_at: u.created_at || new Date().toISOString(),
-                  is_active: u.is_active !== false
-                });
-              }
-            });
-          }
-        } catch (e) {
-          console.warn('Store users client query warning:', e);
+    const isClientDeleted = (candidate: any): boolean => {
+      if (!candidate) return false;
+      const cId = candidate.id ? String(candidate.id).trim().toLowerCase() : '';
+      const cDoc = normalizeDocKey(candidate.document || candidate.doc_number || candidate.documento || candidate.rif);
+      const cName = normalizeNameKey(candidate.name || candidate.nombre);
+      if (cId && deletedClientsSet.has(cId)) return true;
+      if (cDoc && deletedClientsSet.has(cDoc)) return true;
+      if (cName && deletedClientsSet.has(cName)) return true;
+      return false;
+    };
+
+    // Find existing client in list by ID, Document, Name, or Phone
+    const findExisting = (item: any): any | undefined => {
+      const targetId = item.id ? String(item.id).trim() : '';
+      const targetDoc = normalizeDocKey(item.document || item.doc_number || item.documento || item.rif);
+      const targetName = normalizeNameKey(item.name || item.nombre);
+      const targetPhone = normalizePhoneKey(item.phone || item.telefono);
+
+      return clientsList.find(c => {
+        if (targetId && c.id && String(c.id).trim() === targetId) return true;
+        const cDoc = normalizeDocKey(c.document || c.doc_number || c.documento || c.rif);
+        if (targetDoc && cDoc && targetDoc === cDoc) return true;
+        const cName = normalizeNameKey(c.name || c.nombre);
+        if (targetName && cName && targetName === cName) return true;
+        const cPhone = normalizePhoneKey(c.phone || c.telefono);
+        if (targetPhone && cPhone && targetPhone.length >= 7 && targetPhone === cPhone && (!targetName || !cName || targetName === cName)) return true;
+        return false;
+      });
+    };
+
+    // Add or merge into clientsList
+    const addOrMerge = (candidate: any, isAuthoritativeDb: boolean) => {
+      if (isClientDeleted(candidate)) return;
+      const rawName = (candidate.name || candidate.nombre || '').trim();
+      if (!rawName || rawName.toLowerCase() === 'consumidor final') return;
+
+      const parsedExtras = parsePhoneExtras(candidate.raw_phone || candidate.phone || candidate.telefono || '');
+      const phone = parsedExtras.phone || candidate.phone || candidate.telefono || '';
+      const email = (candidate.email || candidate.correo || parsedExtras.email || '').trim().toLowerCase();
+      const address = (candidate.address || candidate.direccion || parsedExtras.address || '').trim();
+      const docStr = (candidate.document || candidate.doc_number || candidate.documento || candidate.rif || '').trim();
+
+      const existing = findExisting({ ...candidate, name: rawName, document: docStr, phone });
+
+      if (existing) {
+        // Merge fields: prioritize DB data or fill missing fields
+        if (isAuthoritativeDb && candidate.id) {
+          existing.id = candidate.id;
+        }
+        if (!existing.document && docStr) existing.document = docStr;
+        if (!existing.phone && phone) existing.phone = phone;
+        if (!existing.email && email) {
+          existing.email = email;
+          existing.correo = email;
+        }
+        if (!existing.address && address) {
+          existing.address = address;
+          existing.direccion = address;
+        }
+        if (candidate.type && !existing.type) existing.type = candidate.type;
+        if (candidate.code && !existing.code) existing.code = candidate.code;
+        if (candidate.credit_usd !== undefined && candidate.credit_usd !== null) {
+          existing.credit_usd = Number(candidate.credit_usd);
+        }
+      } else {
+        clientsList.push({
+          id: candidate.id || (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `local-${Date.now()}-${Math.floor(Math.random() * 10000)}`),
+          name: rawName,
+          document: docStr,
+          phone,
+          email,
+          correo: email,
+          address,
+          direccion: address,
+          type: candidate.type || 'Natural',
+          credit_usd: Number(candidate.credit_usd || 0),
+          code: candidate.code || '',
+          is_active: candidate.is_active !== false,
+          created_at: candidate.created_at || new Date().toISOString()
+        });
+      }
+    };
+
+    // 1. Load authoritative 'clients' table from Supabase
+    if (supabase) {
+      try {
+        const { data: cData } = await supabase.from('clients').select('*');
+        if (cData && Array.isArray(cData) && cData.length > 0) {
+          cData.forEach(c => addOrMerge(c, true));
         }
       } catch (e) {
-        console.warn('Error fetching clients from Supabase:', e);
+        console.warn('Error fetching from clients table:', e);
       }
     }
 
-    // Load from localStorage
-    let localClients: any[] = [];
+    // 2. Load from local clients cache (filtering out synthetic ghosts)
     try {
       const saved = localStorage.getItem('copias_bellavista_local_clients');
       if (saved) {
-        localClients = JSON.parse(saved);
+        const localClients = JSON.parse(saved);
+        if (Array.isArray(localClients)) {
+          localClients.forEach(c => {
+            if (c.id && (String(c.id).startsWith('inv-cli-') || String(c.id).startsWith('ord-cli-'))) {
+              return; // Skip old synthetic duplicates
+            }
+            addOrMerge(c, false);
+          });
+        }
       }
     } catch (e) {
-      console.error('Error loading local clients:', e);
+      console.warn('Error loading local clients cache:', e);
     }
 
-    // Merge both lists, avoiding duplicates by document or code
-    const mergedMap = new Map<string, any>();
-    localClients.forEach(c => {
-      mergedMap.set(c.id || c.document || c.code, c);
-    });
-    apiClients.forEach(c => {
-      mergedMap.set(c.id || c.document || c.code, c);
-    });
-
-    return Array.from(mergedMap.values()).map(c => {
-      let phone = c.phone || '';
-      let email = c.email || c.correo || '';
-      if (phone.includes(' | email:')) {
-        const parts = phone.split(' | email:');
-        phone = parts[0].trim();
-        email = parts[1].trim();
+    // 3. Load from 'store_users' (role = 'Cliente')
+    if (supabase) {
+      try {
+        const { data: suData } = await supabase.from('store_users').select('*').eq('role', 'Cliente');
+        if (suData && Array.isArray(suData)) {
+          suData.forEach(u => addOrMerge(u, false));
+        }
+      } catch (e) {
+        console.warn('Error fetching from store_users:', e);
       }
+    }
 
-      const cleanEmail = (email || '').trim().toLowerCase();
+    // 4. Query 'accounts_receivable' table to calculate real active debt per client
+    if (supabase) {
+      try {
+        const { data: arData } = await supabase.from('accounts_receivable').select('*');
+        if (arData && Array.isArray(arData)) {
+          arDataLoaded = true;
+          arData.forEach(ar => {
+            const rawName = (ar.customer_name || ar.client_name || ar.entity_name || '').trim();
+            if (!rawName || rawName.toLowerCase() === 'consumidor final') return;
+
+            const phoneMatch = rawName.match(/(\+?\d{10,14})/);
+            const cleanName = phoneMatch ? rawName.replace(phoneMatch[1], '').trim() : rawName;
+            const phone = ar.customer_phone || ar.client_phone || (phoneMatch ? phoneMatch[1] : '');
+            const doc = (ar.customer_document || ar.client_document || '').trim();
+            const debt = (ar.status !== 'cobrado' && Number(ar.remaining_amount) > 0) ? Number(ar.remaining_amount) : 0;
+
+            const nameKey = normalizeNameKey(cleanName);
+            const docKey = normalizeDocKey(doc);
+            const phoneKey = normalizePhoneKey(phone);
+
+            if (nameKey) clientDebtMap.set(nameKey, (clientDebtMap.get(nameKey) || 0) + debt);
+            if (docKey) clientDebtMap.set(docKey, (clientDebtMap.get(docKey) || 0) + debt);
+            if (phoneKey) clientDebtMap.set(phoneKey, (clientDebtMap.get(phoneKey) || 0) + debt);
+          });
+        }
+      } catch (e) {
+        console.warn('Error fetching clients from accounts_receivable:', e);
+      }
+    }
+
+    // Sort clients deterministically by created_at or name so codes and IDs remain stable
+    clientsList.sort((a, b) => {
+      const dateA = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const dateB = b.created_at ? new Date(b.created_at).getTime() : 0;
+      if (dateA !== dateB) return dateA - dateB;
+      return (a.name || '').localeCompare(b.name || '');
+    });
+
+    // REORGANIZATION ENGINE: Strictly enforce 100% Unique IDs and Sequential Unique Codes (CLI-1001, CLI-1002...)
+    const usedIds = new Set<string>();
+    const usedCodes = new Set<string>();
+    let nextCodeNum = 1001;
+
+    const normalizedClients = clientsList.map((c) => {
+      const parsedExtras = parsePhoneExtras(c.raw_phone || c.phone || c.telefono || '');
+      const phone = parsedExtras.phone || c.phone || '';
+      const email = (c.email || c.correo || parsedExtras.email || '').trim().toLowerCase();
+      const address = (c.address || c.direccion || parsedExtras.address || '').trim();
 
       let docType = c.doc_type || c.tipo_documento || '';
       let docNumber = c.doc_number || c.documento || '';
       let docStr = c.document || c.rif || '';
 
-      if (!docStr) {
-        if (docType && docNumber) {
-          docStr = `${docType}-${docNumber}`;
-        } else if (docNumber) {
-          docStr = docNumber;
-        }
-      }
-
       if (docStr && (!docType || !docNumber)) {
         if (docStr.includes('-')) {
           const parts = docStr.split('-');
-          if (!docType) docType = parts[0].toUpperCase();
-          if (!docNumber) docNumber = parts.slice(1).join('-');
+          docType = parts[0].toUpperCase();
+          docNumber = parts.slice(1).join('-');
         } else {
           const match = docStr.match(/^([a-zA-Z])[-_\s]?(.*)$/);
           if (match && match[2]) {
-            if (!docType) docType = match[1].toUpperCase();
-            if (!docNumber) docNumber = match[2];
+            docType = match[1].toUpperCase();
+            docNumber = match[2];
           } else {
-            if (!docType) docType = 'V';
-            if (!docNumber) docNumber = docStr;
+            docType = 'V';
+            docNumber = docStr;
           }
         }
       }
 
-      if (!docStr && (docType || docNumber)) {
-        docStr = `${docType || 'V'}-${docNumber || ''}`;
+      // 1. Guaranteed strictly unique internal ID
+      let finalId = c.id ? String(c.id).trim() : '';
+      if (!finalId || usedIds.has(finalId)) {
+        finalId = typeof crypto !== 'undefined' && crypto.randomUUID 
+          ? crypto.randomUUID() 
+          : `cli-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+      }
+      usedIds.add(finalId);
+
+      // 2. Guaranteed strictly unique sequential Code (CLI-1001, CLI-1002...)
+      let assignedCode = '';
+      if (c.code && typeof c.code === 'string' && /^CLI-\d+$/i.test(c.code.trim())) {
+        const candidateCode = c.code.trim().toUpperCase();
+        if (!usedCodes.has(candidateCode)) {
+          assignedCode = candidateCode;
+        }
+      }
+
+      if (!assignedCode) {
+        while (usedCodes.has(`CLI-${nextCodeNum}`)) {
+          nextCodeNum++;
+        }
+        assignedCode = `CLI-${nextCodeNum}`;
+        nextCodeNum++;
+      }
+      usedCodes.add(assignedCode);
+
+      const determinedType = c.type || (docType === 'J' || docType === 'G' ? 'Jurídico' : 'Natural');
+
+      const nameKey = normalizeNameKey(c.name);
+      const docKey = normalizeDocKey(docStr);
+      const phoneKey = normalizePhoneKey(phone);
+
+      let calculatedDebt = Number(c.credit_usd || 0);
+      if (arDataLoaded) {
+        calculatedDebt = (docKey ? clientDebtMap.get(docKey) : undefined) ??
+                         clientDebtMap.get(nameKey) ??
+                         (phoneKey ? clientDebtMap.get(phoneKey) : undefined) ??
+                         Number(c.credit_usd || 0);
       }
 
       return {
-        ...c,
-        phone,
-        email: cleanEmail,
-        correo: cleanEmail,
+        id: finalId,
+        name: c.name,
         document: docStr,
-        doc_type: docType || 'V',
-        doc_number: docNumber,
-        tipo_documento: docType || 'V',
-        documento: docNumber,
-        rif: docStr
+        doc_type: docType || (docStr ? 'V' : ''),
+        doc_number: docNumber || docStr,
+        tipo_documento: docType || (docStr ? 'V' : ''),
+        documento: docNumber || docStr,
+        rif: docStr,
+        type: determinedType,
+        phone,
+        email,
+        correo: email,
+        address,
+        direccion: address,
+        credit_usd: Number(calculatedDebt.toFixed(2)),
+        code: assignedCode,
+        is_active: c.is_active !== false,
+        created_at: c.created_at || new Date().toISOString()
       };
-    }).sort((a, b) => {
-      const dateA = new Date(a.created_at || 0).getTime();
-      const dateB = new Date(b.created_at || 0).getTime();
-      return dateB - dateA;
-    });
+    }).sort((a, b) => (a.code || '').localeCompare(b.code || '') || a.name.localeCompare(b.name));
+
+    // Cache clean deduplicated & reorganized list to localStorage
+    try {
+      localStorage.setItem('copias_bellavista_local_clients', JSON.stringify(normalizedClients));
+    } catch (e) {
+      console.warn('Failed to cache clients to localStorage:', e);
+    }
+
+    return normalizedClients;
   },
 
   async createClient(client: any): Promise<any> {
-    // Generate sequential code
-    let calculatedCode = client.code;
-    if (!calculatedCode) {
-      try {
-        const allClients = await this.getClients();
-        calculatedCode = `CLI-${1001 + allClients.length}`;
-      } catch (e) {
-        calculatedCode = `CLI-${Math.floor(Math.random() * 90000) + 10000}`;
-      }
+    const rawName = (client.name || '').trim();
+    if (!rawName || rawName.toLowerCase() === 'consumidor final') {
+      return {
+        id: 'cf',
+        name: 'Consumidor final',
+        document: 'V-99999999',
+        type: 'Natural',
+        phone: '',
+        email: '',
+        address: 'Mostrador',
+        credit_usd: 0,
+        code: 'CLI-0000'
+      };
     }
 
-    const phoneWithEmail = client.email 
-      ? `${client.phone || ''} | email:${client.email}` 
-      : (client.phone || '');
+    const cleanClientEmail = (client.email || client.correo || '').trim().toLowerCase();
+    const cleanClientAddress = (client.address || client.direccion || '').trim();
+    const cleanClientPhone = parsePhoneExtras(client.phone || client.telefono || '').phone.trim();
 
     let docType = client.doc_type || client.tipo_documento || '';
     let docNumber = client.doc_number || client.documento || '';
-    let docStr = client.document || client.rif || '';
+    let docStr = (client.document || client.rif || '').trim();
 
     if (!docStr && docNumber) {
       docStr = `${docType || 'V'}-${docNumber}`;
@@ -1805,20 +2701,71 @@ export const dbService = {
       }
     }
 
-    const cleanClientEmail = (client.email || client.correo || '').trim().toLowerCase();
+    // 🔍 REAL-TIME DUPLICATE & COLLISION VERIFICATION: Check all existing clients in real time
+    const allClients = await this.getClients();
+    const normDoc = docStr.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+    const normName = rawName.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+    const existingMatch = allClients.find(c => {
+      const cDoc = (c.document || c.doc_number || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+      const cName = (c.name || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      if (normDoc && cDoc && normDoc === cDoc) return true;
+      if (normName && cName && normName === cName) return true;
+      return false;
+    });
+
+    if (existingMatch) {
+      // Client already exists: update existing client record in real-time without duplicating ID or Code
+      return await this.updateClient(existingMatch.id, {
+        name: rawName || existingMatch.name,
+        document: docStr || existingMatch.document,
+        doc_type: docType || existingMatch.doc_type,
+        doc_number: docNumber || existingMatch.doc_number,
+        phone: cleanClientPhone || existingMatch.phone,
+        email: cleanClientEmail || existingMatch.email,
+        address: cleanClientAddress || existingMatch.address,
+        type: client.type || existingMatch.type,
+        credit_usd: client.credit_usd ?? existingMatch.credit_usd
+      });
+    }
+
+    // Real-time unique sequential Code generation: scan all existing codes to prevent collision
+    const existingCodesSet = new Set<string>(allClients.map(c => (c.code || '').toUpperCase()));
+    let nextCodeNum = 1001;
+    while (existingCodesSet.has(`CLI-${nextCodeNum}`)) {
+      nextCodeNum++;
+    }
+    const calculatedCode = client.code && !existingCodesSet.has(client.code.toUpperCase()) 
+      ? client.code.toUpperCase() 
+      : `CLI-${nextCodeNum}`;
+
+    // Real-time unique ID generation: ensure the UUID does not collide with any existing ID
+    const existingIdsSet = new Set<string>(allClients.map(c => String(c.id).trim()));
+    let newId = client.id ? String(client.id).trim() : '';
+    if (!newId || existingIdsSet.has(newId)) {
+      newId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `cli-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+    }
+
+    const phoneWithExtras = serializePhoneWithExtras(
+      cleanClientPhone,
+      cleanClientEmail,
+      cleanClientAddress
+    );
 
     const newClient = {
-      id: client.id || (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `local-${Math.floor(Math.random() * 1000000)}`),
-      name: client.name,
+      id: newId,
+      name: rawName,
       document: docStr,
-      doc_type: docType || 'V',
-      doc_number: docNumber,
-      tipo_documento: docType || 'V',
-      documento: docNumber,
+      doc_type: docType || (docStr ? 'V' : ''),
+      doc_number: docNumber || docStr,
+      tipo_documento: docType || (docStr ? 'V' : ''),
+      documento: docNumber || docStr,
       type: client.type || (docType === 'J' || docType === 'G' ? 'Jurídico' : 'Natural'),
-      phone: phoneWithEmail,
+      phone: cleanClientPhone,
       email: cleanClientEmail,
       correo: cleanClientEmail,
+      address: cleanClientAddress,
+      direccion: cleanClientAddress,
       password: client.password || '',
       credit_usd: client.credit_usd || 0,
       code: calculatedCode,
@@ -1828,127 +2775,250 @@ export const dbService = {
 
     if (supabase) {
       try {
-        const { data, error } = await supabase.from('clients').insert([newClient]).select();
+        const supabasePayload = {
+          id: newClient.id,
+          name: newClient.name,
+          document: newClient.document,
+          phone: phoneWithExtras,
+          type: newClient.type,
+          credit_usd: newClient.credit_usd || 0,
+          code: newClient.code
+        };
+        const { data, error } = await supabase.from('clients').insert([supabasePayload]).select();
         if (!error && data && data[0]) {
-          let p = data[0].phone || '';
-          let em = '';
-          if (p.includes(' | email:')) {
-            const pts = p.split(' | email:');
-            p = pts[0];
-            em = pts[1];
-          }
-          return { ...data[0], phone: p, email: em };
+          newClient.id = data[0].id;
         } else {
-          console.warn("Supabase insert client failed (likely RLS). Saving to localStorage fallback:", error);
+          console.warn("Supabase insert client notice (saving locally):", error?.message || error);
         }
       } catch (e) {
-        console.warn("Supabase insert client error. Saving to localStorage fallback:", e);
+        console.warn("Supabase insert client error:", e);
       }
     }
 
-    // Save to localStorage as fallback
+    // Save to localStorage ensuring real-time deduplication
     try {
       const saved = localStorage.getItem('copias_bellavista_local_clients');
       const localClients = saved ? JSON.parse(saved) : [];
-      localClients.push(newClient);
-      localStorage.setItem('copias_bellavista_local_clients', JSON.stringify(localClients));
+      const filtered = localClients.filter((c: any) => 
+        c.id !== newClient.id && 
+        (!normDoc || (c.document || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase() !== normDoc) &&
+        (c.name || '').toLowerCase().trim() !== normName
+      );
+      filtered.push({
+        ...newClient,
+        phone: cleanClientPhone,
+        raw_phone: phoneWithExtras,
+        email: cleanClientEmail,
+        correo: cleanClientEmail,
+        address: cleanClientAddress,
+        direccion: cleanClientAddress
+      });
+      localStorage.setItem('copias_bellavista_local_clients', JSON.stringify(filtered));
     } catch (e) {
       console.error("Failed to save client to localStorage:", e);
     }
 
-    let p = newClient.phone || '';
-    let em = '';
-    if (p.includes(' | email:')) {
-      const pts = p.split(' | email:');
-      p = pts[0];
-      em = pts[1];
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('bellavista_clients_updated'));
     }
-    return { ...newClient, phone: p, email: em };
+
+    return newClient;
   },
 
   async updateClient(id: string, updates: any): Promise<any> {
-    const updatedPayload = { ...updates };
-    if ('email' in updates || 'phone' in updates) {
-      const phone = 'phone' in updates ? updates.phone : '';
-      const email = 'email' in updates ? updates.email : '';
-      updatedPayload.phone = email ? `${phone} | email:${email}` : phone;
-      delete updatedPayload.email;
+    // 1. Extract current client in real-time
+    const allClients = await this.getClients();
+    const currentClient = allClients.find(c => c.id === id) ||
+      allClients.find(c => updates.document && c.document === updates.document) ||
+      allClients.find(c => updates.name && c.name.toLowerCase() === updates.name.toLowerCase());
+
+    const existingPhone = currentClient ? currentClient.phone : '';
+    const existingEmail = currentClient ? (currentClient.email || currentClient.correo) : '';
+    const existingAddress = currentClient ? (currentClient.address || currentClient.direccion) : '';
+
+    const newEmail = 'email' in updates ? (updates.email ?? '') : ('correo' in updates ? (updates.correo ?? '') : existingEmail);
+    const newPhone = 'phone' in updates ? (updates.phone ?? '') : ('telefono' in updates ? (updates.telefono ?? '') : existingPhone);
+    const newAddress = 'address' in updates ? (updates.address ?? '') : ('direccion' in updates ? (updates.direccion ?? '') : existingAddress);
+
+    const cleanEmail = (typeof newEmail === 'string' ? newEmail.trim().toLowerCase() : '');
+    const cleanAddress = (typeof newAddress === 'string' ? newAddress.trim() : '');
+    const cleanPhone = (typeof newPhone === 'string' ? parsePhoneExtras(newPhone).phone.trim() : '');
+
+    const phoneWithExtras = serializePhoneWithExtras(cleanPhone, cleanEmail, cleanAddress);
+
+    // Verify Code uniqueness in real time if code is provided in updates
+    let finalCode = updates.code || (currentClient ? currentClient.code : '');
+    if (updates.code) {
+      const isCodeTaken = allClients.some(c => c.id !== id && c.code && c.code.toUpperCase() === updates.code.toUpperCase());
+      if (isCodeTaken) {
+        console.warn(`Code ${updates.code} is taken. Keeping current code or generating next.`);
+        finalCode = currentClient ? currentClient.code : `CLI-${1001 + allClients.length}`;
+      }
     }
 
-    if (supabase && id && !String(id).startsWith('local-')) {
+    if (supabase && id && !String(id).startsWith('local-') && !String(id).startsWith('ord-cli-') && !String(id).startsWith('inv-cli-') && !String(id).startsWith('ar-cli-')) {
       try {
-        const { data, error } = await supabase
+        const supabaseUpdatePayload: any = {};
+        if ('name' in updates) supabaseUpdatePayload.name = updates.name;
+        if ('document' in updates) supabaseUpdatePayload.document = updates.document;
+        if ('type' in updates) supabaseUpdatePayload.type = updates.type;
+        if ('credit_usd' in updates) supabaseUpdatePayload.credit_usd = Number(updates.credit_usd);
+        if (finalCode) supabaseUpdatePayload.code = finalCode;
+        supabaseUpdatePayload.phone = phoneWithExtras;
+
+        const { error } = await supabase
           .from('clients')
-          .update(updatedPayload)
-          .eq('id', id)
-          .select();
-        if (!error && data && data[0]) {
-          let p = data[0].phone || '';
-          let em = '';
-          if (p.includes(' | email:')) {
-            const pts = p.split(' | email:');
-            p = pts[0];
-            em = pts[1];
-          }
-          return { ...data[0], phone: p, email: em };
+          .update(supabaseUpdatePayload)
+          .eq('id', id);
+
+        if (error) {
+          console.warn("Supabase update client notice:", error.message);
         }
       } catch (e) {
-        console.warn("Supabase update client error. Updating local copy instead:", e);
+        console.warn("Supabase update client error:", e);
+      }
+    }
+
+    // Update in store_users if linked
+    if (cleanEmail) {
+      try {
+        const storeUsers = await this.getStoreUsers();
+        const matchingUser = storeUsers.find(u => 
+          (u.id === id) || 
+          (currentClient && currentClient.email && u.email && u.email.toLowerCase() === currentClient.email.toLowerCase()) ||
+          (currentClient && currentClient.document && u.document && u.document === currentClient.document)
+        );
+        if (matchingUser) {
+          await this.updateStoreUser(matchingUser.id, {
+            name: updates.name || matchingUser.name,
+            email: cleanEmail,
+            phone: cleanPhone || matchingUser.phone,
+            address: cleanAddress || matchingUser.address
+          });
+        }
+      } catch (e) {
+        console.warn("Notice syncing client update to store_users:", e);
       }
     }
 
     // Update in local storage
+    let updatedResult: any = null;
     try {
       const saved = localStorage.getItem('copias_bellavista_local_clients');
-      if (saved) {
-        let localClients = JSON.parse(saved);
-        localClients = localClients.map((c: any) => {
-          if (c.id === id) {
-            return { ...c, ...updatedPayload };
-          }
-          return c;
-        });
-        localStorage.setItem('copias_bellavista_local_clients', JSON.stringify(localClients));
-        
-        const found = localClients.find((c: any) => c.id === id);
-        if (found) {
-          let p = found.phone || '';
-          let em = '';
-          if (p.includes(' | email:')) {
-            const pts = p.split(' | email:');
-            p = pts[0];
-            em = pts[1];
-          }
-          return { ...found, phone: p, email: em };
-        }
+      let localClients = saved ? JSON.parse(saved) : [];
+      let foundIndex = localClients.findIndex((c: any) => c.id === id);
+
+      if (foundIndex < 0 && currentClient) {
+        foundIndex = localClients.findIndex((c: any) => 
+          (c.document && c.document === currentClient.document) ||
+          (c.code && c.code === currentClient.code) ||
+          (c.name && c.name.toLowerCase() === currentClient.name.toLowerCase())
+        );
       }
+
+      const mergedClient = {
+        ...(currentClient || {}),
+        ...(foundIndex >= 0 ? localClients[foundIndex] : {}),
+        ...updates,
+        id: id || (currentClient ? currentClient.id : `local-${Date.now()}`),
+        code: finalCode,
+        phone: cleanPhone,
+        raw_phone: phoneWithExtras,
+        email: cleanEmail,
+        correo: cleanEmail,
+        address: cleanAddress,
+        direccion: cleanAddress
+      };
+
+      if (foundIndex >= 0) {
+        localClients[foundIndex] = mergedClient;
+      } else {
+        localClients.push(mergedClient);
+      }
+
+      localStorage.setItem('copias_bellavista_local_clients', JSON.stringify(localClients));
+      updatedResult = mergedClient;
     } catch (e) {
       console.error("Failed to update client in localStorage:", e);
     }
 
-    return null;
-  },
-
-  async deleteClient(id: string): Promise<boolean> {
-    if (supabase && id && !String(id).startsWith('local-')) {
-      try {
-        const { error } = await supabase.from('clients').delete().eq('id', id);
-        if (!error) return true;
-      } catch (e) {
-        console.warn("Supabase delete client failed. Deleting from local copy:", e);
-      }
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('bellavista_clients_updated'));
     }
 
+    return updatedResult || {
+      ...(currentClient || {}),
+      ...updates,
+      id,
+      code: finalCode,
+      phone: cleanPhone,
+      email: cleanEmail,
+      correo: cleanEmail,
+      address: cleanAddress,
+      direccion: cleanAddress
+    };
+  },
+
+  async deleteClient(id: string, name?: string, document?: string): Promise<boolean> {
+    // 1. Record in permanently deleted clients set to prevent reappearance from caches
+    try {
+      const deletedRaw = localStorage.getItem('copias_bellavista_deleted_clients');
+      const deletedArr: any[] = deletedRaw ? JSON.parse(deletedRaw) : [];
+      deletedArr.push({
+        id: id || '',
+        name: name || '',
+        document: document || '',
+        deleted_at: new Date().toISOString()
+      });
+      localStorage.setItem('copias_bellavista_deleted_clients', JSON.stringify(deletedArr));
+    } catch (e) {
+      console.warn("Failed to persist deleted client record:", e);
+    }
+
+    // 2. Remove from local storage cache
     try {
       const saved = localStorage.getItem('copias_bellavista_local_clients');
       if (saved) {
         let localClients = JSON.parse(saved);
-        localClients = localClients.filter((c: any) => c.id !== id);
+        const normDoc = (document || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+        const normName = (name || '').trim().toLowerCase();
+
+        localClients = localClients.filter((c: any) => {
+          if (id && c.id === id) return false;
+          if (normDoc && (c.document || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase() === normDoc) return false;
+          if (normName && (c.name || '').trim().toLowerCase() === normName) return false;
+          return true;
+        });
         localStorage.setItem('copias_bellavista_local_clients', JSON.stringify(localClients));
       }
     } catch (e) {
       console.error("Failed to delete client from localStorage:", e);
     }
+
+    // 3. Delete from Supabase 'clients' and 'store_users'
+    if (supabase) {
+      try {
+        if (id && !String(id).startsWith('local-')) {
+          await supabase.from('clients').delete().eq('id', id);
+        }
+        if (name && name.trim()) {
+          await supabase.from('clients').delete().ilike('name', name.trim());
+        }
+        if (document && document.trim()) {
+          await supabase.from('clients').delete().eq('document', document.trim());
+        }
+      } catch (e) {
+        console.warn("Supabase delete client notice:", e);
+      }
+    }
+
+    // 4. Real-time broadcast notification across all open tabs/modules
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('bellavista_clients_updated', {
+        detail: { deletedId: id, name, document }
+      }));
+    }
+
     return true;
   },
 
@@ -2184,9 +3254,10 @@ export const dbService = {
       created_at: op.created_at || new Date().toISOString()
     };
 
-    // Save locally first
+    // Save locally first with zero latency
     try {
-      const ops = await this.getCashOps();
+      const savedOps = localStorage.getItem('copias_bellavista_cash_ops');
+      const ops = savedOps ? JSON.parse(savedOps) : [];
       const updated = [newOp, ...ops.filter((existing: any) => existing.id !== newOp.id)];
       localStorage.setItem('copias_bellavista_cash_ops', JSON.stringify(updated));
     } catch (e) {
@@ -2560,18 +3631,19 @@ export const dbService = {
 
   // Helper to check if string is a valid UUID
   , isUUID(str?: string): boolean {
-    if (!str) return false;
-    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
+    return isUUID(str);
   }
 
   // --- STORE USERS OPERATIONS ---
   , async getStoreUsers(): Promise<StoreUser[]> {
     let dbUsers: StoreUser[] = [];
+    let dbFetched = false;
     if (supabase) {
       try {
         const { data, error } = await supabase.from('store_users').select('*').order('created_at', { ascending: false });
-        if (!error && data) {
+        if (!error && data && Array.isArray(data)) {
           dbUsers = data;
+          dbFetched = true;
         }
       } catch (e) {
         console.warn('Could not fetch store users from Supabase', e);
@@ -2588,92 +3660,36 @@ export const dbService = {
       console.warn('Error reading store users from localStorage', e);
     }
 
-    // Merge strategy: Start with localUsers, override or append with dbUsers
-    const userMap = new Map<string, StoreUser>();
-    
-    // Add local users first
+    const localMap = new Map<string, StoreUser>();
     localUsers.forEach(u => {
-      const key = (u.id || u.email || '').toLowerCase();
-      if (key) userMap.set(key, u);
-    });
-
-    // Add/override with DB users
-    dbUsers.forEach(u => {
-      const keyByEmail = (u.email || '').toLowerCase();
       const keyById = (u.id || '').toLowerCase();
-      if (keyById && userMap.has(keyById)) {
-        userMap.set(keyById, { ...userMap.get(keyById), ...u });
-      } else if (keyByEmail && userMap.has(keyByEmail)) {
-        userMap.set(keyByEmail, { ...userMap.get(keyByEmail), ...u });
-      } else {
-        userMap.set(keyById || keyByEmail, u);
-      }
+      const keyByEmail = (u.email || '').toLowerCase();
+      if (keyById) localMap.set(keyById, u);
+      if (keyByEmail) localMap.set(keyByEmail, u);
     });
 
-    let combined = Array.from(userMap.values());
-
-    // Filter out default "Cajero Bella Vista" / "Copias Bella vista" if present
-    combined = combined.filter(u => {
-      const nameLower = (u.name || '').toLowerCase();
-      const emailLower = (u.email || '').toLowerCase();
-      return !nameLower.includes('cajero bella vista') && 
-             !nameLower.includes('copias bella vista') && 
-             emailLower !== 'cajero@copiasbellavista.com';
-    });
-
-    // Default Seed Users if empty
-    if (combined.length === 0) {
-      combined = [
-        {
-          id: 'user-admin-default',
-          name: 'Administrador Principal',
-          email: 'admin@copiasbellavista.com',
-          password: 'admin123',
-          role: 'Admin',
-          permissions: ['orders', 'sales', 'products', 'caja', 'clientes', 'proveedores', 'compras', 'reportes', 'settings', 'marketing'],
-          is_active: true,
-          created_at: new Date().toISOString()
-        },
-        {
-          id: 'user-gerente-default',
-          name: 'Gerente General',
-          email: 'gerente@copiasbellavista.com',
-          password: 'gerente123',
-          role: 'Gerente',
-          permissions: ['orders', 'sales', 'products', 'caja', 'clientes', 'proveedores', 'compras', 'reportes', 'settings', 'marketing'],
-          is_active: true,
-          created_at: new Date().toISOString()
-        },
-        {
-          id: 'user-despachador-default',
-          name: 'Despachador Almacén',
-          email: 'despacho@copiasbellavista.com',
-          password: 'despacho123',
-          role: 'Despachador',
-          permissions: ['products'],
-          is_active: true,
-          created_at: new Date().toISOString()
-        },
-        {
-          id: 'user-repartidor-default',
-          name: 'Repartidor Motorizado',
-          email: 'repartidor@copiasbellavista.com',
-          password: 'repartidor123',
-          role: 'Repartidor',
-          permissions: ['orders'],
-          is_active: true,
-          created_at: new Date().toISOString()
-        }
-      ];
+    let combined: StoreUser[] = [];
+    if (dbFetched) {
+      // 100% Real data from Supabase store_users - NO simulated seed users!
+      combined = dbUsers.map(dbUser => {
+        const local = localMap.get((dbUser.id || '').toLowerCase()) || 
+                      localMap.get((dbUser.email || '').toLowerCase());
+        return {
+          ...dbUser,
+          email: (dbUser.email || '').trim().toLowerCase(),
+          password: local?.password || '123456',
+          permissions: local?.permissions || (dbUser as any).permissions || getDefaultPermissionsForRole(dbUser.role)
+        };
+      });
+    } else {
+      // Fallback only if offline/no connection
+      combined = localUsers.map(u => ({
+        ...u,
+        email: (u.email || '').trim().toLowerCase()
+      }));
     }
 
-    // Normalize all returned store users emails to lowercase
-    combined = combined.map(u => ({
-      ...u,
-      email: (u.email || '').trim().toLowerCase()
-    }));
-
-    // Save consolidated list back to LocalStorage
+    // Save real list to LocalStorage cache
     try {
       localStorage.setItem('copias_bellavista_store_users', JSON.stringify(combined));
     } catch (e) {}
@@ -2780,12 +3796,26 @@ export const dbService = {
     let savedDbUser: StoreUser | null = null;
     if (supabase) {
       try {
-        const { data, error } = await supabase.from('store_users').upsert([cleanUserPayload], { onConflict: 'email' }).select().single();
+        let dbRole = cleanUserPayload.role || 'Cajero';
+        if (dbRole === 'Vendedor') dbRole = 'Cajero';
+        if (!['Propietario', 'Admin', 'Gerente', 'Cajero', 'Despachador', 'Repartidor'].includes(dbRole)) {
+          dbRole = 'Cajero';
+        }
+
+        const supabasePayload = {
+          name: cleanUserPayload.name,
+          email: cleanUserPayload.email,
+          role: dbRole,
+          is_active: cleanUserPayload.is_active !== false,
+          updated_at: new Date().toISOString()
+        };
+
+        const { data, error } = await supabase.from('store_users').upsert([supabasePayload], { onConflict: 'email' }).select().single();
         if (!error && data) {
           savedDbUser = data;
         } else if (error) {
           console.warn('Supabase store_users insert error:', error.message);
-          const { data: d2 } = await supabase.from('store_users').insert([cleanUserPayload]).select().single();
+          const { data: d2 } = await supabase.from('store_users').insert([supabasePayload]).select().single();
           if (d2) savedDbUser = d2;
         }
       } catch (e) {
@@ -2793,10 +3823,15 @@ export const dbService = {
       }
     }
 
-    const finalUser: StoreUser = savedDbUser || {
+    const finalUser: StoreUser = savedDbUser ? {
+      ...savedDbUser,
+      password: cleanUserPayload.password || '123456',
+      permissions: cleanUserPayload.permissions || getDefaultPermissionsForRole(savedDbUser.role)
+    } : {
       id: user.id || 'usr-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4),
       ...user,
-      ...cleanUserPayload
+      ...cleanUserPayload,
+      permissions: cleanUserPayload.permissions || getDefaultPermissionsForRole(cleanUserPayload.role)
     };
 
     // Update LocalStorage
@@ -2807,6 +3842,10 @@ export const dbService = {
       const updatedUsers = [finalUser, ...localUsers.filter(u => u.email !== finalUser.email && u.id !== finalUser.id)];
       localStorage.setItem('copias_bellavista_store_users', JSON.stringify(updatedUsers));
     } catch (e) {}
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('bellavista_store_users_updated'));
+    }
 
     return finalUser;
   }
@@ -2829,8 +3868,21 @@ export const dbService = {
     let success = false;
     if (supabase && cleanId) {
       try {
-        if (this.isUUID(cleanId)) {
-          const { error, data } = await supabase.from('store_users').update(cleanUpdates).eq('id', cleanId).select();
+        const supabaseUpdates: Record<string, any> = {
+          updated_at: new Date().toISOString()
+        };
+        if (updates.name !== undefined && updates.name !== null) supabaseUpdates.name = String(updates.name).trim();
+        if (updates.email !== undefined && updates.email !== null) supabaseUpdates.email = String(updates.email).trim().toLowerCase();
+        if (updates.is_active !== undefined) supabaseUpdates.is_active = updates.is_active;
+        if (updates.role !== undefined) {
+          let r = updates.role;
+          if (r === 'Vendedor') r = 'Cajero';
+          if (!['Propietario', 'Admin', 'Gerente', 'Cajero', 'Despachador', 'Repartidor'].includes(r)) r = 'Cajero';
+          supabaseUpdates.role = r;
+        }
+
+        if (isUUID(cleanId)) {
+          const { error, data } = await supabase.from('store_users').update(supabaseUpdates).eq('id', cleanId).select();
           if (!error && data && data.length > 0) {
             success = true;
           }
@@ -2838,7 +3890,7 @@ export const dbService = {
 
         const targetEmail = (cleanId.includes('@') ? cleanId : updates.email || '').toLowerCase();
         if (!success && targetEmail) {
-          const { error, data } = await supabase.from('store_users').update(cleanUpdates).ilike('email', targetEmail).select();
+          const { error, data } = await supabase.from('store_users').update(supabaseUpdates).ilike('email', targetEmail).select();
           if (!error && data && data.length > 0) {
             success = true;
           }
@@ -2848,13 +3900,16 @@ export const dbService = {
         if (!success && (updates.name || updates.email)) {
           const localList = await this.getStoreUsers();
           const target = localList.find(u => u.id === cleanId || u.email === cleanId || (u.email && (u.email || '').toLowerCase() === cleanId.toLowerCase()));
+          let r = updates.role || target?.role || 'Cajero';
+          if (r === 'Vendedor') r = 'Cajero';
+          if (!['Propietario', 'Admin', 'Gerente', 'Cajero', 'Despachador', 'Repartidor'].includes(r)) r = 'Cajero';
+
           const fullPayload = {
             name: updates.name || target?.name || 'Usuario',
             email: (updates.email || target?.email || cleanId).toLowerCase(),
-            password: updates.password || target?.password || '123456',
-            role: updates.role || target?.role || 'Cajero',
+            role: r,
             is_active: updates.is_active !== undefined ? updates.is_active : (target?.is_active !== false),
-            ...cleanUpdates
+            updated_at: new Date().toISOString()
           };
           if (fullPayload.email) {
             const { error } = await supabase.from('store_users').upsert([fullPayload], { onConflict: 'email' });
@@ -2898,20 +3953,30 @@ export const dbService = {
       success = true;
     } catch (e) {}
 
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('bellavista_store_users_updated'));
+    }
+
     return success;
   }
 
-  , async deleteStoreUser(id: string): Promise<boolean> {
-    const cleanId = (id || '').toString();
+  , async deleteStoreUser(id: string, email?: string): Promise<boolean> {
+    const cleanId = (id || '').toString().trim();
+    const cleanEmail = (email || (cleanId.includes('@') ? cleanId : '')).trim().toLowerCase();
     let success = false;
-    if (supabase && cleanId) {
+    if (supabase) {
       try {
-        if (this.isUUID(cleanId)) {
-          await supabase.from('store_users').delete().eq('id', cleanId);
+        if (cleanId && isUUID(cleanId)) {
+          const { error } = await supabase.from('store_users').delete().eq('id', cleanId);
+          if (!error) success = true;
         }
-        const targetEmail = cleanId.includes('@') ? cleanId : '';
-        if (targetEmail) {
-          await supabase.from('store_users').delete().ilike('email', targetEmail);
+        if (cleanEmail) {
+          const { error } = await supabase.from('store_users').delete().ilike('email', cleanEmail);
+          if (!error) success = true;
+        }
+        if (cleanId && !isUUID(cleanId) && !cleanId.includes('@')) {
+          const { error } = await supabase.from('store_users').delete().eq('id', cleanId);
+          if (!error) success = true;
         }
       } catch (e) {
         console.warn('Could not delete store user from Supabase', e);
@@ -2924,10 +3989,21 @@ export const dbService = {
       const local = localStorage.getItem('copias_bellavista_store_users');
       if (local) localUsers = JSON.parse(local);
 
-      const updatedUsers = localUsers.filter(u => u.id !== cleanId && u.email !== cleanId && (u.email || '').toLowerCase() !== cleanId.toLowerCase());
+      const updatedUsers = localUsers.filter(u => {
+        const uId = (u.id || '').toString().trim();
+        const uEmail = (u.email || '').trim().toLowerCase();
+        if (cleanId && uId === cleanId) return false;
+        if (cleanId && uEmail === cleanId.toLowerCase()) return false;
+        if (cleanEmail && uEmail === cleanEmail) return false;
+        return true;
+      });
       localStorage.setItem('copias_bellavista_store_users', JSON.stringify(updatedUsers));
       success = true;
     } catch (e) {}
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('bellavista_store_users_updated'));
+    }
 
     return success;
   }
@@ -3578,6 +4654,7 @@ export const dbService = {
     purchaseData: Omit<Purchase, 'id'> & { id?: string },
     updateProductCost: boolean = false
   ): Promise<{ purchase: Purchase; updatedProducts: Product[] }> {
+    notifyProcedureExecuted();
     const allPurchases = await this.getPurchases();
     const purchaseSeq = String(allPurchases.length + 1).padStart(5, '0');
     const newId = purchaseData.id || (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `pur-${Date.now()}`);
@@ -3675,7 +4752,115 @@ export const dbService = {
       }
     }
 
+    // 3. Auto-link to Cuentas por Pagar (CXP) if purchase is credit/pending
+    const isCreditPurchase = newPurchase.payment_status === 'pendiente' ||
+      newPurchase.payment_status === 'parcial' ||
+      newPurchase.status === 'pendiente' ||
+      String(newPurchase.payment_method || '').toLowerCase().includes('crédito') ||
+      String(newPurchase.payment_method || '').toLowerCase().includes('credito') ||
+      String(newPurchase.payment_method || '').toLowerCase().includes('cxp') ||
+      String(newPurchase.payment_method || '').toLowerCase().includes('cuenta por pagar') ||
+      Boolean(newPurchase.installments && newPurchase.installments.length > 0);
+
+    if (isCreditPurchase) {
+      try {
+        const cxpId = `cxp-pur-${newPurchase.id}`;
+        const totalDebt = Number(newPurchase.total_amount || 0);
+        const paidAmount = Number(newPurchase.paid_amount ?? newPurchase.initial_payment ?? 0);
+        const remainingDebt = Math.max(0, Number((totalDebt - paidAmount).toFixed(2)));
+        const status = remainingDebt <= 0 ? 'pagado' : (paidAmount > 0 ? 'parcial' : 'pendiente');
+
+        const autoCxp: AccountPayable = {
+          id: cxpId,
+          purchase_id: newPurchase.id,
+          invoice_number: newPurchase.invoice_number,
+          entity_name: newPurchase.provider_name || 'Proveedor General',
+          provider_name: newPurchase.provider_name || 'Proveedor General',
+          provider_rif: newPurchase.provider_rif || '',
+          subject: `Factura #${newPurchase.invoice_number} - Compra`,
+          description: `Cuenta por pagar generada desde Compra Factura #${newPurchase.invoice_number}. Sede/Notas: ${newPurchase.notes || 'Principal'}`,
+          total_amount: totalDebt,
+          paid_amount: paidAmount,
+          remaining_amount: remainingDebt,
+          status: status,
+          currency: 'USD',
+          issue_date: newPurchase.date ? new Date(newPurchase.date).toISOString() : new Date().toISOString(),
+          due_date: newPurchase.due_date ? new Date(newPurchase.due_date).toISOString() : undefined,
+          installments_count: newPurchase.installments_count,
+          installments: newPurchase.installments,
+          created_at: newPurchase.created_at || new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        };
+        await this.saveAccountPayable(autoCxp);
+
+        if (paidAmount > 0) {
+          const initialPaymentRecord: AccountPayablePayment = {
+            id: `pay-init-${newPurchase.id}`,
+            cxp_id: cxpId,
+            account_payable_id: cxpId,
+            amount: paidAmount,
+            payment_method: 'Abono Inicial',
+            payment_date: newPurchase.date ? new Date(newPurchase.date).toISOString() : new Date().toISOString(),
+            reference: `Abono Inicial Factura #${newPurchase.invoice_number}`,
+            notes: `Abono inicial registrado en compra Factura #${newPurchase.invoice_number}`
+          };
+          const existingPayments = await this.getAccountsPayablePayments();
+          if (!existingPayments.some(p => p.id === initialPaymentRecord.id)) {
+            const updated = [initialPaymentRecord, ...existingPayments];
+            localStorage.setItem('copias_bellavista_accounts_payable_payments', JSON.stringify(updated));
+            if (supabase) {
+              try {
+                await supabase.from('accounts_payable_payments').insert(initialPaymentRecord);
+              } catch (e) {}
+            }
+            window.dispatchEvent(new CustomEvent('bellavista_accounts_payable_payments_updated', { detail: updated }));
+          }
+        }
+      } catch (cxpErr) {
+        console.warn('Could not auto-create CXP in createPurchase:', cxpErr);
+      }
+    }
+
+    window.dispatchEvent(new CustomEvent('bellavista_purchases_updated'));
     return { purchase: newPurchase, updatedProducts };
+  },
+
+  async updatePurchase(id: string, updates: Partial<Purchase>): Promise<Purchase | null> {
+    const all = await this.getPurchases();
+    const existing = all.find(p => p.id === id);
+    if (!existing) return null;
+
+    const updatedPurchase: Purchase = {
+      ...existing,
+      ...updates
+    };
+
+    if (supabase && id && !String(id).startsWith('pur-')) {
+      try {
+        const payload = {
+          ...updatedPurchase,
+          items: typeof updatedPurchase.items === 'object' ? JSON.stringify(updatedPurchase.items) : updatedPurchase.items,
+          installments: updatedPurchase.installments ? JSON.stringify(updatedPurchase.installments) : undefined
+        };
+        await supabase.from('purchases').update(payload).eq('id', id);
+      } catch (e) {
+        console.warn('Supabase update purchase error:', e);
+      }
+    }
+
+    try {
+      const saved = localStorage.getItem('copias_bellavista_local_purchases');
+      if (saved) {
+        let localPurchases = JSON.parse(saved);
+        localPurchases = localPurchases.map((p: any) => p.id === id ? updatedPurchase : p);
+        localStorage.setItem('copias_bellavista_local_purchases', JSON.stringify(localPurchases));
+      }
+    } catch (e) {
+      console.error('Failed to update purchase in localStorage:', e);
+    }
+
+    window.dispatchEvent(new CustomEvent('bellavista_purchases_updated'));
+    return updatedPurchase;
   },
 
   async deletePurchase(id: string): Promise<boolean> {
@@ -4287,7 +5472,7 @@ export const dbService = {
         id: 'pm-binance',
         code: 'BINANCE_PAY',
         name: 'Binance Pay (USDT)',
-        currency: 'USD',
+        currency: 'USDT',
         type: 'digital',
         description: 'Criptomoneda estable USDT / Binance Pay ID instantáneo.',
         instructions: 'Enviar por Pay ID o código QR Binance.',
@@ -4560,6 +5745,327 @@ export const dbService = {
       }
     }
     window.dispatchEvent(new CustomEvent('bellavista_taxes_updated'));
+    return true;
+  },
+
+  // ==========================================
+  // 💱 SYSTEM CURRENCIES (MONEDAS PRINCIPALES)
+  // ==========================================
+  async getCurrencies(): Promise<SystemCurrency[]> {
+    const cachedRates = getCachedCurrencyRates();
+    const defaultCurrencies: SystemCurrency[] = [
+      {
+        id: 'cur-usd',
+        code: 'USD',
+        name: 'Dólar Estadounidense (USD)',
+        symbol: '$',
+        rate: 1.00,
+        is_active: true,
+        is_main: false,
+        country_code: 'US',
+        decimals: 2,
+        position: 'prefix',
+        created_at: new Date().toISOString()
+      },
+      {
+        id: 'cur-ves',
+        code: 'VES',
+        name: 'Bolívar Venezolano (VES)',
+        symbol: 'Bs.',
+        rate: cachedRates.VES || 842.2067,
+        is_active: true,
+        is_main: true,
+        country_code: 'VE',
+        decimals: 2,
+        position: 'prefix',
+        created_at: new Date().toISOString()
+      },
+      {
+        id: 'cur-eur',
+        code: 'EUR',
+        name: 'Euro (EUR)',
+        symbol: '€',
+        rate: cachedRates.EUR || 0.92,
+        is_active: true,
+        is_main: false,
+        country_code: 'EU',
+        decimals: 2,
+        position: 'suffix',
+        created_at: new Date().toISOString()
+      },
+      {
+        id: 'cur-cop',
+        code: 'COP',
+        name: 'Peso Colombiano (COP)',
+        symbol: 'COP$',
+        rate: cachedRates.COP || 4100,
+        is_active: true,
+        is_main: false,
+        country_code: 'CO',
+        decimals: 0,
+        position: 'prefix',
+        created_at: new Date().toISOString()
+      },
+      {
+        id: 'cur-usdt',
+        code: 'USDT',
+        name: 'Tether / USDT (Binance)',
+        symbol: 'USDT',
+        rate: 1.00,
+        is_active: true,
+        is_main: false,
+        country_code: 'USDT',
+        decimals: 2,
+        position: 'suffix',
+        created_at: new Date().toISOString()
+      }
+    ];
+
+    try {
+      const savedLocal = localStorage.getItem('copias_bellavista_system_currencies');
+      let localCurrencies: SystemCurrency[] = savedLocal ? JSON.parse(savedLocal) : [];
+      let mergedCurrencies: SystemCurrency[] = [];
+
+      if (supabase) {
+        try {
+          const { data, error } = await supabase
+            .from('system_currencies')
+            .select('*')
+            .order('created_at', { ascending: true });
+
+          if (!error && data && data.length > 0) {
+            const dbCurrencies: SystemCurrency[] = data.map((c: any) => ({
+              id: c.id,
+              code: (c.code || 'USD').toUpperCase().trim(),
+              name: c.name || c.code,
+              symbol: c.symbol || '$',
+              rate: parseFloat(c.rate) || 1,
+              is_active: c.is_active !== false,
+              is_main: c.is_main === true,
+              country_code: c.country_code || (c.code === 'VES' ? 'VE' : c.code === 'EUR' ? 'EU' : c.code === 'COP' ? 'CO' : 'US'),
+              decimals: c.decimals !== undefined ? parseInt(c.decimals) : 2,
+              position: c.position || 'prefix',
+              created_at: c.created_at,
+              updated_at: c.updated_at
+            }));
+
+            mergedCurrencies = [...dbCurrencies];
+
+            // Ensure base default currencies exist
+            defaultCurrencies.forEach(def => {
+              if (!mergedCurrencies.some(c => c.code === def.code)) {
+                mergedCurrencies.push(def);
+              }
+            });
+
+            // Keep any locally created ones that might not have reached DB yet
+            localCurrencies.forEach(loc => {
+              if (!mergedCurrencies.some(c => c.code === loc.code)) {
+                mergedCurrencies.push(loc);
+              }
+            });
+          } else {
+            mergedCurrencies = localCurrencies.length > 0 ? localCurrencies : [...defaultCurrencies];
+          }
+        } catch (e) {
+          console.warn('Supabase getCurrencies exception:', e);
+          mergedCurrencies = localCurrencies.length > 0 ? localCurrencies : [...defaultCurrencies];
+        }
+      } else {
+        mergedCurrencies = localCurrencies.length > 0 ? localCurrencies : [...defaultCurrencies];
+      }
+
+      // Guarantee default currencies are always present
+      defaultCurrencies.forEach(def => {
+        if (!mergedCurrencies.some(c => c.code === def.code)) {
+          mergedCurrencies.push(def);
+        }
+      });
+
+      // Sync rates from currency_rates table if available
+      if (supabase) {
+        try {
+          const { data: rateData } = await supabase.from('currency_rates').select('*');
+          if (rateData && rateData.length > 0) {
+            rateData.forEach((r: any) => {
+              const match = mergedCurrencies.find(c => c.code === r.code);
+              if (match && r.rate) {
+                match.rate = parseFloat(r.rate);
+              }
+            });
+          }
+        } catch (_) {}
+      }
+
+      localStorage.setItem('copias_bellavista_system_currencies', JSON.stringify(mergedCurrencies));
+
+      // Register all currencies in currency.ts helper
+      mergedCurrencies.forEach(c => {
+        registerDynamicCurrency({
+          code: c.code,
+          symbol: c.symbol,
+          name: c.name,
+          position: c.position,
+          decimals: c.decimals
+        });
+      });
+
+      return mergedCurrencies;
+    } catch (e) {
+      console.warn('Error reading currencies:', e);
+      return defaultCurrencies;
+    }
+  },
+
+  async saveCurrency(currency: Partial<SystemCurrency>, updatedBy?: string): Promise<SystemCurrency> {
+    const currencies = await this.getCurrencies();
+    const code = (currency.code || 'USD').toUpperCase().trim();
+    
+    // Check if ID is a valid UUID
+    const isUuid = currency.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(currency.id);
+    const id = isUuid ? currency.id! : (currency.id || `cur-${code.toLowerCase()}-${Date.now()}`);
+
+    const cleanCurrency: SystemCurrency = {
+      id,
+      code,
+      name: currency.name || `${code}`,
+      symbol: currency.symbol || '$',
+      rate: currency.rate !== undefined ? parseFloat(currency.rate.toString()) : 1,
+      is_active: currency.is_active !== undefined ? currency.is_active : true,
+      is_main: currency.is_main === true,
+      country_code: currency.country_code || (code === 'VES' ? 'VE' : code === 'EUR' ? 'EU' : code === 'COP' ? 'CO' : code.slice(0, 2)),
+      decimals: currency.decimals !== undefined ? Number(currency.decimals) : (code === 'COP' ? 0 : 2),
+      position: currency.position || (code === 'EUR' ? 'suffix' : 'prefix'),
+      created_at: currency.created_at || new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    // If marked as is_main, unmark others
+    if (cleanCurrency.is_main) {
+      currencies.forEach(c => {
+        if (c.code !== cleanCurrency.code) {
+          c.is_main = false;
+        }
+      });
+      localStorage.setItem('copias_bellavista_active_currency', cleanCurrency.code);
+    }
+
+    const existingIndex = currencies.findIndex(c => c.id === id || c.code === code);
+    if (existingIndex > -1) {
+      currencies[existingIndex] = { ...currencies[existingIndex], ...cleanCurrency };
+    } else {
+      currencies.push(cleanCurrency);
+    }
+
+    localStorage.setItem('copias_bellavista_system_currencies', JSON.stringify(currencies));
+
+    // Register in memory CURRENCIES
+    registerDynamicCurrency({
+      code: cleanCurrency.code,
+      symbol: cleanCurrency.symbol,
+      name: cleanCurrency.name,
+      position: cleanCurrency.position,
+      decimals: cleanCurrency.decimals
+    });
+
+    // Update cached rates
+    const cachedRates = getCachedCurrencyRates();
+    cachedRates[cleanCurrency.code] = cleanCurrency.rate;
+    saveCachedCurrencyRates(cachedRates);
+
+    // Persist to Supabase
+    if (supabase) {
+      try {
+        const payload: any = {
+          code: cleanCurrency.code,
+          name: cleanCurrency.name,
+          symbol: cleanCurrency.symbol,
+          rate: cleanCurrency.rate,
+          is_active: cleanCurrency.is_active,
+          is_main: cleanCurrency.is_main || false,
+          country_code: cleanCurrency.country_code,
+          decimals: cleanCurrency.decimals,
+          position: cleanCurrency.position,
+          updated_at: cleanCurrency.updated_at
+        };
+        if (isUuid) {
+          payload.id = cleanCurrency.id;
+        }
+
+        const { data: curData, error: curErr } = await supabase
+          .from('system_currencies')
+          .upsert(payload, { onConflict: 'code' })
+          .select();
+
+        if (curErr) {
+          console.warn('Supabase save system_currencies table note:', curErr.message);
+        } else if (curData && curData.length > 0 && curData[0].id) {
+          cleanCurrency.id = curData[0].id;
+          const idx = currencies.findIndex(c => c.code === cleanCurrency.code);
+          if (idx > -1) {
+            currencies[idx].id = curData[0].id;
+            localStorage.setItem('copias_bellavista_system_currencies', JSON.stringify(currencies));
+          }
+        }
+
+        // 2. Also keep currency_rates table synchronized
+        const { error: rateErr } = await supabase.from('currency_rates').upsert({
+          code: cleanCurrency.code,
+          rate: cleanCurrency.rate,
+          updated_at: new Date().toISOString(),
+          updated_by: updatedBy || 'Administrador'
+        }, { onConflict: 'code' });
+
+        if (rateErr) {
+          console.warn('Supabase save currency_rates table note:', rateErr.message);
+        }
+      } catch (e) {
+        console.warn('Supabase saveCurrency exception:', e);
+      }
+    }
+
+    // Real-time events
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('bellavista_currencies_updated'));
+      window.dispatchEvent(new CustomEvent('bellavista_bcv_rate_updated', { detail: { rate: cleanCurrency.rate, code: cleanCurrency.code } }));
+      if (cleanCurrency.is_main) {
+        window.dispatchEvent(new CustomEvent('bellavista_currency_changed', { detail: cleanCurrency.code }));
+      }
+    }
+
+    return cleanCurrency;
+  },
+
+  async deleteCurrency(idOrCode: string): Promise<boolean> {
+    const currencies = await this.getCurrencies();
+    const target = currencies.find(c => c.id === idOrCode || c.code === idOrCode);
+    if (!target) return false;
+
+    if (target.code === 'USD') {
+      throw new Error('No es posible eliminar el Dólar (USD) ya que actúa como moneda base del sistema.');
+    }
+
+    const filtered = currencies.filter(c => c.id !== target.id && c.code !== target.code);
+    localStorage.setItem('copias_bellavista_system_currencies', JSON.stringify(filtered));
+
+    if (supabase) {
+      try {
+        const isUuid = target.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(target.id);
+        if (isUuid) {
+          await supabase.from('system_currencies').delete().or(`id.eq.${target.id},code.eq.${target.code}`);
+        } else {
+          await supabase.from('system_currencies').delete().eq('code', target.code);
+        }
+        await supabase.from('currency_rates').delete().eq('code', target.code);
+      } catch (e) {
+        console.warn('Supabase deleteCurrency exception:', e);
+      }
+    }
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('bellavista_currencies_updated'));
+    }
+
     return true;
   },
 
@@ -4957,36 +6463,213 @@ export const dbService = {
   // ============================================================================
   
   async getBankAccounts(): Promise<BankAccount[]> {
-    if (!supabase) return this._getLocalFallback('bank_accounts', [] as BankAccount[]);
-    try {
-      const { data, error } = await supabase.from('bank_accounts').select('*').order('created_at', { ascending: false });
-      if (error) throw error;
-      if (data) {
-        localStorage.setItem('copias_bellavista_bank_accounts', JSON.stringify(data));
-        return data as BankAccount[];
+    const local = this._getLocalFallback('bank_accounts', [] as BankAccount[]);
+    let apiList: BankAccount[] = [];
+    let configAccounts: BankAccount[] = [];
+
+    if (supabase) {
+      try {
+        const { data, error } = await supabase.from('bank_accounts').select('*').order('created_at', { ascending: false });
+        if (!error && data) {
+          apiList = data as BankAccount[];
+        }
+      } catch (e) {
+        console.warn('Supabase fetch bank_accounts error:', e);
       }
-    } catch (e) {
-      console.warn('Fallback to local bank accounts');
+
+      // Also read from app_config backup
+      try {
+        const { data: configData } = await supabase.from('app_config').select('*').eq('key', 'bank_accounts').maybeSingle();
+        if (configData && configData.value && Array.isArray(configData.value)) {
+          configAccounts = configData.value as BankAccount[];
+        }
+      } catch (e) {}
     }
-    return this._getLocalFallback('bank_accounts', [] as BankAccount[]);
+
+    // 🛑 Strictly exclude virtual Accounts Receivable accounts from real Bank Accounts list
+    const cleanAccounts = (rawList: BankAccount[]) => (rawList || []).filter(a => 
+      a && a.id &&
+      a.id !== 'cxc-virtual' && 
+      !a.name?.toLowerCase().includes('cuentas por cobrar') && 
+      !a.bank_name?.toLowerCase().includes('cobranzas virtual')
+    );
+
+    const validApi = cleanAccounts(apiList);
+    const validConfig = cleanAccounts(configAccounts);
+    const validLocal = cleanAccounts(local);
+
+    // 🧹 Smart deduplication prioritizing Supabase real accounts (apiList) as authoritative
+    const dedupedAccounts: BankAccount[] = [];
+    const seenSignatures = new Map<string, BankAccount>();
+    const aliasMap = new Map<string, string[]>();
+
+    // 1. First register Supabase real accounts (authoritative)
+    validApi.forEach(acc => {
+      const curr = (acc.currency || 'VES').toUpperCase().trim();
+      const cleanName = (acc.name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const cleanBank = (acc.bank_name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const sig = `${curr}::${cleanName}::${cleanBank}`;
+
+      if (!seenSignatures.has(sig)) {
+        acc.alias_ids = [acc.id];
+        seenSignatures.set(sig, acc);
+        aliasMap.set(acc.id, [acc.id]);
+        dedupedAccounts.push(acc);
+      } else {
+        // Consolidate duplicate records in Supabase (e.g. repeated MERCANTIL P2P) into primary
+        const primary = seenSignatures.get(sig)!;
+        primary.balance = parseFloat(((Number(primary.balance) || 0) + (Number(acc.balance) || 0)).toFixed(2));
+        if (!primary.account_number && acc.account_number) primary.account_number = acc.account_number;
+        if ((!primary.notes || primary.notes === '[]') && acc.notes && acc.notes !== '[]') primary.notes = acc.notes;
+        const aliases = aliasMap.get(primary.id) || [primary.id];
+        if (!aliases.includes(acc.id)) aliases.push(acc.id);
+        aliasMap.set(primary.id, aliases);
+        primary.alias_ids = aliases;
+      }
+    });
+
+    // 2. Then incorporate any config or local accounts not yet present in Supabase
+    const fallbackList = [...validConfig, ...validLocal];
+    fallbackList.forEach(acc => {
+      if (!acc || !acc.id) return;
+      const curr = (acc.currency || 'VES').toUpperCase().trim();
+      const cleanName = (acc.name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const cleanBank = (acc.bank_name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const sig = `${curr}::${cleanName}::${cleanBank}`;
+
+      if (seenSignatures.has(sig)) {
+        const primary = seenSignatures.get(sig)!;
+        if (!primary.account_number && acc.account_number) primary.account_number = acc.account_number;
+        if ((!primary.notes || primary.notes === '[]') && acc.notes && acc.notes !== '[]') primary.notes = acc.notes;
+        const aliases = aliasMap.get(primary.id) || [primary.id];
+        if (!aliases.includes(acc.id)) aliases.push(acc.id);
+        aliasMap.set(primary.id, aliases);
+        primary.alias_ids = aliases;
+      } else {
+        // New account not in Supabase yet
+        acc.alias_ids = [acc.id];
+        seenSignatures.set(sig, acc);
+        aliasMap.set(acc.id, [acc.id]);
+        dedupedAccounts.push(acc);
+      }
+    });
+
+    let accounts = dedupedAccounts;
+
+    localStorage.setItem('copias_bellavista_bank_accounts', JSON.stringify(accounts));
+
+    // Auto-sync missing local accounts to cloud in background
+    if (supabase && accounts.length > 0 && apiList.length < accounts.length) {
+      try {
+        Promise.resolve(
+          supabase.from('app_config').upsert({
+            key: 'bank_accounts',
+            value: accounts,
+            updated_at: new Date().toISOString()
+          }, { onConflict: 'key' })
+        ).catch(() => {});
+
+        accounts.forEach(acc => {
+          if (!apiList.some(apiAcc => apiAcc.id === acc.id)) {
+            const dbPayload = {
+              id: acc.id,
+              name: acc.name,
+              bank_name: acc.bank_name,
+              currency: acc.currency,
+              balance: Number(acc.balance) || 0,
+              is_active: acc.is_active !== false,
+              notes: acc.notes || null,
+              account_number: acc.account_number || null,
+              created_at: acc.created_at || new Date().toISOString(),
+              updated_at: acc.updated_at || new Date().toISOString()
+            };
+            Promise.resolve(
+              supabase!.from('bank_accounts').upsert(dbPayload, { onConflict: 'id' })
+            ).catch(() => {});
+          }
+        });
+      } catch (e) {}
+    }
+
+    return accounts;
   },
 
   async saveBankAccount(account: BankAccount): Promise<BankAccount> {
-    const isNew = !account.id;
-    if (isNew) account.id = crypto.randomUUID();
+    // 🛑 Never save or register virtual CxC as a real bank account
+    if (
+      account.id === 'cxc-virtual' || 
+      account.name?.toLowerCase().includes('cuentas por cobrar') || 
+      account.bank_name?.toLowerCase().includes('cobranzas virtual')
+    ) {
+      return account;
+    }
+
+    const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!account.id || !UUID_REGEX.test(account.id)) {
+      account.id = crypto.randomUUID();
+    }
     
+    account.currency = (account.currency || 'VES').toUpperCase().trim();
+    account.balance = Number(account.balance) || 0;
     account.updated_at = new Date().toISOString();
+    if (!account.created_at) account.created_at = new Date().toISOString();
 
     const current = await this.getBankAccounts();
-    const updated = isNew ? [...current, account] : current.map(a => a.id === account.id ? account : a);
+    const cleanCurrent = current.filter(a => a.id !== 'cxc-virtual' && !a.name?.toLowerCase().includes('cuentas por cobrar'));
+    
+    // Check if updating an existing account by ID or matching semantic identity (name + bank + currency)
+    const existingIndex = cleanCurrent.findIndex(a => 
+      a.id === account.id || 
+      (a.currency?.toUpperCase() === account.currency && 
+       a.name?.toLowerCase().trim() === account.name?.toLowerCase().trim() && 
+       (a.bank_name || '').toLowerCase().trim() === (account.bank_name || '').toLowerCase().trim())
+    );
+
+    let updated: BankAccount[];
+    if (existingIndex >= 0) {
+      // If found by name/bank/currency with a different valid ID, keep original ID
+      if (cleanCurrent[existingIndex].id && cleanCurrent[existingIndex].id !== account.id) {
+        account.id = cleanCurrent[existingIndex].id;
+      }
+      updated = cleanCurrent.map((a, idx) => idx === existingIndex ? account : a);
+    } else {
+      // Brand new account: successfully append!
+      updated = [...cleanCurrent, account];
+    }
+    
     localStorage.setItem('copias_bellavista_bank_accounts', JSON.stringify(updated));
 
     if (supabase) {
       try {
-        await supabase.from('bank_accounts').upsert(account, { onConflict: 'id' });
+        // Only send known columns to Supabase bank_accounts
+        const dbPayload = {
+          id: account.id,
+          name: account.name,
+          bank_name: account.bank_name,
+          currency: account.currency,
+          balance: account.balance,
+          is_active: account.is_active !== false,
+          notes: account.notes || null,
+          account_number: account.account_number || null,
+          created_at: account.created_at,
+          updated_at: account.updated_at
+        };
+        const { error } = await supabase.from('bank_accounts').upsert(dbPayload, { onConflict: 'id' });
+        if (error) {
+          console.warn("Supabase saveBankAccount notice:", error.message);
+        }
       } catch (e) {
         console.warn("Supabase saveBankAccount fallback:", e);
       }
+
+      // Always backup in app_config
+      try {
+        await supabase.from('app_config').upsert({
+          key: 'bank_accounts',
+          value: updated,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'key' });
+      } catch (e2) {}
     }
 
     window.dispatchEvent(new CustomEvent('bellavista_bank_accounts_updated', { detail: updated }));
@@ -5001,6 +6684,14 @@ export const dbService = {
     if (supabase) {
       try {
         await supabase.from('bank_accounts').delete().eq('id', id);
+      } catch (e) {}
+
+      try {
+        await supabase.from('app_config').upsert({
+          key: 'bank_accounts',
+          value: updated,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'key' });
       } catch (e) {}
     }
     window.dispatchEvent(new CustomEvent('bellavista_bank_accounts_updated', { detail: updated }));
@@ -5019,19 +6710,24 @@ export const dbService = {
   },
 
   async getBankTransfers(): Promise<BankTransfer[]> {
-    let transfers: BankTransfer[] = [];
+    const local = this._getLocalFallback('bank_transfers', [] as BankTransfer[]);
+    let apiList: BankTransfer[] = [];
     if (supabase) {
       try {
-        const { data, error } = await supabase.from('bank_transfers').select('*').order('created_at', { ascending: false });
+        const { data, error } = await supabase.from('bank_transfers').select('*').order('created_at', { ascending: false }).limit(5000);
         if (!error && data) {
-          transfers = data as BankTransfer[];
-          localStorage.setItem('copias_bellavista_bank_transfers', JSON.stringify(transfers));
+          apiList = data as BankTransfer[];
         }
-      } catch (e) {}
+      } catch (e) {
+        console.warn('Supabase fetch bank_transfers error:', e);
+      }
     }
-    if (transfers.length === 0) {
-      transfers = this._getLocalFallback('bank_transfers', [] as BankTransfer[]);
-    }
+
+    const merged = new Map<string, BankTransfer>();
+    local.forEach(t => { if (t.id) merged.set(t.id, t); });
+    apiList.forEach(t => { if (t.id) merged.set(t.id, t); });
+
+    let transfers = Array.from(merged.values());
 
     // Auto-sanitize records: for VES records where amount was stored in USD (e.g. 0.50) while exchange_rate was 785.07
     transfers = transfers.map(t => {
@@ -5046,47 +6742,9 @@ export const dbService = {
       return t;
     });
 
-    // Auto-reconciliation for mistargeted Banesco transactions
-    try {
-      const savedAccountsRaw = localStorage.getItem('copias_bellavista_bank_accounts');
-      if (savedAccountsRaw) {
-        const accounts: BankAccount[] = JSON.parse(savedAccountsRaw);
-        const banescoAcc = accounts.find(a => `${a.name} ${a.bank_name || ''}`.toLowerCase().includes('banesco'));
-        const vzlaAcc = accounts.find(a => {
-          const text = `${a.name} ${a.bank_name || ''}`.toLowerCase();
-          return text.includes('venezuela') || text.includes('bdv') || text.includes('vzla');
-        });
-
-        if (banescoAcc && vzlaAcc) {
-          let hasFix = false;
-          transfers.forEach(t => {
-            const note = (t.notes || '').toLowerCase();
-            if (
-              (note.includes('banesco') || note.includes('pago movil banesco')) &&
-              (t.to_account_id === vzlaAcc.id || (t.to_account_name || '').toLowerCase().includes('venezuela') || (t.to_account_name || '').toLowerCase().includes('bdv'))
-            ) {
-              t.to_account_id = banescoAcc.id;
-              t.to_account_name = banescoAcc.name || banescoAcc.bank_name;
-              vzlaAcc.balance = Math.max(0, Number(vzlaAcc.balance || 0) - Number(t.amount || 0));
-              banescoAcc.balance = Number(banescoAcc.balance || 0) + Number(t.amount || 0);
-              hasFix = true;
-            }
-          });
-
-          if (hasFix) {
-            localStorage.setItem('copias_bellavista_bank_transfers', JSON.stringify(transfers));
-            localStorage.setItem('copias_bellavista_bank_accounts', JSON.stringify(accounts));
-            if (supabase) {
-              try {
-                supabase.from('bank_accounts').upsert([banescoAcc, vzlaAcc]);
-                supabase.from('bank_transfers').upsert(transfers);
-              } catch (err) {}
-            }
-          }
-        }
-      }
-    } catch (e) {}
-
+    // Clean sorting
+    transfers.sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
+    localStorage.setItem('copias_bellavista_bank_transfers', JSON.stringify(transfers));
     return transfers;
   },
 
@@ -5101,8 +6759,9 @@ export const dbService = {
     if (transfer.from_account_id) {
       await this.updateBankAccountBalance(transfer.from_account_id, -transfer.amount);
     }
-    if (transfer.to_account_id && transfer.converted_amount) {
-      await this.updateBankAccountBalance(transfer.to_account_id, transfer.converted_amount);
+    const creditAmount = transfer.converted_amount !== undefined ? Number(transfer.converted_amount) : Number(transfer.amount);
+    if (transfer.to_account_id && creditAmount > 0) {
+      await this.updateBankAccountBalance(transfer.to_account_id, creditAmount);
     }
 
     if (supabase) {
@@ -5120,21 +6779,28 @@ export const dbService = {
     splitPayments?: Array<{
       method: string;
       currency?: string;
-      amount: number;
-      amount_usd: number;
-      amount_ves: number;
+      amount?: number;
+      amount_usd?: number;
+      amount_ves?: number;
       rate?: number;
+      bankAccountId?: string;
+      bank_account_id?: string;
+      bank_account_name?: string;
     }>;
     singlePaymentMethod?: string;
-    totalUsd: number;
-    totalVes: number;
-    bcvRate: number;
+    totalUsd?: number;
+    totalVes?: number;
+    bcvRate?: number;
     createdBy?: string;
+    bankAccountId?: string;
   }): Promise<void> {
     try {
-      let bankAccounts = await this.getBankAccounts();
-      const paymentMethods = await this.getPaymentMethods();
-      const bcvRate = params.bcvRate || 45.5;
+      const [bankAccountsRes, paymentMethods] = await Promise.all([
+        this.getBankAccounts(),
+        this.getPaymentMethods()
+      ]);
+      let bankAccounts = bankAccountsRes;
+      const bcvRate = params.bcvRate || params.invoice?.bcv_rate || getCachedCurrencyRates().VES;
 
       // If no bank accounts exist in DB, create initial seed accounts so money gets tracked
       if (bankAccounts.length === 0) {
@@ -5176,135 +6842,128 @@ export const dbService = {
       // Build payment items list
       const paymentEntries: Array<{
         method: string;
+        amount: number;
         amountUsd: number;
         amountVes: number;
         currency: string;
         rate: number;
+        bankAccountId?: string;
       }> = [];
 
-      if (params.splitPayments && params.splitPayments.length > 0) {
-        params.splitPayments.forEach(sp => {
+      const rawSplit = params.splitPayments || (params.invoice as any)?.split_payments;
+
+      if (rawSplit && rawSplit.length > 0) {
+        rawSplit.forEach((sp: any) => {
+          const spMethod = sp.method || 'Pago';
+          const spRate = sp.rate || bcvRate || 1;
+          const spCurr = (sp.currency || (sp.amount_ves && !sp.amount_usd ? 'VES' : 'USD')).toUpperCase();
+          const amt = Number(sp.amount || 0);
+          let amtUsd = Number(sp.amount_usd || 0);
+          let amtVes = Number(sp.amount_ves || 0);
+
+          if (amtUsd === 0 && amtVes === 0 && amt > 0) {
+            if (spCurr === 'VES') {
+              amtVes = amt;
+              amtUsd = amt / (spRate || 1);
+            } else if (spCurr === 'USDT') {
+              amtUsd = amt;
+              amtVes = amt * (bcvRate || spRate);
+            } else {
+              amtUsd = amt;
+              amtVes = amt * (spRate || bcvRate);
+            }
+          } else if (amtUsd > 0 && amtVes === 0) {
+            amtVes = amtUsd * (spRate || bcvRate);
+          } else if (amtVes > 0 && amtUsd === 0) {
+            amtUsd = amtVes / (spRate || 1);
+          }
+
           paymentEntries.push({
-            method: sp.method,
-            amountUsd: Number(sp.amount_usd || 0),
-            amountVes: Number(sp.amount_ves || (sp.amount_usd * bcvRate)),
-            currency: sp.currency || (sp.amount_ves > 0 ? 'VES' : 'USD'),
-            rate: sp.rate || bcvRate
+            method: spMethod,
+            amount: amt || (spCurr === 'VES' ? amtVes : amtUsd),
+            amountUsd: amtUsd,
+            amountVes: amtVes,
+            currency: spCurr,
+            rate: spRate,
+            bankAccountId: sp.bankAccountId || sp.bank_account_id || params.bankAccountId || params.invoice?.bank_account_id
           });
         });
       } else {
-        const methodStr = params.singlePaymentMethod || params.invoice.payment_method || 'Efectivo';
-        const isVes = methodStr.toLowerCase().includes('bs') || 
+        const methodStr = params.singlePaymentMethod || params.invoice?.payment_method || 'Efectivo';
+        const isUsdt = methodStr.toLowerCase().includes('usdt') || 
+                       methodStr.toLowerCase().includes('binance') || 
+                       methodStr.toLowerCase().includes('tether');
+        const isVes = !isUsdt && (methodStr.toLowerCase().includes('bs') || 
                       methodStr.toLowerCase().includes('bolivar') || 
                       methodStr.toLowerCase().includes('pago movil') || 
                       methodStr.toLowerCase().includes('punto') || 
-                      methodStr.toLowerCase().includes('transferencia');
+                      methodStr.toLowerCase().includes('transferencia'));
+        const totUsd = Number(params.totalUsd !== undefined ? params.totalUsd : params.invoice?.total || 0);
+        const totVes = Number(params.totalVes !== undefined ? params.totalVes : totUsd * bcvRate);
+
         paymentEntries.push({
           method: methodStr,
-          amountUsd: Number(params.totalUsd || 0),
-          amountVes: Number(params.totalVes || (params.totalUsd * bcvRate)),
-          currency: isVes ? 'VES' : 'USD',
-          rate: bcvRate
+          amount: isVes ? totVes : totUsd,
+          amountUsd: totUsd,
+          amountVes: totVes,
+          currency: isUsdt ? 'USDT' : (isVes ? 'VES' : 'USD'),
+          rate: bcvRate,
+          bankAccountId: params.bankAccountId || params.invoice?.bank_account_id
         });
       }
 
       const transfersToInsert: BankTransfer[] = [];
 
       for (const entry of paymentEntries) {
-        if (entry.amountUsd <= 0 && entry.amountVes <= 0) continue;
+        if (entry.amountUsd <= 0 && entry.amountVes <= 0 && entry.amount <= 0) continue;
 
         const rawMethod = entry.method || '';
         const normMethod = clean(rawMethod);
         
+        // 🛑 IMPORTANT: Ignore virtual CxC entries so credit sales / receivables are not recorded as bank deposits!
+        if (
+          entry.bankAccountId === 'cxc-virtual' ||
+          normMethod.includes('cuentas por cobrar') ||
+          normMethod.includes('credito cliente') ||
+          normMethod.includes('credito por venta')
+        ) {
+          continue;
+        }
+        
+        let targetBank: BankAccount | undefined;
+
+        // 🏦 STEP 0: Direct bank account ID assigned to this entry (HIGHEST PRIORITY)
+        if (entry.bankAccountId) {
+          targetBank = bankAccounts.find(a => a.id === entry.bankAccountId);
+        }
+
+        // 🏦 STEP 0.5: Fallback to invoice-level / params bank account ID
+        if (!targetBank && params.bankAccountId) {
+          targetBank = bankAccounts.find(a => a.id === params.bankAccountId);
+        }
+        if (!targetBank && params.invoice?.bank_account_id) {
+          targetBank = bankAccounts.find(a => a.id === params.invoice.bank_account_id);
+        }
+
         // Find configured payment method
         const pmConfig = paymentMethods.find(p => {
           const normPName = clean(p.name);
-          return normPName === normMethod || p.id === rawMethod || (normPName.length > 3 && normMethod.includes(normPName));
+          const normPId = clean(p.id);
+          const normPCode = clean(p.code || '');
+          return normPName === normMethod || 
+                 p.id === rawMethod || 
+                 normPId === normMethod ||
+                 normPCode === normMethod ||
+                 (normPName.length > 3 && (normMethod.includes(normPName) || normPName.includes(normMethod))) ||
+                 (normMethod.length > 3 && (normMethod.includes(normPName) || normPName.includes(normMethod)));
         });
 
-        // 🏦 STEP 1: Detect explicit bank institution keywords in the payment method name
-        // (This guarantees "Pago Movil Banesco" ALWAYS routes to Banesco, not Venezuela or other accounts)
-        let targetBank: BankAccount | undefined;
-
-        const isBanesco = normMethod.includes('banesco');
-        const isVenezuela = normMethod.includes('venezuela') || normMethod.includes('bdv') || normMethod.includes('vzla');
-        const isBNC = normMethod.includes('bnc') || normMethod.includes('nacional de credito') || (normMethod.includes('credito') && !normMethod.includes('tarjeta'));
-        const isMercantil = normMethod.includes('mercantil');
-        const isProvincial = normMethod.includes('provincial') || normMethod.includes('bbva');
-        const isBofA = normMethod.includes('bofa') || normMethod.includes('bank of america') || normMethod.includes('america');
-        const isZelle = normMethod.includes('zelle');
-        const isBinance = normMethod.includes('binance') || normMethod.includes('usdt');
-        
-        const isEfectivoVES = (normMethod.includes('efectivo') || normMethod.includes('cash')) && 
-                             (normMethod.includes('ves') || normMethod.includes('bs') || normMethod.includes('bolivar') || normMethod.includes('bolivares'));
-        
-        const isEfectivoUSD = normMethod === 'efectivo' || 
-                             normMethod === 'efectivo usd' || 
-                             normMethod === 'efectivo dolares' || 
-                             normMethod === 'efectivo dólares' || 
-                             normMethod === 'dolares' || 
-                             normMethod === 'usd' || 
-                             ((normMethod.includes('efectivo') || normMethod.includes('cash')) && !isEfectivoVES);
-
-        if (isBanesco) {
-          targetBank = bankAccounts.find(a => clean(`${a.name} ${a.bank_name || ''}`).includes('3750')) ||
-                       bankAccounts.find(a => clean(`${a.name} ${a.bank_name || ''}`).includes('banesco'));
-        } else if (isVenezuela) {
-          targetBank = bankAccounts.find(a => {
-            const aText = clean(`${a.name} ${a.bank_name || ''}`);
-            return aText.includes('ahorro') && (aText.includes('venezuela') || aText.includes('bdv') || aText.includes('vzla'));
-          }) || bankAccounts.find(a => {
-            const aText = clean(`${a.name} ${a.bank_name || ''}`);
-            return aText.includes('venezuela') || aText.includes('bdv') || aText.includes('vzla');
-          });
-        } else if (isBNC) {
-          targetBank = bankAccounts.find(a => {
-            const aText = clean(`${a.name} ${a.bank_name || ''}`);
-            return aText.includes('bnc') || aText.includes('nacional de credito') || aText.includes('credito');
-          });
-        } else if (isMercantil) {
-          targetBank = bankAccounts.find(a => clean(`${a.name} ${a.bank_name || ''}`).includes('mercantil'));
-        } else if (isProvincial) {
-          targetBank = bankAccounts.find(a => {
-            const aText = clean(`${a.name} ${a.bank_name || ''}`);
-            return aText.includes('provincial') || aText.includes('bbva');
-          });
-        } else if (isBofA) {
-          targetBank = bankAccounts.find(a => {
-            const aText = clean(`${a.name} ${a.bank_name || ''}`);
-            return aText.includes('bofa') || aText.includes('america');
-          });
-        } else if (isZelle) {
-          targetBank = bankAccounts.find(a => {
-            const aText = clean(`${a.name} ${a.bank_name || ''}`);
-            return aText.includes('zelle') || (a.currency === 'USD' && aText.includes('dolar'));
-          });
-        } else if (isBinance) {
-          targetBank = bankAccounts.find(a => {
-            const aText = clean(`${a.name} ${a.bank_name || ''}`);
-            return aText.includes('binance') || (a.currency === 'USD' && aText.includes('dolar'));
-          });
-        } else if (isEfectivoUSD) {
-          targetBank = bankAccounts.find(a => {
-            const aText = clean(`${a.name} ${a.bank_name || ''}`);
-            return (aText.includes('efectivo') && (aText.includes('dolar') || aText.includes('dolares'))) || aText === 'efectivo dolares';
-          }) || bankAccounts.find(a => {
-            const aText = clean(`${a.name} ${a.bank_name || ''}`);
-            return a.currency === 'USD' && (aText.includes('efectivo') || aText.includes('caja') || aText.includes('dolar'));
-          }) || bankAccounts.find(a => a.currency === 'USD');
-        } else if (isEfectivoVES) {
-          targetBank = bankAccounts.find(a => {
-            const aText = clean(`${a.name} ${a.bank_name || ''}`);
-            return a.currency === 'VES' && (aText.includes('efectivo') || aText.includes('caja') || aText.includes('bolivar'));
-          }) || bankAccounts.find(a => a.currency === 'VES' && clean(a.name).includes('efectivo'));
-        }
-
-        // 🏦 STEP 2: Explicit bank_account_id in PaymentMethodConfig if not already matched
+        // 🏦 STEP 1: Direct link in PaymentMethodConfig
         if (!targetBank && pmConfig && pmConfig.bank_account_id) {
           targetBank = bankAccounts.find(a => a.id === pmConfig.bank_account_id);
         }
 
-        // 🏦 STEP 3: Associated methods JSON in bankAccount.notes
+        // 🏦 STEP 2: Associated methods JSON in bankAccount.notes
         if (!targetBank) {
           targetBank = bankAccounts.find(a => {
             if (!a.notes) return false;
@@ -5312,8 +6971,12 @@ export const dbService = {
               const parsed = JSON.parse(a.notes);
               if (Array.isArray(parsed)) {
                 return parsed.some(m => {
-                  const mNorm = clean(m.name);
-                  return mNorm === normMethod || (mNorm.length > 4 && normMethod.includes(mNorm));
+                  const mNorm = clean(m.name || '');
+                  const mIdNorm = clean(m.id || '');
+                  return mNorm === normMethod || 
+                         mIdNorm === normMethod ||
+                         (mNorm.length > 3 && (normMethod.includes(mNorm) || mNorm.includes(normMethod))) ||
+                         m.id === pmConfig?.id;
                 });
               }
             } catch (e) {}
@@ -5321,15 +6984,134 @@ export const dbService = {
           });
         }
 
-        // 🏦 STEP 4: Default fallback by currency
+        // 🏦 STEP 3: Institution keyword search in method name
         if (!targetBank) {
-          const isUsdMethod = entry.currency === 'USD' || normMethod.includes('usd') || normMethod.includes('dolar') || normMethod.includes('zelle');
-          targetBank = bankAccounts.find(a => isUsdMethod ? a.currency === 'USD' : a.currency === 'VES') || bankAccounts[0];
+          const isBanesco = normMethod.includes('banesco');
+          const isVenezuela = normMethod.includes('venezuela') || normMethod.includes('bdv') || normMethod.includes('vzla');
+          const isBNC = normMethod.includes('bnc') || normMethod.includes('nacional de credito') || (normMethod.includes('credito') && !normMethod.includes('tarjeta')) || normMethod.includes('pagomovil') || normMethod.includes('pago movil') || normMethod.includes('punto');
+          const isMercantil = normMethod.includes('mercantil');
+          const isProvincial = normMethod.includes('provincial') || normMethod.includes('bbva');
+          const isBofA = normMethod.includes('bofa') || normMethod.includes('bank of america') || normMethod.includes('america');
+          const isZelle = normMethod.includes('zelle');
+          const isBinance = normMethod.includes('binance') || normMethod.includes('usdt');
+          
+          const isEfectivoVES = (normMethod.includes('efectivo') || normMethod.includes('cash')) && 
+                               (normMethod.includes('ves') || normMethod.includes('bs') || normMethod.includes('bolivar') || normMethod.includes('bolivares'));
+          
+          const isEfectivoUSD = normMethod === 'efectivo' || 
+                               normMethod === 'efectivo usd' || 
+                               normMethod === 'efectivo dolares' || 
+                               normMethod === 'efectivo dólares' || 
+                               normMethod === 'dolares' || 
+                               normMethod === 'usd' || 
+                               ((normMethod.includes('efectivo') || normMethod.includes('cash')) && !isEfectivoVES);
+
+          if (isBanesco) {
+            targetBank = bankAccounts.find(a => clean(`${a.name} ${a.bank_name || ''}`).includes('3750')) ||
+                         bankAccounts.find(a => clean(`${a.name} ${a.bank_name || ''}`).includes('banesco'));
+          } else if (isVenezuela) {
+            targetBank = bankAccounts.find(a => {
+              const aText = clean(`${a.name} ${a.bank_name || ''}`);
+              return aText.includes('ahorro') && (aText.includes('venezuela') || aText.includes('bdv') || aText.includes('vzla'));
+            }) || bankAccounts.find(a => {
+              const aText = clean(`${a.name} ${a.bank_name || ''}`);
+              return aText.includes('venezuela') || aText.includes('bdv') || aText.includes('vzla');
+            });
+          } else if (isBNC) {
+            targetBank = bankAccounts.find(a => {
+              const aText = clean(`${a.name} ${a.bank_name || ''}`);
+              return aText.includes('bnc') || aText.includes('nacional de credito') || aText.includes('credito');
+            });
+          } else if (isMercantil) {
+            targetBank = bankAccounts.find(a => clean(`${a.name} ${a.bank_name || ''}`).includes('mercantil'));
+          } else if (isProvincial) {
+            targetBank = bankAccounts.find(a => {
+              const aText = clean(`${a.name} ${a.bank_name || ''}`);
+              return aText.includes('provincial') || aText.includes('bbva');
+            });
+          } else if (isBofA) {
+            targetBank = bankAccounts.find(a => {
+              const aText = clean(`${a.name} ${a.bank_name || ''}`);
+              return aText.includes('bofa') || aText.includes('america');
+            });
+          } else if (isZelle) {
+            targetBank = bankAccounts.find(a => {
+              const aText = clean(`${a.name} ${a.bank_name || ''}`);
+              return aText.includes('zelle') || (a.currency === 'USD' && aText.includes('dolar'));
+            });
+          } else if (isBinance) {
+            targetBank = bankAccounts.find(a => {
+              const aText = clean(`${a.name} ${a.bank_name || ''}`);
+              return (a.currency || '').toUpperCase() === 'USDT' || aText.includes('binance') || aText.includes('usdt');
+            }) || bankAccounts.find(a => (a.currency || '').toUpperCase() === 'USDT');
+          } else if (isEfectivoUSD) {
+            targetBank = bankAccounts.find(a => {
+              const aText = clean(`${a.name} ${a.bank_name || ''}`);
+              return (aText.includes('efectivo') && (aText.includes('dolar') || aText.includes('dolares'))) || aText === 'efectivo dolares';
+            }) || bankAccounts.find(a => {
+              const aText = clean(`${a.name} ${a.bank_name || ''}`);
+              return a.currency === 'USD' && (aText.includes('efectivo') || aText.includes('caja') || aText.includes('dolar'));
+            }) || bankAccounts.find(a => a.currency === 'USD');
+          } else if (isEfectivoVES) {
+            targetBank = bankAccounts.find(a => {
+              const aText = clean(`${a.name} ${a.bank_name || ''}`);
+              return a.currency === 'VES' && (aText.includes('efectivo') || aText.includes('caja') || aText.includes('bolivar'));
+            }) || bankAccounts.find(a => a.currency === 'VES' && clean(a.name).includes('efectivo'));
+          }
+        }
+
+        // 🏦 STEP 4: Substring matching with bank account names
+        if (!targetBank) {
+          targetBank = bankAccounts.find(a => {
+            const aNameNorm = clean(a.name);
+            const aBankNorm = clean(a.bank_name || '');
+            return normMethod.includes(aNameNorm) || (aNameNorm.length > 3 && normMethod.includes(aNameNorm)) ||
+                   (aBankNorm.length > 3 && normMethod.includes(aBankNorm));
+          });
+        }
+
+        // 🏦 STEP 5: Intelligent Fallback by currency (differentiating Cash vs Bank/Digital)
+        if (!targetBank) {
+          const isUsdtMethod = (entry.currency || '').toUpperCase() === 'USDT' || 
+                               normMethod.includes('usdt') || 
+                               normMethod.includes('binance') || 
+                               normMethod.includes('tether');
+          const isUsdMethod = !isUsdtMethod && (
+            (entry.currency || '').toUpperCase() === 'USD' || 
+            normMethod.includes('usd') || 
+            normMethod.includes('dolar') || 
+            normMethod.includes('zelle')
+          );
+          const isCashMethod = normMethod.includes('efectivo') || normMethod.includes('cash');
+
+          if (isUsdtMethod) {
+            targetBank = bankAccounts.find(a => (a.currency || '').toUpperCase() === 'USDT')
+                      || bankAccounts.find(a => clean(`${a.name} ${a.bank_name || ''}`).includes('binance') || clean(`${a.name} ${a.bank_name || ''}`).includes('usdt'));
+          } else if (isCashMethod) {
+            targetBank = bankAccounts.find(a => (a.currency || '').toUpperCase() === (isUsdMethod ? 'USD' : 'VES') && (clean(a.name).includes('efectivo') || clean(a.name).includes('caja')))
+                      || bankAccounts.find(a => (a.currency || '').toUpperCase() === (isUsdMethod ? 'USD' : 'VES'));
+          } else {
+            targetBank = bankAccounts.find(a => (a.currency || '').toUpperCase() === (isUsdMethod ? 'USD' : 'VES') && !clean(a.name).includes('efectivo') && !clean(a.name).includes('caja'))
+                      || bankAccounts.find(a => (a.currency || '').toUpperCase() === (isUsdMethod ? 'USD' : 'VES'));
+          }
+          if (!targetBank) {
+            targetBank = bankAccounts[0];
+          }
         }
 
         if (targetBank) {
-          const isBankVES = targetBank.currency === 'VES';
-          let creditAmount = isBankVES ? entry.amountVes : entry.amountUsd;
+          const targetCurr = (targetBank.currency || 'VES').toUpperCase();
+          const isBankVES = targetCurr === 'VES';
+          const isBankUSDT = targetCurr === 'USDT';
+          let creditAmount = 0;
+
+          if (isBankVES) {
+            creditAmount = Number(entry.amountVes) || (Number(entry.amountUsd) * bcvRate) || (Number(entry.amount) * (entry.currency === 'VES' ? 1 : bcvRate));
+          } else if (isBankUSDT) {
+            creditAmount = Number(entry.amountUsd) || (entry.currency === 'VES' ? (Number(entry.amount) / bcvRate) : Number(entry.amount));
+          } else {
+            creditAmount = Number(entry.amountUsd) || (entry.currency === 'VES' ? (Number(entry.amount) / bcvRate) : Number(entry.amount));
+          }
 
           // Deduct incoming commission if configured
           const commissionPercent = pmConfig?.incoming_commission || 0;
@@ -5339,15 +7121,14 @@ export const dbService = {
 
           creditAmount = parseFloat(creditAmount.toFixed(2));
 
-          // 1. Update bank account balance
+          // 1. Update bank account balance directly
           targetBank.balance = Number(targetBank.balance || 0) + creditAmount;
           targetBank.updated_at = new Date().toISOString();
-          await this.saveBankAccount(targetBank);
 
           // 2. Prepare movement record for bank_transfers
-          const docTypeLabel = params.invoice.document_type === 'nota_entrega' ? 'Nota de Entrega' : 'Factura';
-          const docNum = params.invoice.control_number || params.invoice.invoice_number || '';
-          const clientName = params.invoice.customer_name || 'Consumidor Final';
+          const docTypeLabel = params.invoice?.document_type === 'nota_entrega' ? 'Nota de Entrega' : 'Factura';
+          const docNum = params.invoice?.control_number || params.invoice?.invoice_number || '';
+          const clientName = params.invoice?.customer_name || 'Consumidor Final';
 
           const transferItem: BankTransfer = {
             id: crypto.randomUUID(),
@@ -5355,20 +7136,33 @@ export const dbService = {
             to_account_name: targetBank.name || targetBank.bank_name,
             amount: creditAmount,
             currency: targetBank.currency,
-            exchange_rate: isBankVES ? entry.rate : undefined,
+            exchange_rate: isBankVES ? (entry.rate || bcvRate) : undefined,
             converted_amount: creditAmount,
-            reference: docNum ? `POS-${docNum}` : `VENTA-${Date.now().toString().slice(-6)}`,
-            notes: `Ingreso Venta Flash (${entry.method}) - ${docTypeLabel} #${docNum} (${clientName})`,
-            created_by: params.createdBy || params.invoice.created_by || 'Cajero POS',
-            created_at: params.invoice.created_at || new Date().toISOString()
+            reference: docNum ? `${params.invoice?.document_type === 'nota_entrega' ? 'NE' : 'FAC'}-${docNum}` : `VENTA-${Date.now().toString().slice(-6)}`,
+            notes: `Ingreso Venta Flash (${targetBank.name || entry.method}) - ${docTypeLabel} #${docNum} (${clientName})`,
+            created_by: params.createdBy || params.invoice?.created_by || 'Cajero POS',
+            created_at: params.invoice?.created_at || new Date().toISOString()
           };
 
           transfersToInsert.push(transferItem);
         }
       }
 
+      // Save updated bank accounts in local storage immediately and sync with Supabase in background
+      localStorage.setItem('copias_bellavista_bank_accounts', JSON.stringify(bankAccounts));
+      if (supabase) {
+        Promise.allSettled(
+          bankAccounts.map(b => supabase!.from('bank_accounts').upsert(b, { onConflict: 'id' }))
+        ).catch(e => console.warn("Background bank upsert notice:", e));
+      }
+
       if (transfersToInsert.length > 0) {
-        const currentTransfers = await this.getBankTransfers();
+        let currentTransfers: BankTransfer[] = [];
+        try {
+          const savedT = localStorage.getItem('copias_bellavista_bank_transfers');
+          if (savedT) currentTransfers = JSON.parse(savedT);
+        } catch (e) {}
+
         const updatedTransfers = [...transfersToInsert, ...currentTransfers];
         localStorage.setItem('copias_bellavista_bank_transfers', JSON.stringify(updatedTransfers));
 
@@ -5380,7 +7174,7 @@ export const dbService = {
           }
         }
 
-        window.dispatchEvent(new CustomEvent('bellavista_bank_accounts_updated'));
+        window.dispatchEvent(new CustomEvent('bellavista_bank_accounts_updated', { detail: bankAccounts }));
         window.dispatchEvent(new CustomEvent('bellavista_bank_transfers_updated', { detail: updatedTransfers }));
       }
     } catch (err) {
@@ -5406,6 +7200,7 @@ export const dbService = {
   },
 
   async saveGastoFijo(gasto: GastoFijo): Promise<GastoFijo> {
+    notifyProcedureExecuted();
     const isNew = !gasto.id;
     if (isNew) gasto.id = crypto.randomUUID();
     
@@ -5466,7 +7261,7 @@ export const dbService = {
       const bank = bankAccounts.find(a => a.id === payment.bank_account_id);
       if (bank) {
         const isVES = bank.currency === 'VES';
-        const amountToDeduct = isVES ? (Number(payment.amount_bs) || (Number(payment.amount) * 45)) : Number(payment.amount);
+        const amountToDeduct = isVES ? (Number(payment.amount_bs) || (Number(payment.amount) * getCachedCurrencyRates().VES)) : Number(payment.amount);
         
         bank.balance = Number(bank.balance) - amountToDeduct;
         bank.updated_at = new Date().toISOString();
@@ -5526,16 +7321,172 @@ export const dbService = {
   // ============================================================================
 
   async getAccountsPayable(): Promise<AccountPayable[]> {
-    if (!supabase) return this._getLocalFallback('accounts_payable', [] as AccountPayable[]);
+    const localItems = this._getLocalFallback('accounts_payable', [] as AccountPayable[]);
+    let apiItems: AccountPayable[] = [];
+
+    if (supabase) {
+      try {
+        const { data, error } = await supabase.from('accounts_payable').select('*').order('created_at', { ascending: false });
+        if (!error && data) {
+          apiItems = data as AccountPayable[];
+        }
+      } catch (e) {
+        console.warn('Supabase getAccountsPayable warning:', e);
+      }
+    }
+
+    // 1. Merge Supabase & Local Accounts Payable
+    const mergedMap = new Map<string, AccountPayable>();
+    localItems.forEach(item => {
+      if (typeof (item as any).installments === 'string') {
+        try {
+          (item as any).installments = JSON.parse((item as any).installments);
+        } catch (e) {}
+      }
+      if (item.id) mergedMap.set(item.id, item);
+    });
+    apiItems.forEach(item => {
+      if (typeof (item as any).installments === 'string') {
+        try {
+          (item as any).installments = JSON.parse((item as any).installments);
+        } catch (e) {}
+      }
+      if (item.id) mergedMap.set(item.id, item);
+    });
+
+    // 2. Also check legacy copias_bellavista_cuentas_por_pagar
     try {
-      const { data, error } = await supabase.from('accounts_payable').select('*').order('created_at', { ascending: false });
-      if (error) throw error;
-      if (data) {
-        localStorage.setItem('copias_bellavista_accounts_payable', JSON.stringify(data));
-        return data as AccountPayable[];
+      const legacyRaw = localStorage.getItem('copias_bellavista_cuentas_por_pagar');
+      if (legacyRaw) {
+        const legacyList = JSON.parse(legacyRaw);
+        if (Array.isArray(legacyList)) {
+          // Clean legacyList to remove redundant sub-cuota items
+          const cleanedLegacy = legacyList.filter((leg: any) => {
+            const isSubCuota = leg.id && /cxp-pur-.*-\d+$/.test(leg.id);
+            const isCuotaConcept = leg.concept && /Cuota #\d+ de \d+/i.test(leg.concept);
+            return !isSubCuota && !isCuotaConcept;
+          });
+          localStorage.setItem('copias_bellavista_cuentas_por_pagar', JSON.stringify(cleanedLegacy));
+
+          cleanedLegacy.forEach((leg: any) => {
+            const mappedId = leg.id || `cxp-leg-${Date.now()}`;
+            if (!mergedMap.has(mappedId)) {
+              mergedMap.set(mappedId, {
+                id: mappedId,
+                entity_name: leg.provider_name || leg.entity_name || 'Proveedor General',
+                provider_name: leg.provider_name || leg.entity_name || 'Proveedor General',
+                subject: leg.concept || leg.subject || 'Cuenta por Pagar',
+                description: leg.observation || leg.description || '',
+                total_amount: Number(leg.amount || leg.total_amount || 0),
+                paid_amount: 0,
+                remaining_amount: Number(leg.amount || leg.total_amount || 0),
+                status: leg.status || 'pendiente',
+                currency: 'USD',
+                issue_date: leg.created_at || new Date().toISOString(),
+                due_date: leg.due_date ? new Date(leg.due_date).toISOString() : undefined,
+                created_at: leg.created_at || new Date().toISOString(),
+                updated_at: new Date().toISOString()
+              });
+            }
+          });
+        }
       }
     } catch (e) {}
-    return this._getLocalFallback('accounts_payable', [] as AccountPayable[]);
+
+    // 3. Scan Purchases to ensure all Credit / CXP / Pendiente purchases exist in Cuentas por Pagar
+    try {
+      const allPurchases = await this.getPurchases();
+      for (const pur of allPurchases) {
+        const isCredit = pur.payment_status === 'pendiente' ||
+          pur.payment_status === 'parcial' ||
+          pur.status === 'pendiente' ||
+          String(pur.payment_method || '').toLowerCase().includes('crédito') ||
+          String(pur.payment_method || '').toLowerCase().includes('credito') ||
+          String(pur.payment_method || '').toLowerCase().includes('cxp') ||
+          String(pur.payment_method || '').toLowerCase().includes('cuenta por pagar') ||
+          Boolean(pur.installments && pur.installments.length > 0);
+
+        if (isCredit) {
+          // Check if already in mergedMap by purchase_id or invoice_number
+          const existing = Array.from(mergedMap.values()).find(
+            c => (c.purchase_id && c.purchase_id === pur.id) ||
+                 (c.invoice_number && pur.invoice_number && c.invoice_number === pur.invoice_number) ||
+                 c.id === `cxp-pur-${pur.id}` ||
+                 c.id === pur.id
+          );
+
+          if (!existing) {
+            const totalDebt = Number(pur.total_amount || 0);
+            const paidAmount = Number(pur.paid_amount ?? pur.initial_payment ?? (pur.payment_status === 'pagado' ? totalDebt : 0));
+            const remaining = Math.max(0, Number((totalDebt - paidAmount).toFixed(2)));
+            const autoCxp: AccountPayable = {
+              id: `cxp-pur-${pur.id}`,
+              purchase_id: pur.id,
+              invoice_number: pur.invoice_number,
+              entity_name: pur.provider_name || 'Proveedor General',
+              provider_name: pur.provider_name || 'Proveedor General',
+              provider_rif: pur.provider_rif || '',
+              subject: `Factura #${pur.invoice_number} - Compra`,
+              description: `Cuenta por pagar vinculada desde Compra #${pur.invoice_number}. Sede: ${pur.notes || 'Principal'}`,
+              total_amount: totalDebt,
+              paid_amount: paidAmount,
+              remaining_amount: remaining,
+              status: remaining <= 0 ? 'pagado' : (paidAmount > 0 ? 'parcial' : 'pendiente'),
+              currency: 'USD',
+              issue_date: pur.date ? new Date(pur.date).toISOString() : (pur.created_at || new Date().toISOString()),
+              due_date: pur.due_date ? new Date(pur.due_date).toISOString() : undefined,
+              installments_count: pur.installments_count,
+              installments: pur.installments,
+              created_at: pur.created_at || new Date().toISOString(),
+              updated_at: new Date().toISOString()
+            };
+            mergedMap.set(autoCxp.id, autoCxp);
+          } else {
+            if (!existing.installments && pur.installments) {
+              existing.installments = pur.installments;
+              existing.installments_count = pur.installments_count;
+            }
+          }
+        }
+      }
+    } catch (e) {}
+
+    // 4. PURGE DUPLICATE SUB-CUOTA RECORDS
+    // Sub-cuotas (e.g. `cxp-pur-*-1`, `Cuota #1 de 2`) must never exist as independent CXP debts
+    const toDeleteIds: string[] = [];
+    mergedMap.forEach((cxp, id) => {
+      const isSubCuotaId = /cxp-pur-.*-\d+$/.test(id);
+      const isCuotaSubject = Boolean(cxp.subject && /Cuota #\d+ de \d+/i.test(cxp.subject));
+      if (isSubCuotaId || isCuotaSubject) {
+        toDeleteIds.push(id);
+      }
+    });
+    toDeleteIds.forEach(id => mergedMap.delete(id));
+
+    // 5. Reconcile with recorded payments to ensure accurate remaining balances
+    try {
+      const allPayments = await this.getAccountsPayablePayments().catch(() => this._getLocalFallback('accounts_payable_payments', [] as AccountPayablePayment[]));
+      mergedMap.forEach((cxp) => {
+        const itemPayments = allPayments.filter(p => p.account_payable_id === cxp.id || p.cxp_id === cxp.id);
+        if (itemPayments.length > 0) {
+          const sumPayments = itemPayments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+          if (sumPayments > 0) {
+            cxp.paid_amount = Number(sumPayments.toFixed(2));
+            cxp.remaining_amount = Math.max(0, Number((cxp.total_amount - cxp.paid_amount).toFixed(2)));
+            cxp.status = cxp.remaining_amount <= 0.001 ? 'pagado' : 'parcial';
+          }
+        }
+      });
+    } catch (e) {}
+
+    const finalList = Array.from(mergedMap.values()).sort((a, b) => {
+      const dateA = new Date(a.issue_date || a.created_at || 0).getTime();
+      const dateB = new Date(b.issue_date || b.created_at || 0).getTime();
+      return dateB - dateA;
+    });
+
+    localStorage.setItem('copias_bellavista_accounts_payable', JSON.stringify(finalList));
+    return finalList;
   },
 
   async saveAccountPayable(cxp: AccountPayable): Promise<AccountPayable> {
@@ -5544,13 +7495,19 @@ export const dbService = {
     cxp.updated_at = new Date().toISOString();
 
     const current = await this.getAccountsPayable();
-    const updated = isNew ? [cxp, ...current] : current.map(c => c.id === cxp.id ? cxp : c);
+    const updated = isNew ? [cxp, ...current.filter(c => c.id !== cxp.id)] : current.map(c => c.id === cxp.id ? cxp : c);
     localStorage.setItem('copias_bellavista_accounts_payable', JSON.stringify(updated));
 
     if (supabase) {
       try {
-        await supabase.from('accounts_payable').upsert(cxp, { onConflict: 'id' });
-      } catch (e) {}
+        const payloadToSave = {
+          ...cxp,
+          installments: cxp.installments ? (typeof cxp.installments === 'object' ? JSON.stringify(cxp.installments) : cxp.installments) : undefined
+        };
+        await supabase.from('accounts_payable').upsert(payloadToSave, { onConflict: 'id' });
+      } catch (e) {
+        console.warn('Supabase upsert accounts_payable warning:', e);
+      }
     }
 
     window.dispatchEvent(new CustomEvent('bellavista_accounts_payable_updated', { detail: updated }));
@@ -5572,24 +7529,37 @@ export const dbService = {
   },
 
   async getAccountsPayablePayments(): Promise<AccountPayablePayment[]> {
-    if (!supabase) return this._getLocalFallback('accounts_payable_payments', [] as AccountPayablePayment[]);
-    try {
-      const { data, error } = await supabase.from('accounts_payable_payments').select('*').order('payment_date', { ascending: false });
-      if (error) throw error;
-      if (data) {
-        localStorage.setItem('copias_bellavista_accounts_payable_payments', JSON.stringify(data));
-        return data as AccountPayablePayment[];
-      }
-    } catch (e) {}
-    return this._getLocalFallback('accounts_payable_payments', [] as AccountPayablePayment[]);
+    const local = this._getLocalFallback('accounts_payable_payments', [] as AccountPayablePayment[]);
+    let apiList: AccountPayablePayment[] = [];
+    if (supabase) {
+      try {
+        const { data, error } = await supabase.from('accounts_payable_payments').select('*').order('payment_date', { ascending: false });
+        if (!error && data) {
+          apiList = data as AccountPayablePayment[];
+        }
+      } catch (e) {}
+    }
+
+    const merged = new Map<string, AccountPayablePayment>();
+    local.forEach(p => { if (p.id) merged.set(p.id, p); });
+    apiList.forEach(p => { if (p.id) merged.set(p.id, p); });
+
+    const result = Array.from(merged.values()).sort((a, b) => {
+      const da = new Date(a.payment_date || a.created_at || 0).getTime();
+      const db = new Date(b.payment_date || b.created_at || 0).getTime();
+      return db - da;
+    });
+
+    localStorage.setItem('copias_bellavista_accounts_payable_payments', JSON.stringify(result));
+    return result;
   },
 
   async payAccountPayable(payment: AccountPayablePayment): Promise<AccountPayablePayment> {
-    payment.id = crypto.randomUUID();
+    payment.id = payment.id || crypto.randomUUID();
     if (!payment.created_at) payment.created_at = new Date().toISOString();
 
     const current = await this.getAccountsPayablePayments();
-    const updated = [payment, ...current];
+    const updated = [payment, ...current.filter(p => p.id !== payment.id)];
     localStorage.setItem('copias_bellavista_accounts_payable_payments', JSON.stringify(updated));
 
     // Deduct from bank account with currency conversion & bank movement registration
@@ -5598,7 +7568,7 @@ export const dbService = {
       const bank = bankAccounts.find(a => a.id === payment.bank_account_id);
       if (bank) {
         const isVES = bank.currency === 'VES';
-        const amountToDeduct = isVES ? (Number(payment.amount_bs) || (Number(payment.amount) * 45)) : Number(payment.amount);
+        const amountToDeduct = isVES ? (Number(payment.amount_bs) || (Number(payment.amount) * getCachedCurrencyRates().VES)) : Number(payment.amount);
         
         bank.balance = Number(bank.balance) - amountToDeduct;
         bank.updated_at = new Date().toISOString();
@@ -5632,13 +7602,73 @@ export const dbService = {
     }
 
     const cxps = await this.getAccountsPayable();
-    const cxp = cxps.find(c => c.id === payment.account_payable_id);
+    const cxp = cxps.find(c => c.id === payment.account_payable_id || c.id === payment.cxp_id);
     if (cxp) {
-      cxp.paid_amount = Number(cxp.paid_amount) + payment.amount;
-      cxp.remaining_amount = Math.max(0, Number(cxp.total_amount) - cxp.paid_amount);
-      if (cxp.remaining_amount <= 0) cxp.status = 'pagado';
-      else cxp.status = 'parcial';
+      const thisCxPPayments = updated.filter(p => p.account_payable_id === cxp.id || p.cxp_id === cxp.id);
+      const totalPaid = thisCxPPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+
+      cxp.paid_amount = Number(totalPaid.toFixed(2));
+      cxp.remaining_amount = Math.max(0, Number((Number(cxp.total_amount) - totalPaid).toFixed(2)));
+      if (cxp.remaining_amount <= 0.001) {
+        cxp.status = 'pagado';
+      } else {
+        cxp.status = 'parcial';
+      }
+
+      // Synchronize installments status if exists
+      if (cxp.installments && cxp.installments.length > 0) {
+        let runningPaid = totalPaid;
+        cxp.installments = cxp.installments.map((inst, idx) => {
+          const instNum = inst.number || idx + 1;
+          const instAmount = Number(inst.amount || 0);
+          const isDirectlyPaid = payment.installment_number === instNum;
+
+          if (isDirectlyPaid || runningPaid >= instAmount - 0.001) {
+            runningPaid = Math.max(0, runningPaid - instAmount);
+            return {
+              ...inst,
+              status: 'pagado' as const,
+              paid_amount: instAmount,
+              paid_at: inst.paid_at || payment.payment_date || new Date().toISOString(),
+              payment_method: inst.payment_method || payment.payment_method
+            };
+          } else if (runningPaid > 0.001) {
+            const partialForThis = Number(runningPaid.toFixed(2));
+            runningPaid = 0;
+            return {
+              ...inst,
+              status: 'pendiente' as const,
+              paid_amount: partialForThis
+            };
+          } else {
+            return {
+              ...inst,
+              status: 'pendiente' as const,
+              paid_amount: 0
+            };
+          }
+        });
+      }
+
       await this.saveAccountPayable(cxp);
+
+      // Sincronizar estado con la compra correspondiente si existe
+      if (cxp.purchase_id || cxp.invoice_number) {
+        try {
+          const purchases = await this.getPurchases();
+          const targetPur = purchases.find(p => p.id === cxp.purchase_id || (cxp.invoice_number && p.invoice_number === cxp.invoice_number));
+          if (targetPur) {
+            const newPaymentStatus = cxp.remaining_amount <= 0.001 ? 'pagado' : 'parcial';
+            const newStatus = cxp.remaining_amount <= 0.001 ? 'completada' : targetPur.status;
+            await this.updatePurchase(targetPur.id, {
+              payment_status: newPaymentStatus,
+              status: newStatus
+            });
+          }
+        } catch (syncPurErr) {
+          console.warn('Could not sync purchase status on CXP payment:', syncPurErr);
+        }
+      }
     }
 
     if (supabase) {
@@ -5691,19 +7721,155 @@ export const dbService = {
   // ============================================================================
 
   async getAccountsReceivable(): Promise<AccountReceivable[]> {
-    if (!supabase) return this._getLocalFallback('accounts_receivable', [] as AccountReceivable[]);
+    const localItems = this._getLocalFallback('accounts_receivable', [] as AccountReceivable[]);
+    let apiItems: AccountReceivable[] = [];
+
+    if (supabase) {
+      try {
+        const { data, error } = await supabase.from('accounts_receivable').select('*').order('created_at', { ascending: false });
+        if (!error && data) {
+          apiItems = data as AccountReceivable[];
+        }
+      } catch (e) {
+        console.warn("Supabase fetch accounts_receivable error:", e);
+      }
+    }
+
+    // 1. Merge by id / key
+    const mergedMap = new Map<string, AccountReceivable>();
+    localItems.forEach(item => {
+      if (typeof (item as any).installments === 'string') {
+        try {
+          (item as any).installments = JSON.parse((item as any).installments);
+        } catch (e) {}
+      }
+      if (item.id) mergedMap.set(item.id, item);
+    });
+    apiItems.forEach(item => {
+      if (typeof (item as any).installments === 'string') {
+        try {
+          (item as any).installments = JSON.parse((item as any).installments);
+        } catch (e) {}
+      }
+      if (item.id) {
+        const existing = mergedMap.get(item.id);
+        mergedMap.set(item.id, {
+          ...existing,
+          ...item
+        });
+      }
+    });
+
+    // 2. Auto-reconcile from Invoices (detect any credit sale or split payment like FAC-1354 Adelis Duarte)
     try {
-      const { data, error } = await supabase.from('accounts_receivable').select('*').order('created_at', { ascending: false });
-      if (error) throw error;
-      if (data) {
-        localStorage.setItem('copias_bellavista_accounts_receivable', JSON.stringify(data));
-        return data as AccountReceivable[];
+      const invoices = await this.getInvoices().catch(() => []);
+      for (const inv of invoices) {
+        const isSplit = Array.isArray(inv.split_payments) && inv.split_payments.length > 0;
+        let creditUsd = 0;
+        let immediatePaidUsd = 0;
+
+        if (isSplit) {
+          inv.split_payments.forEach((p: any) => {
+            const isCxCPart = p.bankAccountId === 'cxc-virtual' || 
+                              p.bank_account_id === 'cxc-virtual' ||
+                              p.bankAccountId === 'cxc' ||
+                              (p.method && (p.method.toLowerCase().includes('cuentas por cobrar') || p.method.toLowerCase().includes('crédito') || p.method.toLowerCase().includes('credito')));
+            if (isCxCPart) {
+              creditUsd += Number(p.amount_usd || p.amount || 0);
+            } else {
+              immediatePaidUsd += Number(p.amount_usd || (p.currency === 'USD' ? p.amount : 0) || 0);
+            }
+          });
+        } else {
+          const methodStr = (inv.payment_method || '').toLowerCase();
+          if (methodStr.includes('crédito') || methodStr.includes('credito') || methodStr.includes('cuentas por cobrar') || methodStr.includes('cxc')) {
+            creditUsd = Number(inv.total) || 0;
+          }
+        }
+
+        if (creditUsd > 0.001) {
+          const invNum = inv.control_number || `FAC-${inv.id.substring(0, 6)}`;
+          const clientName = (inv.customer_name || 'Cliente').trim();
+          const clientPhone = (inv.customer_phone || '').trim();
+          const clientDoc = (inv.customer_document || '').trim();
+          const entityName = clientPhone ? `${clientName} ${clientPhone}` : clientName;
+
+          // Check if already in mergedMap
+          const existingCxc = Array.from(mergedMap.values()).find(c => 
+            c.id === `cxc-${inv.id}` ||
+            c.id === inv.id ||
+            c.invoice_id === inv.id ||
+            c.invoice_number === invNum ||
+            (c.subject && c.subject.includes(invNum))
+          );
+
+          if (!existingCxc) {
+            const newCxc: AccountReceivable = {
+              id: `cxc-${inv.id}`,
+              invoice_id: inv.id,
+              invoice_number: invNum,
+              subject: `Crédito por Venta - Factura #${invNum}`,
+              entity_name: entityName || 'Consumidor final',
+              client_name: entityName || 'Consumidor final',
+              customer_name: clientName || 'Consumidor final',
+              customer_phone: clientPhone,
+              customer_document: clientDoc,
+              description: `Crédito registrado vía ${inv.document_type === 'nota_entrega' ? 'Nota de Entrega' : 'Factura'} #${invNum}`,
+              total_amount: Number(inv.total) || creditUsd,
+              paid_amount: Number(immediatePaidUsd.toFixed(2)),
+              remaining_amount: Number(creditUsd.toFixed(2)),
+              currency: 'USD',
+              bcv_rate: inv.bcv_rate || 40,
+              status: (creditUsd <= 0.001 ? 'cobrado' : (immediatePaidUsd > 0 ? 'parcial' : 'pendiente')) as any,
+              issue_date: inv.created_at || new Date().toISOString(),
+              due_date: new Date(new Date(inv.created_at || Date.now()).getTime() + 15 * 24 * 60 * 60 * 1000).toISOString(),
+              created_at: inv.created_at || new Date().toISOString(),
+              updated_at: new Date().toISOString()
+            };
+            mergedMap.set(newCxc.id, newCxc);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Notice checking invoices for CxC reconciliation:", e);
+    }
+
+    let result = Array.from(mergedMap.values());
+
+    // 3. Auto-reconcile with payments ledger & ensure remaining_amount = total_amount - paid_amount
+    try {
+      const payments = await this.getAccountsReceivablePayments().catch(() => this._getLocalFallback('accounts_receivable_payments', [] as AccountReceivablePayment[]));
+      let hasChanges = false;
+      result = result.map(cxc => {
+        const cxcPayments = payments.filter(p => p.account_receivable_id === cxc.id || p.cxc_id === cxc.id);
+        const paymentsTotal = cxcPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+        const effectivePaid = paymentsTotal > 0 ? paymentsTotal : (Number(cxc.paid_amount) || 0);
+        const totalAmt = Number(cxc.total_amount) || 0;
+        const calculatedRemaining = Math.max(0, parseFloat((totalAmt - effectivePaid).toFixed(2)));
+
+        if (effectivePaid > 0 && Math.abs((Number(cxc.remaining_amount) || 0) - calculatedRemaining) > 0.01) {
+          hasChanges = true;
+          return {
+            ...cxc,
+            paid_amount: effectivePaid,
+            remaining_amount: calculatedRemaining,
+            status: (calculatedRemaining <= 0.001 ? 'cobrado' : 'parcial') as any
+          };
+        }
+        return cxc;
+      });
+
+      if (hasChanges) {
+        localStorage.setItem('copias_bellavista_accounts_receivable', JSON.stringify(result));
       }
     } catch (e) {}
-    return this._getLocalFallback('accounts_receivable', [] as AccountReceivable[]);
+
+    localStorage.setItem('copias_bellavista_accounts_receivable', JSON.stringify(result));
+    return result;
   },
 
   async saveAccountReceivable(cxc: AccountReceivable): Promise<AccountReceivable> {
+    notifyProcedureExecuted();
     const isNew = !cxc.id;
     if (isNew) cxc.id = crypto.randomUUID();
     cxc.updated_at = new Date().toISOString();
@@ -5714,8 +7880,31 @@ export const dbService = {
 
     if (supabase) {
       try {
-        await supabase.from('accounts_receivable').upsert(cxc, { onConflict: 'id' });
-      } catch (e) {}
+        const payload: any = {
+          id: cxc.id,
+          entity_name: cxc.entity_name || cxc.client_name || cxc.customer_name || 'Sin Asunto',
+          client_name: cxc.client_name || cxc.entity_name || '',
+          customer_name: cxc.customer_name || cxc.entity_name || '',
+          subject: cxc.subject || 'crédito por venta POS',
+          description: cxc.description || '',
+          total_amount: Number(cxc.total_amount) || 0,
+          paid_amount: Number(cxc.paid_amount) || 0,
+          remaining_amount: Number(cxc.remaining_amount) || 0,
+          status: cxc.status || 'pendiente',
+          issue_date: cxc.issue_date || new Date().toISOString(),
+          due_date: cxc.due_date || new Date().toISOString(),
+          installments_count: cxc.installments_count || (cxc.installments ? cxc.installments.length : undefined),
+          installments: cxc.installments ? (typeof cxc.installments === 'object' ? JSON.stringify(cxc.installments) : cxc.installments) : undefined,
+          created_at: cxc.created_at || new Date().toISOString(),
+          updated_at: cxc.updated_at || new Date().toISOString()
+        };
+        const { error } = await supabase.from('accounts_receivable').upsert(payload, { onConflict: 'id' });
+        if (error) {
+          console.error("Error upserting accounts_receivable to Supabase:", error);
+        }
+      } catch (e) {
+        console.error("Supabase upsert exception:", e);
+      }
     }
 
     window.dispatchEvent(new CustomEvent('bellavista_accounts_receivable_updated', { detail: updated }));
@@ -5737,49 +7926,105 @@ export const dbService = {
   },
 
   async getAccountsReceivablePayments(): Promise<AccountReceivablePayment[]> {
-    if (!supabase) return this._getLocalFallback('accounts_receivable_payments', [] as AccountReceivablePayment[]);
-    try {
-      const { data, error } = await supabase.from('accounts_receivable_payments').select('*').order('payment_date', { ascending: false });
-      if (error) throw error;
-      if (data) {
-        localStorage.setItem('copias_bellavista_accounts_receivable_payments', JSON.stringify(data));
-        return data as AccountReceivablePayment[];
+    const local = this._getLocalFallback('accounts_receivable_payments', [] as AccountReceivablePayment[]);
+    let apiList: AccountReceivablePayment[] = [];
+    if (supabase) {
+      try {
+        const { data, error } = await supabase.from('accounts_receivable_payments').select('*').order('payment_date', { ascending: false });
+        if (!error && data) {
+          apiList = data as AccountReceivablePayment[];
+        }
+      } catch (e) {
+        console.warn('Supabase fetch accounts_receivable_payments warning:', e);
       }
-    } catch (e) {}
-    return this._getLocalFallback('accounts_receivable_payments', [] as AccountReceivablePayment[]);
+    }
+
+    const merged = new Map<string, AccountReceivablePayment>();
+    local.forEach(p => { if (p.id) merged.set(p.id, p); });
+    apiList.forEach(p => { if (p.id) merged.set(p.id, p); });
+
+    const result = Array.from(merged.values()).sort((a, b) => {
+      const da = new Date(a.payment_date || a.created_at || 0).getTime();
+      const db = new Date(b.payment_date || b.created_at || 0).getTime();
+      return db - da;
+    });
+
+    localStorage.setItem('copias_bellavista_accounts_receivable_payments', JSON.stringify(result));
+    return result;
   },
 
-  async payAccountReceivable(payment: AccountReceivablePayment): Promise<AccountReceivablePayment> {
-    payment.id = crypto.randomUUID();
+  async recordInitialAccountReceivablePayment(payment: AccountReceivablePayment): Promise<AccountReceivablePayment> {
+    if (!payment.id) payment.id = crypto.randomUUID();
     if (!payment.created_at) payment.created_at = new Date().toISOString();
 
     const current = await this.getAccountsReceivablePayments();
-    const updated = [payment, ...current];
+    const exists = current.some(p => p.id === payment.id);
+    const updated = exists ? current : [payment, ...current];
     localStorage.setItem('copias_bellavista_accounts_receivable_payments', JSON.stringify(updated));
 
-    // Credit to bank account with currency conversion & bank movement registration
-    if (payment.bank_account_id) {
-      const bankAccounts = await this.getBankAccounts();
-      const bank = bankAccounts.find(a => a.id === payment.bank_account_id);
-      if (bank) {
-        const isVES = bank.currency === 'VES';
-        const amountToCredit = isVES ? (Number(payment.amount_bs) || (Number(payment.amount) * 45)) : Number(payment.amount);
+    if (supabase) {
+      try {
+        const paymentPayload: any = {
+          id: payment.id,
+          account_receivable_id: payment.account_receivable_id || payment.cxc_id,
+          cxc_id: payment.cxc_id || payment.account_receivable_id,
+          amount: Number(payment.amount) || 0,
+          amount_bs: payment.amount_bs ? Number(payment.amount_bs) : null,
+          payment_method: payment.payment_method || 'EFECTIVO',
+          bank_account_id: payment.bank_account_id || null,
+          payment_date: payment.payment_date || new Date().toISOString(),
+          reference: payment.reference || null,
+          notes: payment.notes || null,
+          created_by: payment.created_by || 'Administrador',
+          created_at: payment.created_at || new Date().toISOString()
+        };
+        await supabase.from('accounts_receivable_payments').upsert(paymentPayload, { onConflict: 'id' });
+      } catch (e) {
+        console.error("Supabase initial payment exception:", e);
+      }
+    }
+
+    window.dispatchEvent(new CustomEvent('bellavista_accounts_receivable_payments_updated', { detail: updated }));
+    return payment;
+  },
+
+  async payAccountReceivable(payment: AccountReceivablePayment): Promise<AccountReceivablePayment> {
+    if (!payment.id) payment.id = crypto.randomUUID();
+    if (!payment.created_at) payment.created_at = new Date().toISOString();
+
+    const current = await this.getAccountsReceivablePayments();
+    const updated = [payment, ...current.filter(p => p.id !== payment.id)];
+    localStorage.setItem('copias_bellavista_accounts_receivable_payments', JSON.stringify(updated));
+
+    // Get bank accounts to manage balances
+    const bankAccounts = await this.getBankAccounts();
+
+    // 1. ABONAR a la cuenta bancaria real seleccionada por el cliente/usuario
+    const isTargetCxc = payment.bank_account_id === 'cxc-virtual' || payment.bank_account_id === 'cxc';
+    if (payment.bank_account_id && !isTargetCxc) {
+      const destBank = bankAccounts.find(a => a.id === payment.bank_account_id && a.id !== 'cxc-virtual' && !a.name?.toLowerCase().includes('cuentas por cobrar'));
+      if (destBank) {
+        const isVES = destBank.currency === 'VES';
+        const rate = (payment as any).bcv_rate || (Number(payment.amount_bs) && Number(payment.amount) ? (Number(payment.amount_bs) / Number(payment.amount)) : getCachedCurrencyRates().VES);
+        const amountToCredit = isVES ? (Number(payment.amount_bs) || (Number(payment.amount) * rate)) : Number(payment.amount);
         
-        bank.balance = Number(bank.balance) + amountToCredit;
-        bank.updated_at = new Date().toISOString();
-        await this.saveBankAccount(bank);
+        destBank.balance = Number(destBank.balance || 0) + amountToCredit;
+        destBank.updated_at = new Date().toISOString();
+        await this.saveBankAccount(destBank);
 
         // Record movement in bank_transfers for audit and history in Cuentas Bancarias
         const bankMovement: BankTransfer = {
           id: crypto.randomUUID(),
-          to_account_id: bank.id,
-          to_account_name: bank.name || bank.bank_name,
+          from_account_id: 'cxc-virtual',
+          from_account_name: 'Cuentas por Cobrar (Crédito Cliente)',
+          to_account_id: destBank.id,
+          to_account_name: destBank.name || destBank.bank_name,
           amount: amountToCredit,
-          currency: bank.currency,
-          exchange_rate: isVES ? (amountToCredit / (Number(payment.amount) || 1)) : undefined,
+          currency: destBank.currency,
+          exchange_rate: isVES ? rate : undefined,
           converted_amount: amountToCredit,
           reference: payment.reference || 'COBRO-CXC',
-          notes: payment.notes || `Cobro de cuenta por cobrar (${payment.payment_method})`,
+          notes: payment.notes || `Cobro de cuenta por cobrar (${payment.payment_method}) - Abonado en ${destBank.name}`,
           created_by: payment.created_by || 'Administrador',
           created_at: payment.payment_date || new Date().toISOString()
         };
@@ -5797,19 +8042,101 @@ export const dbService = {
     }
 
     const cxcs = await this.getAccountsReceivable();
-    const cxc = cxcs.find(c => c.id === payment.account_receivable_id);
+    const targetCxcId = payment.account_receivable_id || payment.cxc_id;
+    const cxc = cxcs.find(c => c.id === targetCxcId);
     if (cxc) {
-      cxc.paid_amount = Number(cxc.paid_amount) + payment.amount;
-      cxc.remaining_amount = Math.max(0, Number(cxc.total_amount) - cxc.paid_amount);
-      if (cxc.remaining_amount <= 0) cxc.status = 'cobrado';
+      // Strictly derive paid_amount from the payments ledger
+      const thisCxCPayments = updated.filter(p => p.account_receivable_id === cxc.id || p.cxc_id === cxc.id);
+      const totalPaid = thisCxCPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+
+      cxc.paid_amount = Number(totalPaid.toFixed(2));
+      cxc.remaining_amount = Math.max(0, Number((Number(cxc.total_amount) - totalPaid).toFixed(2)));
+      if (cxc.remaining_amount <= 0.001) cxc.status = 'cobrado';
       else cxc.status = 'parcial';
+
+      // Synchronize installments status if exists
+      if (cxc.installments && cxc.installments.length > 0) {
+        let runningPaid = totalPaid;
+        cxc.installments = cxc.installments.map((inst, idx) => {
+          const instNum = inst.number || idx + 1;
+          const instAmount = Number(inst.amount || 0);
+          const isDirectlyPaid = payment.installment_number === instNum;
+
+          if (isDirectlyPaid || runningPaid >= instAmount - 0.001) {
+            runningPaid = Math.max(0, runningPaid - instAmount);
+            return {
+              ...inst,
+              status: 'pagado' as const,
+              paid_amount: instAmount,
+              paid_at: inst.paid_at || payment.payment_date || new Date().toISOString(),
+              payment_method: inst.payment_method || payment.payment_method
+            };
+          } else if (runningPaid > 0.001) {
+            const partialForThis = Number(runningPaid.toFixed(2));
+            runningPaid = 0;
+            return {
+              ...inst,
+              status: 'pendiente' as const,
+              paid_amount: partialForThis
+            };
+          } else {
+            return {
+              ...inst,
+              status: 'pendiente' as const,
+              paid_amount: 0
+            };
+          }
+        });
+      }
+
       await this.saveAccountReceivable(cxc);
+
+      // Actualizar la deuda acumulada del cliente (credit_usd)
+      try {
+        const clients = await this.getClients();
+        const client = clients.find(cl => 
+          (cxc.client_id && cl.id === cxc.client_id) ||
+          ((cl.name || '').trim().toLowerCase() === (cxc.client_name || cxc.entity_name || cxc.customer_name || '').trim().toLowerCase())
+        );
+        if (client) {
+          const allCxCList = await this.getAccountsReceivable();
+          const clientActiveCxC = allCxCList.filter(c => 
+            ((c.client_id && c.client_id === client.id) ||
+            ((c.client_name || c.entity_name || c.customer_name || '').trim().toLowerCase() === (client.name || '').trim().toLowerCase())) &&
+            c.status !== 'cobrado' && Number(c.remaining_amount) > 0
+          );
+          const totalClientDebt = clientActiveCxC.reduce((sum, c) => sum + Number(c.remaining_amount || 0), 0);
+          await this.updateClient(client.id, { credit_usd: Number(totalClientDebt.toFixed(2)) });
+          window.dispatchEvent(new CustomEvent('bellavista_clients_updated'));
+        }
+      } catch (e) {
+        console.warn("Could not update client credit_usd on CxC payment:", e);
+      }
     }
 
     if (supabase) {
       try {
-        await supabase.from('accounts_receivable_payments').insert(payment);
-      } catch (e) {}
+        const paymentPayload: any = {
+          id: payment.id,
+          account_receivable_id: payment.account_receivable_id || payment.cxc_id,
+          cxc_id: payment.cxc_id || payment.account_receivable_id,
+          amount: Number(payment.amount) || 0,
+          amount_bs: payment.amount_bs ? Number(payment.amount_bs) : null,
+          payment_method: payment.payment_method || 'EFECTIVO',
+          bank_account_id: isTargetCxc ? null : (payment.bank_account_id || null),
+          payment_date: payment.payment_date || new Date().toISOString(),
+          reference: payment.reference || null,
+          notes: payment.notes || null,
+          created_by: payment.created_by || 'Administrador',
+          created_at: payment.created_at || new Date().toISOString()
+        };
+        const { error } = await supabase.from('accounts_receivable_payments').upsert(paymentPayload, { onConflict: 'id' });
+        if (error) {
+          console.error("Error upserting accounts_receivable_payments to Supabase:", error);
+        }
+      } catch (e) {
+        console.error("Supabase payment exception:", e);
+      }
     }
 
     window.dispatchEvent(new CustomEvent('bellavista_accounts_receivable_payments_updated', { detail: updated }));
@@ -5849,5 +8176,356 @@ export const dbService = {
       }
     }
     return generatedPayments;
+  },
+
+  /**
+   * 🧹 Limpieza exclusiva de datos operacionales y transaccionales
+   * Purga: Ventas (invoices), Pedidos (orders), Notas de entrega (drafts/invoices),
+   * Movimientos bancarios (bank_transfers) y resetea saldos de cuentas bancarias a 0,
+   * Cuentas por cobrar (CxC) y Cuentas por pagar (CxP), Operaciones de caja (cash_ops).
+   *
+   * CONSERVA ÍNTEGROS: Productos, Inventarios, Clientes, Proveedores, Usuarios,
+   * Cuentas Bancarias registradas (con balance 0), Impuestos y Configuraciones.
+   */
+  async cleanOperationalTransactions(): Promise<{ success: boolean; details: Record<string, number | string> }> {
+    const details: Record<string, number | string> = {};
+
+    // 1. Limpiar Ventas y Facturas / Notas de Entrega
+    try {
+      if (supabase) {
+        await supabase.from('invoices').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        await supabase.from('draft_invoices').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      }
+      localStorage.setItem('copias_bellavista_local_invoices', JSON.stringify([]));
+      localStorage.setItem('copias_bellavista_draft_invoices', JSON.stringify([]));
+      localStorage.setItem('copias_bellavista_deleted_drafts', JSON.stringify([]));
+      details['invoices'] = 'Eliminadas (Facturas y Notas de Entrega)';
+    } catch (e: any) {
+      console.warn("Error cleaning invoices:", e);
+      details['invoices_err'] = e.message || 'Error local';
+    }
+
+    // 2. Limpiar Pedidos (Orders)
+    try {
+      if (supabase) {
+        try {
+          await supabase.from('order_items').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        } catch (err) {}
+        await supabase.from('orders').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      }
+      localStorage.setItem('copias_bellavista_local_orders', JSON.stringify([]));
+      localStorage.setItem('copias_bellavista_orders', JSON.stringify([]));
+      details['orders'] = 'Eliminados (Pedidos Web y Tienda)';
+    } catch (e: any) {
+      console.warn("Error cleaning orders:", e);
+      details['orders_err'] = e.message || 'Error local';
+    }
+
+    // 3. Limpiar Movimientos de Cuentas Bancarias y Resetear Saldos a 0
+    try {
+      if (supabase) {
+        await supabase.from('bank_transfers').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      }
+      localStorage.setItem('copias_bellavista_bank_transfers', JSON.stringify([]));
+
+      // Resetear saldos de las cuentas existentes a 0
+      const currentAccounts = await this.getBankAccounts();
+      const resetAccounts = currentAccounts.map(acc => ({
+        ...acc,
+        balance: 0,
+        updated_at: new Date().toISOString()
+      }));
+      localStorage.setItem('copias_bellavista_bank_accounts', JSON.stringify(resetAccounts));
+
+      if (supabase) {
+        for (const acc of resetAccounts) {
+          try {
+            await supabase.from('bank_accounts').upsert({
+              id: acc.id,
+              balance: 0,
+              updated_at: new Date().toISOString()
+            });
+          } catch (err) {}
+        }
+      }
+      details['bank_accounts'] = `Saldos reseteados a 0.00 (${resetAccounts.length} cuentas conservadas)`;
+      details['bank_transfers'] = 'Movimientos bancarios purgados';
+    } catch (e: any) {
+      console.warn("Error cleaning bank data:", e);
+      details['bank_err'] = e.message || 'Error local';
+    }
+
+    // 4. Limpiar Cuentas por Cobrar (CxC)
+    try {
+      if (supabase) {
+        try {
+          await supabase.from('accounts_receivable_payments').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        } catch (err) {}
+        await supabase.from('accounts_receivable').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      }
+      localStorage.setItem('copias_bellavista_accounts_receivable', JSON.stringify([]));
+      localStorage.setItem('copias_bellavista_accounts_receivable_payments', JSON.stringify([]));
+      details['accounts_receivable'] = 'Cuentas por cobrar y abonos purgados';
+    } catch (e: any) {
+      console.warn("Error cleaning accounts receivable:", e);
+      details['cxc_err'] = e.message || 'Error local';
+    }
+
+    // 5. Limpiar Cuentas por Pagar (CxP)
+    try {
+      if (supabase) {
+        try {
+          await supabase.from('accounts_payable_payments').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        } catch (err) {}
+        await supabase.from('accounts_payable').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      }
+      localStorage.setItem('copias_bellavista_accounts_payable', JSON.stringify([]));
+      localStorage.setItem('copias_bellavista_accounts_payable_payments', JSON.stringify([]));
+      details['accounts_payable'] = 'Cuentas por pagar y pagos purgados';
+    } catch (e: any) {
+      console.warn("Error cleaning accounts payable:", e);
+      details['cxp_err'] = e.message || 'Error local';
+    }
+
+    // 6. Limpiar Operaciones de Caja Chica / Arqueos históricos
+    try {
+      if (supabase) {
+        try {
+          await supabase.from('cash_ops').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+          await supabase.from('cash_sessions').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+        } catch (err) {}
+      }
+      localStorage.setItem('copias_bellavista_cash_ops', JSON.stringify([]));
+      localStorage.setItem('copias_bellavista_cash_sessions', JSON.stringify([]));
+      localStorage.removeItem('copias_bellavista_active_cash_session');
+      details['cash_ops'] = 'Operaciones de caja y sesiones purgadas';
+    } catch (e: any) {
+      console.warn("Error cleaning cash ops:", e);
+    }
+
+    // 7. Notificar a toda la interfaz y componentes montados
+    window.dispatchEvent(new CustomEvent('bellavista_invoices_updated'));
+    window.dispatchEvent(new CustomEvent('bellavista_orders_updated'));
+    window.dispatchEvent(new CustomEvent('bellavista_bank_accounts_updated'));
+    window.dispatchEvent(new CustomEvent('bellavista_bank_transfers_updated'));
+    window.dispatchEvent(new CustomEvent('bellavista_caja_updated'));
+    window.dispatchEvent(new CustomEvent('bellavista_balance_updated'));
+    window.dispatchEvent(new CustomEvent('bellavista_accounts_receivable_updated'));
+    window.dispatchEvent(new CustomEvent('bellavista_accounts_payable_updated'));
+
+    return {
+      success: true,
+      details
+    };
+  },
+
+  /**
+   * 💾 Genera y extrae un respaldo integral de todos los registros y operaciones del sistema
+   */
+  async generateFullSystemBackup(): Promise<{
+    filename: string;
+    backupData: any;
+    summary: Record<string, number>;
+    jsonStr: string;
+  }> {
+    const safeGet = async <T>(fn: () => Promise<T>, fallback: T): Promise<T> => {
+      try {
+        const res = await fn();
+        return res ?? fallback;
+      } catch (err) {
+        console.warn("Backup error retrieving entity:", err);
+        return fallback;
+      }
+    };
+
+    // 1. Obtener datos maestros y transaccionales con tolerancia total a fallos
+    const products = await safeGet(() => this.getProducts(), []);
+    const categories = await safeGet(() => this.getCategories(), []);
+    const brands = await safeGet(() => this.getBrands(), []);
+    const clients = await safeGet(() => this.getClients(), []);
+    const providers = await safeGet(() => this.getProviders(), []);
+    const invoices = await safeGet(() => this.getInvoices(), []);
+    const draftInvoices = await safeGet(() => this.getDraftInvoices(), []);
+    const orders = await safeGet(() => this.getOrders(), []);
+    const quotes = await safeGet(() => this.getQuotes(), []);
+    const purchases = await safeGet(() => this.getPurchases(), []);
+    const bankAccounts = await safeGet(() => this.getBankAccounts(), []);
+    const bankTransfers = await safeGet(() => this.getBankTransfers(), []);
+    const accountsReceivable = await safeGet(() => this.getAccountsReceivable(), []);
+    const accountsReceivablePayments = await safeGet(() => this.getAccountsReceivablePayments(), []);
+    const accountsPayable = await safeGet(() => this.getAccountsPayable(), []);
+    const accountsPayablePayments = await safeGet(() => this.getAccountsPayablePayments(), []);
+    const gastosFijos = await safeGet(() => this.getGastosFijos(), []);
+    const cashSessions = await safeGet(() => this.getCashSessions(), []);
+    const cashOps = await safeGet(() => this.getCashOps(), []);
+    const businessProfile = await safeGet(() => this.getBusinessProfile(), null);
+    const branches = await safeGet(() => this.getBusinessBranches(), []);
+    const terminals = await safeGet(() => this.getBusinessTerminals(), []);
+    const paymentMethods = await safeGet(() => this.getPaymentMethods(), []);
+    const taxes = await safeGet(() => this.getTaxes(), []);
+    const landingConfig = await safeGet(() => this.getLandingConfig(), null);
+    const bannerSlides = await safeGet(() => this.getBannerSlides(), []);
+    const storeUsers = await safeGet(() => this.getStoreUsers(), []);
+
+    // 2. Extraer snapshots directos de almacenamiento local
+    const localSnapshots: Record<string, any> = {};
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key && key.startsWith('copias_bellavista_')) {
+            try {
+              const raw = localStorage.getItem(key);
+              localSnapshots[key] = raw ? JSON.parse(raw) : null;
+            } catch {
+              localSnapshots[key] = localStorage.getItem(key);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Could not capture local snapshots:", e);
+    }
+
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const filename = `Respaldo_Sistema_CopiasBellaVista_${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}.json`;
+
+    const summary: Record<string, number> = {
+      productos: Array.isArray(products) ? products.length : 0,
+      categorias: Array.isArray(categories) ? categories.length : 0,
+      marcas: Array.isArray(brands) ? brands.length : 0,
+      clientes: Array.isArray(clients) ? clients.length : 0,
+      proveedores: Array.isArray(providers) ? providers.length : 0,
+      ventas_facturas: Array.isArray(invoices) ? invoices.length : 0,
+      notas_entrega: Array.isArray(draftInvoices) ? draftInvoices.length : 0,
+      pedidos: Array.isArray(orders) ? orders.length : 0,
+      cotizaciones: Array.isArray(quotes) ? quotes.length : 0,
+      compras: Array.isArray(purchases) ? purchases.length : 0,
+      cuentas_bancarias: Array.isArray(bankAccounts) ? bankAccounts.length : 0,
+      movimientos_bancarios: Array.isArray(bankTransfers) ? bankTransfers.length : 0,
+      cuentas_por_cobrar: Array.isArray(accountsReceivable) ? accountsReceivable.length : 0,
+      abonos_cxc: Array.isArray(accountsReceivablePayments) ? accountsReceivablePayments.length : 0,
+      cuentas_por_pagar: Array.isArray(accountsPayable) ? accountsPayable.length : 0,
+      pagos_cxp: Array.isArray(accountsPayablePayments) ? accountsPayablePayments.length : 0,
+      gastos_fijos: Array.isArray(gastosFijos) ? gastosFijos.length : 0,
+      sesiones_caja: Array.isArray(cashSessions) ? cashSessions.length : 0,
+      operaciones_caja: Array.isArray(cashOps) ? cashOps.length : 0,
+      usuarios_sistema: Array.isArray(storeUsers) ? storeUsers.length : 0,
+      sedes: Array.isArray(branches) ? branches.length : 0,
+      cajas_terminales: Array.isArray(terminals) ? terminals.length : 0,
+      metodos_pago: Array.isArray(paymentMethods) ? paymentMethods.length : 0,
+      impuestos: Array.isArray(taxes) ? taxes.length : 0
+    };
+
+    const backupData = {
+      meta: {
+        sistema: "Copias Bella Vista - Sistema de Gestión Comercial y POS",
+        version: "3.0.0",
+        export_date: now.toISOString(),
+        timestamp: now.getTime(),
+        summary
+      },
+      catalog: {
+        products,
+        categories,
+        brands
+      },
+      commercial_operations: {
+        invoices,
+        draft_invoices: draftInvoices,
+        orders,
+        quotes,
+        purchases
+      },
+      financial_operations: {
+        bank_accounts: bankAccounts,
+        bank_transfers: bankTransfers,
+        accounts_receivable: accountsReceivable,
+        accounts_receivable_payments: accountsReceivablePayments,
+        accounts_payable: accountsPayable,
+        accounts_payable_payments: accountsPayablePayments,
+        gastos_fijos: gastosFijos,
+        cash_sessions: cashSessions,
+        cash_ops: cashOps
+      },
+      contacts: {
+        clients,
+        providers,
+        store_users: Array.isArray(storeUsers) ? storeUsers.map((u: any) => ({
+          id: u.id,
+          name: u.name,
+          email: u.email,
+          role: u.role,
+          created_at: u.created_at
+        })) : []
+      },
+      system_configuration: {
+        business_profile: businessProfile,
+        branches,
+        terminals,
+        payment_methods: paymentMethods,
+        taxes,
+        landing_config: landingConfig,
+        banner_slides: bannerSlides
+      },
+      raw_storage_snapshots: localSnapshots
+    };
+
+    const jsonStr = JSON.stringify(backupData, null, 2);
+
+    return {
+      filename,
+      backupData,
+      summary,
+      jsonStr
+    };
+  },
+
+  /**
+   * 📥 Descarga automática del archivo de respaldo en el navegador
+   */
+  async downloadSystemBackup(): Promise<{ filename: string; summary: Record<string, number>; jsonStr: string; success: boolean }> {
+    const { filename, backupData, summary, jsonStr } = await this.generateFullSystemBackup();
+    
+    try {
+      const blob = new Blob([jsonStr], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', filename);
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      
+      // Dispatch click event for broad browser & iframe compatibility
+      link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      
+      setTimeout(() => {
+        try {
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+        } catch {}
+      }, 2000);
+
+      return { filename, summary, jsonStr, success: true };
+    } catch (e: any) {
+      console.warn("Direct blob download error, attempting data URL fallback:", e);
+      try {
+        const encodedData = 'data:application/json;charset=utf-8,' + encodeURIComponent(jsonStr);
+        const link = document.createElement('a');
+        link.href = encodedData;
+        link.setAttribute('download', filename);
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        setTimeout(() => {
+          try { document.body.removeChild(link); } catch {}
+        }, 2000);
+        return { filename, summary, jsonStr, success: true };
+      } catch (fallbackErr: any) {
+        console.error("Backup download fallback failed:", fallbackErr);
+        return { filename, summary, jsonStr, success: false };
+      }
+    }
   }
 };

@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { Search, MapPin, ShieldAlert, Laptop, UserCheck, Settings, RefreshCw, ShoppingCart, Globe, Lock, LogOut, User, Menu, X, ChevronRight, DollarSign } from 'lucide-react';
+import { Search, MapPin, ShieldAlert, Laptop, UserCheck, Settings, RefreshCw, ShoppingCart, Globe, Lock, LogOut, User, Menu, X, ChevronRight, DollarSign, Edit3 } from 'lucide-react';
 import { dbService, currentSettings } from '../lib/supabase.ts';
 import { CurrencyCode } from '../lib/currency';
 import { StoreUser, Category, BusinessProfile } from '../types.ts';
@@ -207,6 +207,8 @@ export default function Navbar({
                     src={businessProfile.logo_url} 
                     alt={businessProfile.name} 
                     className="w-full h-full object-contain"
+                    referrerPolicy="no-referrer"
+                    onError={(e) => { e.currentTarget.style.display = 'none'; }}
                   />
                 </div>
               )}
@@ -688,9 +690,25 @@ export default function Navbar({
               {/* Rates Badges */}
               <div className="hidden lg:flex items-center gap-2">
                 <span className="text-[10px] text-gray-400 font-bold uppercase">Tasa BCV:</span>
-                <span className="text-[10px] font-bold text-gray-300 bg-[#131921] px-2.5 py-1 rounded border border-gray-800" title="Tasa oficial BCV (VES)">
-                  Bs. {Number(currencyRates.VES).toFixed(2)}
-                </span>
+                <div className="inline-flex items-center rounded border border-gray-800 bg-[#131921] overflow-hidden">
+                  <button
+                    type="button"
+                    onClick={() => window.dispatchEvent(new CustomEvent('bellavista_check_bcv_rate'))}
+                    className="text-[10px] font-bold text-gray-300 hover:text-white hover:bg-[#1a2433] px-2.5 py-1 transition cursor-pointer flex items-center gap-1.5 active:scale-95 border-r border-gray-800"
+                    title="Consultar tasa oficial en web del BCV (Haga clic para verificar actualización)"
+                  >
+                    <span>Bs. {Number(currencyRates.VES).toFixed(2)}</span>
+                    <RefreshCw className="w-2.5 h-2.5 text-[#00BFFF]" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => window.dispatchEvent(new CustomEvent('bellavista_open_manual_bcv_modal'))}
+                    className="text-[10px] font-bold text-gray-400 hover:text-[#FF9900] hover:bg-[#1a2433] px-1.5 py-1 transition cursor-pointer flex items-center"
+                    title="Ajustar o solicitar cambio manual de la tasa BCV"
+                  >
+                    <Edit3 className="w-2.5 h-2.5" />
+                  </button>
+                </div>
                 <span className="text-[10px] text-gray-400 font-bold uppercase ml-1.5">EUR:</span>
                 <span className="text-[10px] font-bold text-gray-300 bg-[#131921] px-2.5 py-1 rounded border border-gray-800" title="Referencia Euro">
                   {Number(currencyRates.EUR).toFixed(2)} €

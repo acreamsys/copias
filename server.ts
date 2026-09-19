@@ -1,6 +1,7 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
+import https from 'https';
 import webPush from 'web-push';
 import { createServer as createViteServer } from 'vite';
 
@@ -276,6 +277,141 @@ async function startServer() {
     } catch (err: any) {
       console.error('Error in /api/reports/process-transactions:', err);
       res.status(500).json({ error: err.message || 'Error processing transactions' });
+    }
+  });
+
+  // BCV Official Exchange Rates Scraper and Comparator Endpoint
+  // Consulta directa a https://www.bcv.org.ve/glosario/cambio-oficial
+  app.get('/api/bcv/rates', async (req, res) => {
+    try {
+      const fetchBcvOfficial = (): Promise<{
+        usdRate: number | null;
+        eurRate: number | null;
+        valueDate: string | null;
+        valueDateText: string | null;
+        rawHtmlAvailable: boolean;
+      }> => {
+        return new Promise((resolve) => {
+          const timeout = setTimeout(() => {
+            resolve({ usdRate: null, eurRate: null, valueDate: null, valueDateText: null, rawHtmlAvailable: false });
+          }, 8000);
+
+          try {
+            const reqBcv = https.get('https://www.bcv.org.ve/glosario/cambio-oficial', {
+              rejectUnauthorized: false,
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'es-VE,es;q=0.9'
+              }
+            }, (resBcv) => {
+              let html = '';
+              resBcv.on('data', (chunk) => { html += chunk; });
+              resBcv.on('end', () => {
+                clearTimeout(timeout);
+                try {
+                  const dolarMatch = html.match(/id=[\"']dolar[\"'][\s\S]*?<strong[^>]*>([\s\S]*?)<\/strong>/i);
+                  const euroMatch = html.match(/id=[\"']euro[\"'][\s\S]*?<strong[^>]*>([\s\S]*?)<\/strong>/i);
+                  const dateMatch = html.match(/class=[\"']date-display-single[\"'][^>]*content=[\"']([^\"']+)[\"'][^>]*>([\s\S]*?)<\/span>/i);
+
+                  let usdRate: number | null = null;
+                  if (dolarMatch && dolarMatch[1]) {
+                    const cleanNum = dolarMatch[1].trim().replace(/\./g, '').replace(',', '.');
+                    const parsed = parseFloat(cleanNum);
+                    if (!isNaN(parsed) && parsed > 0) usdRate = parsed;
+                  }
+
+                  let eurRate: number | null = null;
+                  if (euroMatch && euroMatch[1]) {
+                    const cleanNum = euroMatch[1].trim().replace(/\./g, '').replace(',', '.');
+                    const parsed = parseFloat(cleanNum);
+                    if (!isNaN(parsed) && parsed > 0) eurRate = parsed;
+                  }
+
+                  const valueDate = dateMatch && dateMatch[1] ? dateMatch[1].trim() : null;
+                  const valueDateText = dateMatch && dateMatch[2] ? dateMatch[2].trim() : null;
+
+                  resolve({
+                    usdRate,
+                    eurRate,
+                    valueDate,
+                    valueDateText,
+                    rawHtmlAvailable: true
+                  });
+                } catch (parseErr) {
+                  resolve({ usdRate: null, eurRate: null, valueDate: null, valueDateText: null, rawHtmlAvailable: false });
+                }
+              });
+            });
+
+            reqBcv.on('error', () => {
+              clearTimeout(timeout);
+              resolve({ usdRate: null, eurRate: null, valueDate: null, valueDateText: null, rawHtmlAvailable: false });
+            });
+          } catch (e) {
+            clearTimeout(timeout);
+            resolve({ usdRate: null, eurRate: null, valueDate: null, valueDateText: null, rawHtmlAvailable: false });
+          }
+        });
+      };
+
+      let bcvData = await fetchBcvOfficial();
+
+      // If direct BCV scrape timed out or failed to parse, use official DolarAPI as fallback
+      if (!bcvData.usdRate) {
+        try {
+          const resFallback = await fetch('https://ve.dolarapi.com/v1/dolares/oficial');
+          if (resFallback.ok) {
+            const dataFb: any = await resFallback.json();
+            if (dataFb && typeof dataFb.promedio === 'number' && dataFb.promedio > 0) {
+              bcvData.usdRate = dataFb.promedio;
+              bcvData.valueDate = dataFb.fechaActualizacion || bcvData.valueDate;
+            }
+          }
+        } catch (fbErr) {
+          console.warn('Fallback error fetching official rate in server.ts:', fbErr);
+        }
+      }
+
+      // Caracas time calculation for future rate determination
+      const now = new Date();
+      const utcTime = now.getTime() + (now.getTimezoneOffset() * 60000);
+      const caracasDate = new Date(utcTime + (-4 * 3600000));
+      const todayCaracasStr = caracasDate.toISOString().split('T')[0];
+
+      let isFutureRate = false;
+      let effectiveDateLabel = bcvData.valueDate ? bcvData.valueDate.split('T')[0] : '';
+
+      // Regla estricta de tasa futura:
+      // 1. Si la fecha de valor es posterior a hoy (fecha futura real)
+      if (effectiveDateLabel && effectiveDateLabel > todayCaracasStr) {
+        isFutureRate = true;
+      } 
+      // 2. Si es a partir de las 4:00 PM (16:00) y la fecha de valor NO es de días anteriores
+      else if (caracasDate.getHours() >= 16 && (!effectiveDateLabel || effectiveDateLabel >= todayCaracasStr)) {
+        isFutureRate = true;
+        if (!effectiveDateLabel) {
+          const tomorrow = new Date(caracasDate.getTime() + 24 * 60 * 60 * 1000);
+          effectiveDateLabel = tomorrow.toISOString().split('T')[0];
+        }
+      } else {
+        isFutureRate = false;
+      }
+
+      res.json({
+        success: true,
+        source: 'BCV Oficial (https://www.bcv.org.ve/glosario/cambio-oficial)',
+        usdRate: bcvData.usdRate,
+        eurRate: bcvData.eurRate,
+        valueDate: bcvData.valueDate,
+        valueDateText: bcvData.valueDateText,
+        effectiveDateLabel,
+        isFutureRate,
+        checkedAt: new Date().toISOString()
+      });
+    } catch (err: any) {
+      console.error('Error fetching BCV rate:', err);
+      res.status(500).json({ success: false, error: err?.message || 'Error fetching BCV' });
     }
   });
 

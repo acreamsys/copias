@@ -4,6 +4,7 @@ import { motion } from 'motion/react';
 import { Product } from '../types.ts';
 import { CurrencyCode, CURRENCIES, formatCurrency } from '../lib/currency';
 import { useI18n } from '../lib/i18n.ts';
+import { sanitizeImageUrl, handleImageError, DEFAULT_PRODUCT_FALLBACK } from '../lib/imageUtils';
 
 interface ProductCardProps {
   product: Product;
@@ -37,11 +38,11 @@ const ProductCard: React.FC<ProductCardProps> = ({
   const { t } = useI18n();
   const [imageLoaded, setImageLoaded] = useState(false);
 
-  let optimizedImage = images[0];
-  if (optimizedImage && optimizedImage.includes('supabase.co') && !optimizedImage.includes('?')) {
-    optimizedImage = `${optimizedImage}?width=400&quality=80&format=webp`;
-  }
-  const mainImage = optimizedImage || 'https://images.unsplash.com/photo-1586075010923-2dd4570fb338?auto=format&fit=crop&q=80&w=400';
+  const rawImage = (images && images.length > 0 && images[0]) || 
+                   (product as any).technical_sheet_url || 
+                   (product as any).image_url || 
+                   DEFAULT_PRODUCT_FALLBACK;
+  const mainImage = sanitizeImageUrl(rawImage, DEFAULT_PRODUCT_FALLBACK);
 
   const discountPercentage = product.offer_price 
     ? Math.round(((product.price - product.offer_price) / product.price) * 100)
@@ -158,6 +159,10 @@ const ProductCard: React.FC<ProductCardProps> = ({
           referrerPolicy="no-referrer"
           loading="lazy"
           onLoad={() => setImageLoaded(true)}
+          onError={(e) => {
+            handleImageError(e, DEFAULT_PRODUCT_FALLBACK);
+            setImageLoaded(true);
+          }}
         />
 
         {/* Out of Stock visual mask overlay */}

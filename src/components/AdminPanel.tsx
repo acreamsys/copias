@@ -8,33 +8,42 @@ import {
   BarChart, Package, Tag, Layers, ToggleLeft, ToggleRight, 
   Plus, Edit3, Trash2, Check, AlertTriangle, Printer, Star, Search, Image as ImageIcon, FileText, X, Upload, Download,
   ClipboardList, RefreshCw, Eye, Coins, Truck, Store, Calendar, HelpCircle, Clock, Timer,
-  LayoutDashboard, ShieldCheck, Settings, Activity, ArrowRight, ArrowUp, ArrowDown, Sparkles, TrendingUp, TrendingDown, Users, UserCheck,
+  LayoutDashboard, ShieldCheck, Settings, Activity, ArrowRight, ArrowLeft, ArrowUp, ArrowDown, Sparkles, TrendingUp, TrendingDown, Users, UserCheck,
   Lock, Unlock, LogOut, Megaphone, ShoppingCart, Barcode, Save, Code, Copy, CheckCircle, User, DollarSign, Menu, ShoppingBag, Crown, FileCheck,
-  LayoutGrid, Kanban, Volume2, VolumeX, SlidersHorizontal, ArrowLeftRight, MapPin,
-  ChevronDown, ChevronRight, PieChart, Wallet, CreditCard, Scale, Zap, Receipt
+  LayoutGrid, Kanban, Volume2, VolumeX, SlidersHorizontal, ArrowLeftRight, MapPin, Building2,
+  ChevronDown, ChevronRight, PieChart, Wallet, CreditCard, Scale, Zap, Receipt, FileSpreadsheet, Bike,
+  History, Link2, Database, PackagePlus, MessageSquare, Gauge
 } from 'lucide-react';
 import { Product, Category, Brand, ProductImage, Order, Provider, StoreUser, BannerSlide, LandingConfig, HomeCarouselCardItem, Tax, BusinessBranch, BusinessTerminal, AdminMenuType } from '../types.ts';
 import { dbService, supabase } from '../lib/supabase.ts';
 import { sortProductsByPriority } from '../lib/searchUtils';
 import * as XLSX from 'xlsx';
-import { CurrencyCode, CURRENCIES } from '../lib/currency';
+import { CurrencyCode, CURRENCIES, getCachedCurrencyRates } from '../lib/currency';
 import { sendPushNotification } from '../lib/pushNotifications.ts';
 import { useI18n } from '../lib/i18n.ts';
+import { lazyWithRetry } from '../lib/lazyWithRetry.ts';
 
-// 🚀 Lazy-Loaded Administrative Submodules
-const POSModule = lazy(() => import('./POSModule'));
-const MarketingModule = lazy(() => import('./MarketingModule.tsx'));
-const BalancePage = lazy(() => import('./BalancePage.tsx'));
-const CotizacionesPage = lazy(() => import('./CotizacionesPage.tsx'));
-const OpenCashSessionModal = lazy(() => import('./OpenCashSessionModal.tsx'));
-const BarcodeScannerModal = lazy(() => import('./BarcodeScannerModal.tsx'));
-const SystemConfigPanel = lazy(() => import('./SystemConfigPanel.tsx'));
-const ReportesDashboard = lazy(() => import('./ReportesDashboard.tsx'));
-const ReportesDiariosPage = lazy(() => import('./ReportesDiariosPage.tsx'));
-const ComprasModule = lazy(() => import('./ComprasModule.tsx'));
-const CuentasBancariasPage = lazy(() => import('./CuentasBancariasPage.tsx'));
-const GastosPage = lazy(() => import('./GastosPage.tsx'));
-const CuentasPendientesPage = lazy(() => import('./CuentasPendientesPage.tsx'));
+// 🚀 Lazy-Loaded Administrative Submodules with auto-retry
+const IndicadoresDashboard = lazyWithRetry(() => import('./IndicadoresDashboard.tsx'));
+const POSModule = lazyWithRetry(() => import('./POSModule.tsx'));
+const VentasFlashModule = lazyWithRetry(() => import('./VentasFlashModule.tsx'));
+const SalesReportPage = lazyWithRetry(() => import('./SalesReportPage.tsx'));
+const MarketingModule = lazyWithRetry(() => import('./MarketingModule.tsx'));
+const BalancePage = lazyWithRetry(() => import('./BalancePage.tsx'));
+const CotizacionesPage = lazyWithRetry(() => import('./CotizacionesPage.tsx'));
+const OpenCashSessionModal = lazyWithRetry(() => import('./OpenCashSessionModal.tsx'));
+const BarcodeScannerModal = lazyWithRetry(() => import('./BarcodeScannerModal.tsx'));
+const SystemConfigPanel = lazyWithRetry(() => import('./SystemConfigPanel.tsx'));
+const ReportesDashboard = lazyWithRetry(() => import('./ReportesDashboard.tsx'));
+const ReportesDiariosPage = lazyWithRetry(() => import('./ReportesDiariosPage.tsx'));
+const ProductHistoryModal = lazyWithRetry(() => import('./ProductHistoryModal.tsx'));
+const ComprasModule = lazyWithRetry(() => import('./ComprasModule.tsx'));
+const CuentasBancariasPage = lazyWithRetry(() => import('./CuentasBancariasPage.tsx'));
+const GastosPage = lazyWithRetry(() => import('./GastosPage.tsx'));
+const CuentasPendientesPage = lazyWithRetry(() => import('./CuentasPendientesPage.tsx'));
+const ReportesCuentasPage = lazyWithRetry(() => import('./ReportesCuentasPage.tsx'));
+const ClientsManagerModule = lazyWithRetry(() => import('./ClientsManagerModule.tsx'));
+const GlobalKardex = lazyWithRetry(() => import('./GlobalKardex.tsx'));
 
 const AdminSubmoduleLoader = ({ name = 'Módulo' }: { name?: string }) => (
   <div className="flex flex-col items-center justify-center p-16 min-h-[380px] bg-white rounded-2xl border border-gray-150 text-center select-none animate-fadeIn my-2">
@@ -81,8 +90,8 @@ interface AdminPanelProps {
   onRefreshData: () => void;
   activeRole: 'admin' | 'vendedor' | 'cliente';
   currentUser?: StoreUser | null;
-  initialTab?: 'products' | 'categories' | 'brands' | 'orders';
-  onTabChange?: (tab: 'products' | 'categories' | 'brands' | 'orders') => void;
+  initialTab?: 'products' | 'movimiento' | 'categories' | 'brands' | 'orders';
+  onTabChange?: (tab: 'products' | 'movimiento' | 'categories' | 'brands' | 'orders') => void;
   initialMenu?: AdminMenuType;
   onMenuChange?: (menu: AdminMenuType) => void;
   activeCurrency: CurrencyCode;
@@ -116,11 +125,13 @@ export default function AdminPanel({
 }: AdminPanelProps) {
   const { t, lang } = useI18n();
   const getGroupIdForMenu = (menu: AdminMenuType): string => {
-    if (['sales', 'orders', 'cotizaciones'].includes(menu)) return 'ventas';
+    if (menu === 'indicadores') return 'indicadores';
+    if (['sales', 'orders', 'cotizaciones', 'sales_report'].includes(menu)) return 'ventas';
     if (['products', 'compras'].includes(menu)) return 'inventarios';
-    if (['caja', 'cuentas_bancarias', 'balance'].includes(menu)) return 'cuentas';
+    if (['caja', 'cuentas_bancarias', 'balance', 'reportes_cuentas'].includes(menu)) return 'cuentas';
+    if (menu === 'gastos') return 'gastos';
     if (menu === 'marketing') return 'marketing';
-    if (['reportes_balance', 'reportes_gastos', 'reportes_ganancias', 'reportes', 'gastos'].includes(menu)) return 'reportes';
+    if (['reportes_balance', 'reportes_gastos', 'reportes_ganancias', 'reportes'].includes(menu)) return 'reportes';
     if (['clientes', 'proveedores', 'clientes_proveedores'].includes(menu)) return 'contactos';
     if (['settings', 'users'].includes(menu)) return 'configuracion';
     return '';
@@ -149,6 +160,14 @@ export default function AdminPanel({
   const [isPrintingInventory, setIsPrintingInventory] = useState<boolean>(false);
   const [systemConfigSubTab, setSystemConfigSubTab] = useState<'mi_cuenta' | 'mi_negocio' | 'facturacion' | 'inventario' | 'impresion' | 'dashboard' | 'notificaciones' | 'planes_suscripcion'>('mi_negocio');
 
+  // Base de Datos / Gestión de Inventarios Modal States
+  const [showInventoryMgmtModal, setShowInventoryMgmtModal] = useState<boolean>(false);
+  const [exportFilterOption, setExportFilterOption] = useState<string>('all');
+  const [selectedImportFile, setSelectedImportFile] = useState<File | null>(null);
+  const [convertBcvBsToUsd, setConvertBcvBsToUsd] = useState<boolean>(false);
+  const [isSubmittingImport, setIsSubmittingImport] = useState<boolean>(false);
+  const modalFileInputRef = useRef<HTMLInputElement>(null);
+
   useEffect(() => {
     const handleOpenConfigDashboard = () => {
       setSystemConfigSubTab('dashboard');
@@ -173,9 +192,9 @@ export default function AdminPanel({
       onMenuChange(menu);
     }
   };
-  const [bcvRate, setBcvRate] = useState<number>(721.34);
+  const [bcvRate, setBcvRate] = useState<number>(() => currencyRates?.VES || getCachedCurrencyRates().VES);
   const [isEditingBcv, setIsEditingBcv] = useState<boolean>(false);
-  const [bcvInputValue, setBcvInputValue] = useState<string>("721.34");
+  const [bcvInputValue, setBcvInputValue] = useState<string>(() => (currencyRates?.VES || getCachedCurrencyRates().VES).toString());
   const [eurInputValue, setEurInputValue] = useState<string>("0.92");
   const [copInputValue, setCopInputValue] = useState<string>("4000");
   const [bcvRatesHistory, setBcvRatesHistory] = useState<any[]>([]);
@@ -190,6 +209,19 @@ export default function AdminPanel({
       }
     }
   }, [currencyRates]);
+
+  useEffect(() => {
+    const handleBcvUpdated = (e: any) => {
+      if (e?.detail?.rate) {
+        setBcvRate(e.detail.rate);
+        setBcvInputValue(e.detail.rate.toString());
+      }
+    };
+    window.addEventListener('bellavista_bcv_rate_updated', handleBcvUpdated);
+    return () => {
+      window.removeEventListener('bellavista_bcv_rate_updated', handleBcvUpdated);
+    };
+  }, []);
 
   const fetchBcvRate = async () => {
     try {
@@ -209,29 +241,27 @@ export default function AdminPanel({
     try {
       let finalRate = rate;
       try {
-        const res = await fetch('https://ve.dolarapi.com/v1/dolares');
+        const res = await fetch('/api/bcv/rates');
         if (res.ok) {
           const data = await res.json();
-          if (Array.isArray(data)) {
-            const oficial = data.find((item: any) => item && item.fuente === 'oficial');
-            if (oficial && typeof oficial.promedio === 'number') {
-              const fetchedRate = oficial.promedio;
-              if (fetchedRate > rate) {
-                finalRate = fetchedRate;
-                alert(`Aviso: La tasa oficial de DolarAPI (Bs. ${fetchedRate.toFixed(2)}) es superior a la ingresada (Bs. ${rate.toFixed(2)}). Se mantendrá la tasa de mayor valor (Bs. ${fetchedRate.toFixed(2)}) en el sistema.`);
-              } else {
-                console.log(`Tasa ingresada (${rate}) es mayor o igual a la de DolarAPI (${fetchedRate}). Manteniendo la de mayor valor.`);
-              }
+          if (data && typeof data.usdRate === 'number' && data.usdRate > 0) {
+            const officialRate = data.usdRate;
+            const isFuture = !!data.isFutureRate;
+            if (rate < officialRate - 0.0001) {
+              finalRate = officialRate;
+              alert(`Aviso: Por regla del BCV, la tasa no puede ser menor a la especificada en la página oficial (Bs. ${officialRate.toFixed(2)})${isFuture ? ' o tasa futura' : ''}. Se ajustará a Bs. ${finalRate.toFixed(2)}.`);
             }
           }
         }
       } catch (apiErr) {
-        console.warn("No se pudo consultar DolarAPI para comparación de tasa, guardando la ingresada:", apiErr);
+        console.warn("No se pudo consultar portal BCV para comparación de tasa, guardando la ingresada:", apiErr);
       }
 
-      await dbService.updateBcvRate(finalRate, 'Pedro (Admin)');
+      await dbService.updateCurrencyRate('VES', finalRate, 'Pedro (Admin)');
       setBcvRate(finalRate);
       setBcvInputValue(finalRate.toString());
+      window.dispatchEvent(new CustomEvent('bellavista_bcv_rate_updated', { detail: { rate: finalRate } }));
+      window.dispatchEvent(new CustomEvent('bellavista_settings_updated'));
       const history = await dbService.getBcvRatesHistory();
       setBcvRatesHistory(history);
     } catch (err: any) {
@@ -308,9 +338,38 @@ export default function AdminPanel({
     loadAdminTaxes();
     window.addEventListener('bellavista_taxes_updated', loadAdminTaxes);
     window.addEventListener('bellavista_cash_updated', fetchCajaData);
+    
+    let cashOpsSub: any = null;
+    let cashSessionsSub: any = null;
+    let taxesSub: any = null;
+    if (supabase) {
+      cashOpsSub = supabase.channel('public:cash_ops_realtime')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'cash_ops' }, () => {
+          fetchCajaData();
+        })
+        .subscribe();
+      
+      cashSessionsSub = supabase.channel('public:cash_sessions_realtime')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'cash_sessions' }, () => {
+          fetchCajaData();
+        })
+        .subscribe();
+
+      taxesSub = supabase.channel('public:taxes_realtime')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'taxes' }, () => {
+          loadAdminTaxes();
+        })
+        .subscribe();
+    }
+
     return () => {
       window.removeEventListener('bellavista_taxes_updated', loadAdminTaxes);
       window.removeEventListener('bellavista_cash_updated', fetchCajaData);
+      if (supabase) {
+        if (cashOpsSub) supabase.removeChannel(cashOpsSub);
+        if (cashSessionsSub) supabase.removeChannel(cashSessionsSub);
+        if (taxesSub) supabase.removeChannel(taxesSub);
+      }
     };
   }, []);
 
@@ -434,7 +493,7 @@ export default function AdminPanel({
   });
 
   const [chartView, setChartView] = useState<'days' | 'months'>('days');
-  const [activeTab, setActiveTab] = useState<'products' | 'categories' | 'brands' | 'orders'>(initialTab || 'products');
+  const [activeTab, setActiveTab] = useState<'products' | 'movimiento' | 'categories' | 'brands' | 'orders'>(initialTab || 'products');
   const [settingsTab, setSettingsTab] = useState<'mi_cuenta' | 'business' | 'bcv' | 'landing' | 'publicidad' | 'taxes' | 'mi_negocio' | 'facturacion' | 'inventario' | 'impresion' | 'dashboard_custom' | 'notificaciones'>('mi_cuenta');
   const [adSubTab, setAdSubTab] = useState<'landing' | 'banner' | 'carrusel'>('banner');
   const [bannerSlidesList, setBannerSlidesList] = useState<BannerSlide[]>([]);
@@ -805,7 +864,8 @@ export default function AdminPanel({
     setTimeout(() => setAdSaveSuccessMsg(null), 3500);
   };
 
-  const [usersSubTab, setUsersSubTab] = useState<'internos' | 'externos' | 'permisos'>('internos');
+  const [configMainTab, setConfigMainTab] = useState<'mi_negocio' | 'mi_cuenta' | 'usuarios_asociados' | 'facturacion' | 'inventario' | 'impresion' | 'respaldo'>('mi_negocio');
+  const [usersSubTab, setUsersSubTab] = useState<'asociados' | 'personal'>('asociados');
   
   const [localLandingActive, setLocalLandingActive] = useState(isLandingActive);
   const [showLandingSaveSuccess, setShowLandingSaveSuccess] = useState(false);
@@ -851,7 +911,7 @@ export default function AdminPanel({
     fetchStoreUsers();
   }, []);
 
-  const handleTabClick = (tab: 'products' | 'categories' | 'brands' | 'orders') => {
+  const handleTabClick = (tab: 'products' | 'movimiento' | 'categories' | 'brands' | 'orders') => {
     setActiveTab(tab);
     setSearchQuery('');
     if (onTabChange) {
@@ -1021,8 +1081,8 @@ export default function AdminPanel({
           </div>
           <div style="font-size: 11px; text-align: right; margin-top: 6px; padding: 6px 8px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px;">
             <span style="font-size: 9px; font-weight: bold; color: #64748b; text-transform: uppercase; display: block;">PAGO EN DIVISAS / BS. BCV</span>
-            <span style="font-size: 12px; font-weight: 900; color: #1e293b; display: block;">Bs. ${totalBs.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-            <span style="font-size: 10px; color: #64748b; display: block;">Tasa Oficial BCV: 1 USD = Bs. ${bcv.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+            <span style="font-size: 12px; font-weight: 900; color: #1e293b; display: block;">Bs. ${(Number(totalBs) || 0).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+            <span style="font-size: 10px; color: #64748b; display: block;">Tasa Oficial BCV: 1 USD = Bs. ${(Number(bcv) || 0).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
           </div>
           <div class="line"></div>
           <div class="center" style="font-size: 10px; margin-top: 15px;">
@@ -1095,12 +1155,16 @@ export default function AdminPanel({
   const [clientFormType, setClientFormType] = useState<string>('Natural');
   const [clientFormPhone, setClientFormPhone] = useState<string>('');
   const [clientFormEmail, setClientFormEmail] = useState<string>('');
+  const [clientFormAddress, setClientFormAddress] = useState<string>('');
   const [clientFormCredit, setClientFormCredit] = useState<number>(0);
 
   // Store users state
   const [storeUsers, setStoreUsers] = useState<StoreUser[]>([]);
   const [loadingUsers, setLoadingUsers] = useState(false);
+  const [lastStoreUsersSync, setLastStoreUsersSync] = useState<string>('');
   const [showUserModal, setShowUserModal] = useState(false);
+  const [userToDelete, setUserToDelete] = useState<{ id: string; email?: string; name: string } | null>(null);
+  const [isDeletingUser, setIsDeletingUser] = useState<boolean>(false);
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
   const [userFormName, setUserFormName] = useState('');
   const [userFormEmail, setUserFormEmail] = useState('');
@@ -1132,7 +1196,7 @@ export default function AdminPanel({
 
   const getDefaultPermissionsForRole = (role: string): string[] => {
     const r = (role || '').toLowerCase();
-    if (r === 'gerente' || r === 'admin' || r === 'administrador') {
+    if (r === 'gerente' || r === 'admin' || r === 'administrador' || r === 'propietario') {
       return ['orders', 'sales', 'products', 'caja', 'clientes', 'proveedores', 'compras', 'reportes', 'settings', 'marketing'];
     }
     if (r === 'cajero') {
@@ -1184,17 +1248,59 @@ export default function AdminPanel({
 
   const fetchStoreUsers = async () => {
     setLoadingUsers(true);
-    const users = await dbService.getStoreUsers();
-    setStoreUsers(users);
-    setLoadingUsers(false);
+    try {
+      const users = await dbService.getStoreUsers();
+      setStoreUsers(users);
+      setLastStoreUsersSync(new Date().toLocaleTimeString('es-VE', { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
+    } catch (err) {
+      console.error('Error fetching store users from Supabase:', err);
+    } finally {
+      setLoadingUsers(false);
+    }
   };
 
   useEffect(() => {
-    if (currentMenu === 'users') {
+    if (currentMenu === 'users' || currentMenu === 'settings') {
       fetchStoreUsers();
       fetchClients();
     }
-  }, [currentMenu, usersSubTab]);
+  }, [currentMenu, configMainTab, usersSubTab]);
+
+  // Realtime Supabase Channel and Local Event Listener for store_users
+  useEffect(() => {
+    fetchStoreUsers();
+
+    const handleUsersUpdated = () => {
+      fetchStoreUsers();
+    };
+    window.addEventListener('bellavista_store_users_updated', handleUsersUpdated);
+
+    let channel: any = null;
+    if (supabase) {
+      channel = supabase.channel('realtime_store_users_sub')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'store_users' }, () => {
+          fetchStoreUsers();
+        })
+        .subscribe();
+    }
+
+    let intervalId: any = null;
+    if (currentMenu === 'users') {
+      intervalId = setInterval(() => {
+        fetchStoreUsers();
+      }, 5000);
+    }
+
+    return () => {
+      window.removeEventListener('bellavista_store_users_updated', handleUsersUpdated);
+      if (channel && supabase) {
+        supabase.removeChannel(channel);
+      }
+      if (intervalId) {
+        clearInterval(intervalId);
+      }
+    };
+  }, [currentMenu]);
 
   const handleSaveStoreUser = async () => {
     setUserFormError('');
@@ -1253,25 +1359,60 @@ export default function AdminPanel({
     }
   };
 
-  const handleDeleteStoreUser = async (id: string, name: string) => {
-    if (!confirm(`¿Está seguro de eliminar al usuario "${name}"?`)) return;
-    const success = await dbService.deleteStoreUser(id);
-    if (success) {
-      setStoreUsers(storeUsers.filter(u => u.id !== id));
-    } else {
-      alert('Error al eliminar el usuario de la base de datos.');
+  const handleDeleteStoreUser = (id: string, name: string, email?: string) => {
+    const userRole = (currentUser?.role || activeRole || '').toLowerCase();
+    const canManage = userRole.includes('admin') || userRole.includes('gerente') || userRole.includes('propietario') || activeRole === 'admin' || !currentUser;
+    if (!canManage) {
+      alert('Solo el Propietario o Gerente pueden eliminar operadores del sistema.');
+      return;
+    }
+    setUserToDelete({ id, name, email });
+  };
+
+  const handleConfirmDeleteUser = async () => {
+    if (!userToDelete) return;
+    setIsDeletingUser(true);
+    try {
+      const success = await dbService.deleteStoreUser(userToDelete.id, userToDelete.email);
+      if (success) {
+        setStoreUsers(prev => prev.filter(u => {
+          const uId = (u.id || '').toString();
+          const uEmail = (u.email || '').toLowerCase();
+          const targetId = userToDelete.id.toString();
+          const targetEmail = (userToDelete.email || (targetId.includes('@') ? targetId : '')).toLowerCase();
+          if (targetId && uId === targetId) return false;
+          if (targetId && uEmail === targetId.toLowerCase()) return false;
+          if (targetEmail && uEmail === targetEmail) return false;
+          return true;
+        }));
+        setUserToDelete(null);
+      } else {
+        alert('Error al eliminar el operador de la base de datos.');
+      }
+    } catch (err) {
+      console.error('Error deleting store user:', err);
+      alert('Ocurrió un error inesperado al eliminar el usuario.');
+    } finally {
+      setIsDeletingUser(false);
     }
   };
 
   const handleToggleStoreUserStatus = async (id: string, currentStatus: boolean) => {
-    // Only Admin or Gerente can toggle status
-    if ((activeRole as string) !== 'Admin' && (activeRole as string) !== 'Gerente' && activeRole !== 'admin') {
-      alert('No tienes permisos para desactivar usuarios.');
+    const userRole = (currentUser?.role || activeRole || '').toLowerCase();
+    const canManage = userRole.includes('admin') || userRole.includes('gerente') || userRole.includes('propietario') || activeRole === 'admin';
+    if (!canManage) {
+      alert('Solo el Propietario o Gerente pueden activar o desactivar operadores.');
       return;
     }
-    const success = await dbService.updateStoreUser(id, { is_active: !currentStatus });
-    if (success) {
-      setStoreUsers(storeUsers.map(u => u.id === id ? { ...u, is_active: !currentStatus } : u));
+    const newStatus = !currentStatus;
+    // Optimistic UI update
+    setStoreUsers(prev => prev.map(u => (u.id === id || u.email === id) ? { ...u, is_active: newStatus } : u));
+    
+    const success = await dbService.updateStoreUser(id, { is_active: newStatus });
+    if (!success) {
+      // Revert if failed
+      setStoreUsers(prev => prev.map(u => (u.id === id || u.email === id) ? { ...u, is_active: currentStatus } : u));
+      alert('No se pudo actualizar el estado en la base de datos.');
     }
   };
 
@@ -1412,6 +1553,8 @@ export default function AdminPanel({
         type: clientFormType,
         phone: clientFormPhone.trim(),
         email: clientFormEmail.trim(),
+        address: clientFormAddress.trim(),
+        direccion: clientFormAddress.trim(),
         credit_usd: Number(clientFormCredit) || 0
       };
 
@@ -1423,7 +1566,7 @@ export default function AdminPanel({
 
       setShowClientModal(false);
       setSelectedClientForEdit(null);
-      fetchClients();
+      await fetchClients();
     } catch (err: any) {
       console.error("Error saving client:", err);
       alert("Error al guardar cliente: " + err.message);
@@ -1431,10 +1574,9 @@ export default function AdminPanel({
   };
 
   const handleDeleteClient = async (id: string, name: string) => {
-    if (!confirm(`¿Está seguro de eliminar al cliente "${name}"?`)) return;
     try {
-      await dbService.deleteClient(id);
-      fetchClients();
+      await dbService.deleteClient(id, name);
+      await fetchClients();
     } catch (err: any) {
       console.error("Error deleting client:", err);
       alert("Error al eliminar cliente: " + err.message);
@@ -1443,11 +1585,12 @@ export default function AdminPanel({
 
   const openEditClientModal = (client: any) => {
     setSelectedClientForEdit(client);
-    setClientFormName(client.name);
-    setClientFormDocument(client.document);
+    setClientFormName(client.name || '');
+    setClientFormDocument(client.document || client.doc_number || '');
     setClientFormType(client.type || 'Natural');
     setClientFormPhone(client.phone || '');
-    setClientFormEmail(client.email || '');
+    setClientFormEmail(client.email || client.correo || '');
+    setClientFormAddress(client.address || client.direccion || '');
     setClientFormCredit(client.credit_usd || 0);
     setShowClientModal(true);
   };
@@ -1459,6 +1602,7 @@ export default function AdminPanel({
     setClientFormType('Natural');
     setClientFormPhone('');
     setClientFormEmail('');
+    setClientFormAddress('');
     setClientFormCredit(0);
     setShowClientModal(true);
   };
@@ -1467,10 +1611,14 @@ export default function AdminPanel({
     if (currentMenu === 'clientes') {
       fetchClients();
     }
-    if (currentMenu === 'proveedores') {
+    if (currentMenu === 'proveedores' || currentMenu === 'compras') {
       fetchProviders();
     }
   }, [currentMenu]);
+
+  useEffect(() => {
+    fetchProviders();
+  }, []);
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(Date.now()), 1000);
@@ -1837,6 +1985,61 @@ export default function AdminPanel({
   const [prodRatingStars, setProdRatingStars] = useState<number>(5);
   const [prodRatingCount, setProdRatingCount] = useState<number>(0);
   const [prodImageUrl, setProdImageUrl] = useState(''); // Comma separated for multiples
+  const [prodImageMode, setProdImageMode] = useState<'upload' | 'url'>('upload');
+  const [prodUploadedImages, setProdUploadedImages] = useState<string[]>([]);
+  const [isUploadingImages, setIsUploadingImages] = useState<boolean>(false);
+  const [slotReplaceIndex, setSlotReplaceIndex] = useState<number | null>(null);
+  const prodFileInputRef = useRef<HTMLInputElement | null>(null);
+  const prodReplaceInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleImageFilesChange = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setIsUploadingImages(true);
+    try {
+      const newImages = [...prodUploadedImages];
+      const remainingSlots = Math.max(0, 3 - newImages.length);
+      const filesToProcess = Array.from(files).slice(0, remainingSlots);
+
+      for (const file of filesToProcess) {
+        if (!file.type.startsWith('image/')) continue;
+        const uploadedUrl = await dbService.uploadProductImageFile(file);
+        if (uploadedUrl) {
+          newImages.push(uploadedUrl);
+        }
+      }
+      setProdUploadedImages(newImages.slice(0, 3));
+    } catch (err) {
+      console.error("Error processing images:", err);
+      alert("Error al cargar las imágenes. Por favor intente nuevamente.");
+    } finally {
+      setIsUploadingImages(false);
+    }
+  };
+
+  const handleRemoveUploadedImage = (indexToRemove: number) => {
+    setProdUploadedImages(prev => prev.filter((_, idx) => idx !== indexToRemove));
+  };
+
+  const handleReplaceUploadedImage = async (indexToReplace: number, file: File) => {
+    if (!file || !file.type.startsWith('image/')) return;
+    setIsUploadingImages(true);
+    try {
+      const uploadedUrl = await dbService.uploadProductImageFile(file);
+      if (uploadedUrl) {
+        setProdUploadedImages(prev => {
+          const copy = [...prev];
+          copy[indexToReplace] = uploadedUrl;
+          return copy;
+        });
+      }
+    } catch (err) {
+      console.error("Error replacing image:", err);
+      alert("Error al reemplazar la imagen.");
+    } finally {
+      setIsUploadingImages(false);
+      setSlotReplaceIndex(null);
+    }
+  };
   const [prodTechUrl, setProdTechUrl] = useState('');
   const [prodBarcodeQr, setProdBarcodeQr] = useState('');
   const [showProductFormScanner, setShowProductFormScanner] = useState(false);
@@ -1892,6 +2095,7 @@ export default function AdminPanel({
 
   // Product Movement Modal states
   const [movementModalProd, setMovementModalProd] = useState<Product | null>(null);
+  const [historyModalProd, setHistoryModalProd] = useState<Product | null>(null);
   const [movementType, setMovementType] = useState<'ingreso' | 'egreso' | 'ajuste'>('ingreso');
   const [movementQty, setMovementQty] = useState<number | string>(1);
   const [movementConcept, setMovementConcept] = useState<string>('Ajuste de inventario');
@@ -1901,18 +2105,41 @@ export default function AdminPanel({
     if (!movementModalProd) return;
 
     const qty = Number(movementQty) || 0;
-    let newStock = movementModalProd.stock;
+    const prevStock = movementModalProd.stock;
+    let newStock = prevStock;
+    let qtyDelta = 0;
 
     if (movementType === 'ingreso') {
       newStock += qty;
+      qtyDelta = qty;
     } else if (movementType === 'egreso') {
       newStock = Math.max(0, newStock - qty);
+      qtyDelta = -Math.min(prevStock, qty);
     } else if (movementType === 'ajuste') {
       newStock = Math.max(0, qty);
+      qtyDelta = newStock - prevStock;
     }
 
     try {
       await supabase.from('products').update({ stock: newStock }).eq('id', movementModalProd.id);
+      
+      // Save to audit history ledger
+      await dbService.recordProductMovement({
+        id: crypto.randomUUID(),
+        product_id: movementModalProd.id,
+        product_name: movementModalProd.name,
+        product_sku: movementModalProd.sku,
+        type: movementType,
+        quantity: qtyDelta,
+        previous_stock: prevStock,
+        new_stock: newStock,
+        concept: movementConcept.trim() || `Ajuste manual (${movementType.toUpperCase()})`,
+        unit_price: movementModalProd.offer_price || movementModalProd.price,
+        total_amount: Math.abs(qtyDelta) * (movementModalProd.offer_price || movementModalProd.price),
+        user_name: 'Administración',
+        created_at: new Date().toISOString()
+      });
+
       if (onRefreshData) {
         onRefreshData();
       }
@@ -2005,8 +2232,14 @@ export default function AdminPanel({
       setProdDescription(prod.description);
       setProdUnit(prod.unit || (prod as any).units || 'Unidad');
 
-      const cost = prod.cost_price ?? 0;
-      const m1 = prod.margin_1 ?? 30;
+      const storedMeta = dbService.getStoredProductMeta();
+      const meta = storedMeta[prod.id] || {};
+      const cost = (prod.cost_price !== undefined && prod.cost_price !== null && Number(prod.cost_price) > 0)
+        ? Number(prod.cost_price)
+        : (meta.cost_price !== undefined && meta.cost_price !== null ? Number(meta.cost_price) : Number(prod.cost_price || 0));
+      const m1 = (prod.margin_1 !== undefined && prod.margin_1 !== null && Number(prod.margin_1) > 0)
+        ? Number(prod.margin_1)
+        : (meta.margin_1 !== undefined && meta.margin_1 !== null ? Number(meta.margin_1) : Number(prod.margin_1 || 30));
 
       setProdCostPrice(cost);
       setProdMargin1(m1);
@@ -2037,9 +2270,13 @@ export default function AdminPanel({
       // Load images
       const associatedImgs = productImages
         .filter(img => img.product_id === prod.id)
+        .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
         .map(img => img.image_url)
-        .join(', ');
-      setProdImageUrl(associatedImgs);
+        .filter(url => Boolean(url && url.trim()));
+
+      setProdUploadedImages(associatedImgs);
+      setProdImageUrl(associatedImgs.join(', '));
+      setProdImageMode(associatedImgs.length > 0 ? 'upload' : 'upload');
     } else {
       setEditingProduct(null);
       setProdSku('PRD-' + Math.random().toString(36).substring(2, 8).toUpperCase());
@@ -2057,7 +2294,9 @@ export default function AdminPanel({
       setProdActive(true);
       setProdRatingStars(5);
       setProdRatingCount(0);
+      setProdUploadedImages([]);
       setProdImageUrl('');
+      setProdImageMode('upload');
       setProdTechUrl('');
       setProdBarcodeQr('');
       setProdTaxId('exento');
@@ -2134,26 +2373,15 @@ export default function AdminPanel({
         savedProduct = await dbService.createProduct(payload);
       }
 
-      // Handle additional images save
-      if (prodImageUrl.trim() !== '') {
-        // Clear previous images if editing
-        if (editingProduct) {
-          const prevImgs = productImages.filter(img => img.product_id === editingProduct.id);
-          for (const img of prevImgs) {
-            await dbService.removeProductImage(img.id);
-          }
-        }
-
-        // Add new images
-        const urls = prodImageUrl.split(',').map(u => u.trim()).filter(u => u !== '');
-        for (let i = 0; i < urls.length; i++) {
-          await dbService.addProductImage({
-            product_id: savedProduct.id,
-            image_url: urls[i],
-            sort_order: i + 1
-          });
-        }
+      // Handle images persistence in Supabase database based strictly on the selected mode
+      let finalImagesToPersist: string[] = [];
+      if (prodImageMode === 'upload') {
+        finalImagesToPersist = prodUploadedImages.filter(u => Boolean(u && u.trim())).slice(0, 3);
+      } else {
+        finalImagesToPersist = prodImageUrl.split(',').map(u => u.trim()).filter(u => Boolean(u && u.trim())).slice(0, 3);
       }
+
+      await dbService.setProductImagesForProduct(savedProduct.id, finalImagesToPersist);
 
       setShowProductModal(false);
       onRefreshData();
@@ -2294,10 +2522,9 @@ export default function AdminPanel({
     }
   };
 
-  // Print Critical Stock Inventory Report
+  // Print Full Inventory Report (PDF)
   const handlePrintInventoryReport = async () => {
     try {
-      // 1. Fetch up-to-date products from Database
       let allProds = products;
       try {
         const fetched = await dbService.getProducts();
@@ -2308,20 +2535,17 @@ export default function AdminPanel({
         console.warn("Error fetching products from DB for report, using local state:", e);
       }
 
-      // 2. Determine low stock threshold
       const sysCfg = localStorage.getItem('copias_bellavista_sys_config');
       const lowStockThresh = sysCfg ? (JSON.parse(sysCfg).inventarioLowStockThreshold ?? 5) : inventarioLowStockThreshold;
 
-      // 3. Filter products where stock is <= minimum stock threshold
-      const criticalProds = allProds.filter(p => {
-        const pMin = (p as any).min_stock ?? (p as any).stock_minimo ?? lowStockThresh;
-        return p.stock <= pMin;
-      });
+      // Sort alphabetically by product name
+      allProds.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
 
-      // Sort by stock ascending (0 or negative stock first)
-      criticalProds.sort((a, b) => a.stock - b.stock);
+      const totalUnits = allProds.reduce((sum, p) => sum + (p.stock || 0), 0);
+      const totalValUsd = allProds.reduce((sum, p) => sum + ((p.stock || 0) * (p.price || 0)), 0);
+      const currentRate = (bcvRate && bcvRate > 0) ? bcvRate : 721.34;
+      const totalValVes = totalValUsd * currentRate;
 
-      // 4. Open clean printable window
       const printWin = window.open('', '_blank', 'width=950,height=750');
       if (!printWin) {
         alert("Por favor habilite las ventanas emergentes (popups) en su navegador para imprimir el reporte.");
@@ -2331,36 +2555,39 @@ export default function AdminPanel({
       const reportDate = new Date().toLocaleString('es-VE', { dateStyle: 'full', timeStyle: 'short' });
       const businessName = localStorage.getItem('business_name') || 'Copias Bella Vista, C.A.';
 
-      const tableRowsHtml = criticalProds.length > 0
-        ? criticalProds.map((p, idx) => {
+      const tableRowsHtml = allProds.length > 0
+        ? allProds.map((p, idx) => {
             const catName = categories.find(c => c.id === p.category_id)?.name || 'General';
             const brandName = brands.find(b => b.id === p.brand_id)?.name || 'S/M';
             const pMin = (p as any).min_stock ?? (p as any).stock_minimo ?? lowStockThresh;
             const isZero = p.stock <= 0;
-            const statusLabel = isZero ? 'AGOTADO' : 'STOCK CRÍTICO';
+            const isLow = p.stock <= pMin && !isZero;
+            const statusLabel = isZero ? 'AGOTADO' : isLow ? 'STOCK BAJO' : 'DISPONIBLE';
             const statusStyle = isZero
               ? 'background: #fef2f2; color: #dc2626; border: 1px solid #fca5a5;'
-              : 'background: #fffbeb; color: #d97706; border: 1px solid #fde68a;';
+              : isLow
+              ? 'background: #fffbeb; color: #d97706; border: 1px solid #fde68a;'
+              : 'background: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0;';
 
             return `
               <tr>
-                <td style="text-align: center; font-weight: bold; color: #64748b; padding: 7px;">${idx + 1}</td>
-                <td style="font-family: monospace; font-weight: bold; color: #0f172a; padding: 7px;">${p.sku || 'N/A'}</td>
-                <td style="font-weight: 600; color: #1e293b; padding: 7px;">${p.name}</td>
-                <td style="color: #475569; padding: 7px;">${catName} / ${brandName}</td>
-                <td style="text-align: center; font-weight: 900; font-size: 12px; color: ${isZero ? '#dc2626' : '#d97706'}; padding: 7px;">${p.stock} un.</td>
-                <td style="text-align: center; color: #64748b; font-weight: 600; padding: 7px;">${pMin} un.</td>
-                <td style="text-align: right; font-weight: bold; color: #0f172a; padding: 7px;">$${Number(p.price).toFixed(2)}</td>
-                <td style="text-align: center; padding: 7px;">
-                  <span style="display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 9px; font-weight: 900; ${statusStyle}">
+                <td style="text-align: center; font-weight: bold; color: #64748b; padding: 6px;">${idx + 1}</td>
+                <td style="font-family: monospace; font-weight: bold; color: #0f172a; padding: 6px;">${p.sku || 'N/A'}</td>
+                <td style="font-weight: 600; color: #1e293b; padding: 6px;">${p.name}</td>
+                <td style="color: #475569; padding: 6px;">${catName} / ${brandName}</td>
+                <td style="text-align: center; font-weight: 900; font-size: 11px; color: ${isZero ? '#dc2626' : isLow ? '#d97706' : '#16a34a'}; padding: 6px;">${p.stock} un.</td>
+                <td style="text-align: center; color: #64748b; font-weight: 600; padding: 6px;">${pMin} un.</td>
+                <td style="text-align: right; font-weight: bold; color: #0f172a; padding: 6px;">$${Number(p.price).toFixed(2)}</td>
+                <td style="text-align: center; padding: 6px;">
+                  <span style="display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 8px; font-weight: 900; ${statusStyle}">
                     ${statusLabel}
                   </span>
                 </td>
               </tr>
             `;
           }).join('')
-        : `<tr><td colspan="8" style="text-align: center; padding: 24px; color: #059669; font-weight: bold; font-size: 13px;">
-             ✅ ¡Excelente! No se encontraron productos con stock crítico por debajo o igual al umbral mínimo (${lowStockThresh} unidades).
+        : `<tr><td colspan="8" style="text-align: center; padding: 24px; color: #64748b; font-weight: bold; font-size: 13px;">
+             No se encontraron artículos registrados en el catálogo de inventario.
            </td></tr>`;
 
       printWin.document.write(`
@@ -2368,59 +2595,67 @@ export default function AdminPanel({
         <html lang="es">
         <head>
           <meta charset="UTF-8">
-          <title>Reporte de Stock Crítico - ${businessName}</title>
+          <title>Reporte de Inventario General - ${businessName}</title>
           <style>
-            @page { size: letter portrait; margin: 12mm; }
-            body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #0f172a; margin: 0; padding: 20px; background: #fff; }
-            .header { border-bottom: 3px solid #dc2626; padding-bottom: 12px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: flex-end; }
-            .company { font-size: 20px; font-weight: 900; color: #005da9; text-transform: uppercase; letter-spacing: -0.5px; }
-            .report-title { font-size: 15px; font-weight: 900; color: #dc2626; margin-top: 2px; }
-            .meta-info { text-align: right; font-size: 11px; color: #64748b; line-height: 1.4; }
-            .summary-box { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; display: flex; gap: 24px; align-items: center; }
+            @page { size: letter portrait; margin: 10mm; }
+            body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #0f172a; margin: 0; padding: 16px; background: #fff; }
+            .header { border-bottom: 3px solid #1D3557; padding-bottom: 10px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: flex-end; }
+            .company { font-size: 20px; font-weight: 900; color: #1D3557; text-transform: uppercase; letter-spacing: -0.5px; }
+            .report-title { font-size: 14px; font-weight: 900; color: #00BFFF; margin-top: 2px; }
+            .meta-info { text-align: right; font-size: 10px; color: #64748b; line-height: 1.4; }
+            .summary-box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 14px; margin-bottom: 14px; display: flex; gap: 20px; justify-content: space-between; align-items: center; }
             .stat-item { display: flex; flex-direction: column; }
-            .stat-label { font-size: 10px; font-weight: 800; color: #991b1b; text-transform: uppercase; }
-            .stat-value { font-size: 16px; font-weight: 900; color: #7f1d1d; }
-            table { width: 100%; border-collapse: collapse; font-size: 11px; }
-            th { background: #f1f5f9; border: 1px solid #cbd5e1; padding: 8px 6px; text-align: left; font-size: 10px; font-weight: 900; text-transform: uppercase; color: #334155; }
-            td { border: 1px solid #e2e8f0; }
+            .stat-label { font-size: 9px; font-weight: 800; color: #64748b; text-transform: uppercase; }
+            .stat-value { font-size: 14px; font-weight: 900; color: #1D3557; }
+            table { width: 100%; border-collapse: collapse; font-size: 10px; }
+            th { background: #1D3557; border: 1px solid #0f172a; padding: 7px 5px; text-align: left; font-size: 9px; font-weight: 900; text-transform: uppercase; color: #fff; }
+            td { border: 1px solid #cbd5e1; }
             tr:nth-child(even) { background: #f8fafc; }
-            .footer { margin-top: 24px; border-top: 1px solid #e2e8f0; padding-top: 10px; text-align: center; font-size: 10px; color: #94a3b8; }
+            .footer { margin-top: 20px; border-top: 1px solid #e2e8f0; padding-top: 8px; text-align: center; font-size: 9px; color: #94a3b8; }
           </style>
         </head>
         <body>
           <div class="header">
             <div>
               <div class="company">${businessName}</div>
-              <div class="report-title">⚠️ REPORTE DE STOCK CRÍTICO DE INVENTARIO</div>
+              <div class="report-title">📋 REPORTE GENERAL DE INVENTARIO Y MERCANCÍAS</div>
             </div>
             <div class="meta-info">
               <div><strong>Fecha de emisión:</strong> ${reportDate}</div>
-              <div><strong>Umbral crítico global:</strong> ≤ ${lowStockThresh} unidades</div>
+              <div><strong>Tasa Referencial BCV:</strong> Bs. ${currentRate.toFixed(2)}</div>
             </div>
           </div>
 
           <div class="summary-box">
             <div class="stat-item">
-              <span class="stat-label">Total Productos Críticos</span>
-              <span class="stat-value">${criticalProds.length} artículos</span>
+              <span class="stat-label">Total Productos</span>
+              <span class="stat-value">${allProds.length} ítems</span>
             </div>
             <div class="stat-item">
-              <span class="stat-label">Total en Agotado (Stock 0)</span>
-              <span class="stat-value">${criticalProds.filter(p => p.stock <= 0).length} artículos</span>
+              <span class="stat-label">Stock Total Físico</span>
+              <span class="stat-value">${totalUnits} unidades</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-label">Valoración Total ($)</span>
+              <span class="stat-value">$${totalValUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-label">Valoración Total (Bs)</span>
+              <span class="stat-value">Bs. ${totalValVes.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
             </div>
           </div>
 
           <table>
             <thead>
               <tr>
-                <th style="width: 30px; text-align: center;">#</th>
-                <th style="width: 90px;">SKU</th>
-                <th>Nombre del Producto</th>
+                <th style="width: 25px; text-align: center;">#</th>
+                <th style="width: 80px;">SKU</th>
+                <th>Producto / Artículo</th>
                 <th>Categoría / Marca</th>
-                <th style="width: 85px; text-align: center;">Stock Actual</th>
-                <th style="width: 75px; text-align: center;">Stock Mín.</th>
-                <th style="width: 80px; text-align: right;">Precio ($)</th>
-                <th style="width: 100px; text-align: center;">Estado</th>
+                <th style="width: 75px; text-align: center;">Stock</th>
+                <th style="width: 65px; text-align: center;">Mínimo</th>
+                <th style="width: 75px; text-align: right;">Precio ($)</th>
+                <th style="width: 90px; text-align: center;">Estatus</th>
               </tr>
             </thead>
             <tbody>
@@ -2429,7 +2664,7 @@ export default function AdminPanel({
           </table>
 
           <div class="footer">
-            Sistema de Gestión Integral - ${businessName} | Reporte generado automáticamente
+            Sistema de Control de Inventarios - ${businessName} | Documento oficial generado en PDF
           </div>
 
           <script>
@@ -2443,9 +2678,194 @@ export default function AdminPanel({
       `);
       printWin.document.close();
     } catch (err) {
-      console.error("Error al imprimir el reporte de stock crítico:", err);
-      alert("No se pudo generar el reporte de stock crítico.");
+      console.error("Error al imprimir el reporte general de inventario:", err);
+      alert("No se pudo generar el reporte de inventario.");
     }
+  };
+
+  // Base de Datos Modal Helpers
+  const handleExecuteExportModal = () => {
+    let targetProducts = [...products];
+
+    if (exportFilterOption === 'in_stock') {
+      targetProducts = targetProducts.filter(p => p.stock > 0);
+    } else if (exportFilterOption === 'out_of_stock') {
+      targetProducts = targetProducts.filter(p => p.stock <= 0);
+    } else if (exportFilterOption.startsWith('cat_')) {
+      const catId = exportFilterOption.replace('cat_', '');
+      targetProducts = targetProducts.filter(p => p.category_id === catId);
+    }
+
+    const data = targetProducts.map(p => {
+      const category = categories.find(c => c.id === p.category_id);
+      const brand = brands.find(b => b.id === p.brand_id);
+      return {
+        ID: p.id,
+        SKU: p.sku,
+        Nombre: p.name,
+        Slug: p.slug,
+        Descripcion: p.description,
+        Precio: p.price,
+        PrecioOferta: p.offer_price || '',
+        Stock: p.stock,
+        Categoria: category?.name || '',
+        Marca: brand?.name || '',
+        Destacado: p.featured ? 'Si' : 'No',
+        Activo: p.active ? 'Si' : 'No',
+        Estrellas: p.rating_stars ?? 5,
+        Reviews: p.rating_count ?? 0,
+        FichaTecnica: p.technical_sheet_url || '',
+        CodigoBarraQR: p.barcode_qr || ''
+      };
+    });
+    
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Inventario");
+    XLSX.writeFile(wb, `Inventario_${exportFilterOption}_${new Date().toISOString().slice(0, 10)}.xlsx`);
+  };
+
+  const handleDownloadTemplate = () => {
+    const sampleData = [
+      {
+        ID: '',
+        SKU: 'PAP-001',
+        Nombre: 'Papel Fotocopia Carta 75g (Resma 500 hjs)',
+        Slug: 'papel-fotocopia-carta-75g',
+        Descripcion: 'Resma de papel bond blanco tamaño carta 75g para impresión y fotocopia',
+        Precio: 5.50,
+        PrecioOferta: '',
+        Stock: 100,
+        Categoria: categories[0]?.name || 'Papelería',
+        Marca: brands[0]?.name || 'Chamex',
+        Destacado: 'Si',
+        Activo: 'Si',
+        Estrellas: 5,
+        Reviews: 10,
+        FichaTecnica: '',
+        CodigoBarraQR: ''
+      },
+      {
+        ID: '',
+        SKU: 'TON-002',
+        Nombre: 'Tóner HP Laserjet 85A CE285A Negro',
+        Slug: 'toner-hp-laserjet-85a',
+        Descripcion: 'Cartucho de tóner genérico para impresoras HP LaserJet Pro',
+        Precio: 12.00,
+        PrecioOferta: 10.50,
+        Stock: 25,
+        Categoria: categories[0]?.name || 'Insumos',
+        Marca: brands[0]?.name || 'HP',
+        Destacado: 'No',
+        Activo: 'Si',
+        Estrellas: 5,
+        Reviews: 4,
+        FichaTecnica: '',
+        CodigoBarraQR: ''
+      }
+    ];
+
+    const ws = XLSX.utils.json_to_sheet(sampleData);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Plantilla_Inventario");
+    XLSX.writeFile(wb, "Plantilla_Importacion_Inventario.xlsx");
+  };
+
+  const handleExecuteModalImport = async () => {
+    if (activeRole === 'vendedor') {
+      alert("Su rol de Vendedor no tiene permisos para importar registros masivos.");
+      return;
+    }
+    if (!selectedImportFile) return;
+
+    setIsSubmittingImport(true);
+
+    const reader = new FileReader();
+    reader.onload = async (evt) => {
+      try {
+        const bstr = evt.target?.result;
+        const wb = XLSX.read(bstr, { type: 'binary' });
+        const wsname = wb.SheetNames[0];
+        const ws = wb.Sheets[wsname];
+        const data: any[] = XLSX.utils.sheet_to_json(ws);
+        
+        let importedCount = 0;
+        const rateToUse = (bcvRate && bcvRate > 0) ? bcvRate : 1;
+
+        for (const row of data) {
+          const rawName = row.Nombre || row.PRODUCTO || row.Descripcion;
+          const rawSku = row.SKU || row.Codigo || row.CODIGO;
+          let rawPrice = row.Precio !== undefined ? row.Precio : row.PRECIO;
+          let rawStock = row.Stock !== undefined ? row.Stock : row.STOCK;
+
+          if (!rawName || rawPrice === undefined || rawStock === undefined) continue;
+
+          let finalPrice = Number(rawPrice);
+          if (convertBcvBsToUsd && rateToUse > 0) {
+            finalPrice = finalPrice / rateToUse;
+          }
+
+          let catId = categories[0]?.id || '';
+          const catValue = row.Categoria || row.CATEGORIA;
+          if (catValue) {
+            const foundCat = categories.find(c => c && c.name && (c.name || '').toLowerCase() === (catValue || '').toString().toLowerCase());
+            if (foundCat) catId = foundCat.id;
+          }
+
+          let brandId = brands[0]?.id || '';
+          const brandValue = row.Marca || row.MARCA;
+          if (brandValue) {
+            const foundBrand = brands.find(b => b && b.name && (b.name || '').toLowerCase() === (brandValue || '').toString().toLowerCase());
+            if (foundBrand) brandId = foundBrand.id;
+          }
+
+          const offerPriceNum = row.PrecioOferta && row.PrecioOferta !== '' ? Number(row.PrecioOferta) : null;
+          const finalOfferPrice = (offerPriceNum && convertBcvBsToUsd && rateToUse > 0) ? (offerPriceNum / rateToUse) : offerPriceNum;
+          const skuStr = rawSku ? rawSku.toString() : `PRD-${Math.floor(1000 + Math.random() * 9000)}`;
+          const slug = row.Slug || rawName.toString().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
+
+          const payload = {
+            sku: skuStr,
+            name: rawName.toString(),
+            slug: slug,
+            description: row.Descripcion?.toString() || '',
+            price: Number(finalPrice.toFixed(2)),
+            offer_price: finalOfferPrice ? Number(finalOfferPrice.toFixed(2)) : null,
+            stock: Number(rawStock),
+            category_id: catId,
+            brand_id: brandId,
+            featured: row.Destacado === 'Si' || row.Destacado === true,
+            active: row.Activo === 'Si' || row.Activo === true,
+            rating_stars: row.Estrellas !== undefined ? Number(row.Estrellas) : 5,
+            rating_count: row.Reviews !== undefined ? Number(row.Reviews) : 0,
+            technical_sheet_url: row.FichaTecnica?.toString() || null,
+            barcode_qr: row.CodigoBarraQR?.toString() || null
+          };
+
+          if (row.ID) {
+            const exists = products.find(p => p.id === row.ID.toString());
+            if (exists) {
+              await dbService.updateProduct(exists.id, payload);
+              importedCount++;
+              continue;
+            }
+          }
+          await dbService.createProduct(payload);
+          importedCount++;
+        }
+
+        alert(`Se han importado o actualizado exitosamente ${importedCount} productos de inventario.`);
+        if (onRefreshData) onRefreshData();
+        setShowInventoryMgmtModal(false);
+        setSelectedImportFile(null);
+      } catch (err) {
+        console.error("Error importing Excel file:", err);
+        alert("Ocurrió un error al procesar el archivo Excel. Verifique el formato.");
+      } finally {
+        setIsSubmittingImport(false);
+      }
+    };
+    reader.readAsBinaryString(selectedImportFile);
   };
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -2944,6 +3364,12 @@ export default function AdminPanel({
         sectionTitle: "Gestión de Negocios",
         groups: [
           {
+            groupId: "indicadores",
+            title: "Indicadores",
+            icon: Gauge,
+            directId: 'indicadores'
+          },
+          {
             groupId: "ventas",
             title: "Ventas",
             icon: ShoppingBag,
@@ -2951,7 +3377,8 @@ export default function AdminPanel({
             subItems: [
               { id: 'sales', label: 'Venta Flash', icon: Zap },
               { id: 'orders', label: 'Pedidos de clientes', icon: ClipboardList, badge: pendingOrdersCount > 0 ? pendingOrdersCount : null, badgeColor: 'bg-amber-500 text-white' },
-              { id: 'cotizaciones', label: 'Cotizaciones', icon: FileCheck }
+              { id: 'cotizaciones', label: 'Cotizaciones', icon: FileCheck },
+              { id: 'sales_report', label: 'Reporte Ventas', icon: FileSpreadsheet }
             ]
           },
           {
@@ -2960,7 +3387,8 @@ export default function AdminPanel({
             icon: Package,
             subItems: [
               { id: 'products', label: 'Mercancías', icon: Package },
-              { id: 'compras', label: 'Compras', icon: ShoppingCart }
+              { id: 'compras', label: 'Compras', icon: ShoppingCart },
+              { id: 'movimiento', label: 'Movimientos', icon: History }
             ]
           },
           {
@@ -2971,8 +3399,15 @@ export default function AdminPanel({
             subItems: [
               { id: 'caja', label: 'Caja', icon: Store, badge: activeSession ? '•' : null, badgeColor: 'text-emerald-500 font-black text-xs' },
               { id: 'cuentas_bancarias', label: 'Cuentas bancarias', icon: Coins },
-              { id: 'balance', label: 'Cuentas por cobrar y por pagar', icon: ArrowLeftRight }
+              { id: 'balance', label: 'Cuentas por cobrar y por pagar', icon: ArrowLeftRight },
+              { id: 'reportes_cuentas', label: 'Reportes de cuentas', icon: FileSpreadsheet }
             ]
+          },
+          {
+            groupId: "gastos",
+            title: "Gastos",
+            icon: Receipt,
+            directId: 'gastos'
           },
           {
             groupId: "reportes",
@@ -2980,7 +3415,6 @@ export default function AdminPanel({
             icon: TrendingUp,
             subItems: [
               { id: 'reportes_balance', label: 'Balance', icon: BarChart },
-              { id: 'reportes_gastos', label: 'Gastos fijos', icon: Receipt },
               { id: 'reportes_ganancias', label: 'Ganancias y pérdidas', icon: PieChart }
             ]
           },
@@ -3016,16 +3450,14 @@ export default function AdminPanel({
             groupId: "configuracion",
             title: "Configuración",
             icon: Settings,
-            subItems: [
-              { id: 'settings', label: 'General y Negocio', icon: Settings },
-              { id: 'users', label: 'Usuarios y accesos', icon: UserCheck }
-            ]
+            directId: 'settings'
           }
         ]
       }
     ];
 
     const isItemAllowed = (itemId: string) => {
+      if (itemId === 'movimiento') return isItemAllowed('products');
       const roleLower = (activeRole as string || '').toLowerCase();
       if (roleLower === 'gerente' || roleLower === 'admin' || roleLower === 'administrador') {
         return true;
@@ -3034,7 +3466,7 @@ export default function AdminPanel({
         return roleLower === 'gerente' || roleLower === 'admin' || roleLower === 'administrador';
       }
       if (roleLower === 'cajero' || roleLower === 'vendedor') {
-        return ['orders', 'sales', 'cotizaciones', 'caja', 'clientes', 'cuentas_bancarias', 'clientes_proveedores'].includes(itemId);
+        return ['orders', 'sales', 'cotizaciones', 'sales_report', 'caja', 'clientes', 'cuentas_bancarias', 'clientes_proveedores', 'reportes_cuentas'].includes(itemId);
       }
       if (roleLower === 'despachador') {
         return ['products', 'orders'].includes(itemId);
@@ -3046,20 +3478,20 @@ export default function AdminPanel({
     };
 
     return (
-      <div className="space-y-4">
+      <div className="space-y-4 font-poppins">
         {/* Top Header Card: Usuario & Tasa BCV */}
-        <div className="p-3 bg-gradient-to-r from-blue-50/70 to-emerald-50/70 border border-blue-100/90 rounded-2xl shadow-2xs space-y-2.5">
+        <div className="p-3 bg-gradient-to-r from-[#1D3557]/5 to-[#40E0D0]/10 border border-[#1D3557]/15 rounded-2xl shadow-2xs space-y-2.5">
           {/* User Info Row */}
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 min-w-0">
-              <div className="w-7 h-7 bg-[#005da9] text-white rounded-full flex items-center justify-center font-black text-xs shrink-0 shadow-2xs border border-blue-200">
+              <div className="w-7 h-7 bg-[#1D3557] text-white rounded-full flex items-center justify-center font-montserrat font-black text-xs shrink-0 shadow-2xs border border-[#40E0D0]">
                 {currentUser ? currentUser.name.charAt(0).toUpperCase() : (activeRole === 'admin' ? 'A' : 'V')}
               </div>
               <div className="flex flex-col min-w-0">
-                <span className="text-[11px] font-extrabold text-gray-900 leading-tight truncate">
+                <span className="text-[11px] font-extrabold text-[#2B2D42] leading-tight truncate font-montserrat">
                   {currentUser ? currentUser.name : (activeRole === 'admin' ? 'Administrador' : 'Vendedor')}
                 </span>
-                <span className="text-[8px] font-black uppercase tracking-wider text-[#005da9]">
+                <span className="text-[8.5px] font-black uppercase tracking-wider text-[#00BFFF]">
                   {currentUser ? currentUser.role : (activeRole === 'admin' ? 'Admin' : 'Vendedor')}
                 </span>
               </div>
@@ -3070,7 +3502,7 @@ export default function AdminPanel({
                   e.stopPropagation();
                   setIsSidebarCollapsed(prev => !prev);
                 }}
-                className="p-1 text-gray-400 hover:text-[#005da9] hover:bg-white/80 rounded transition cursor-pointer shrink-0"
+                className="p-1 text-gray-400 hover:text-[#1D3557] hover:bg-white/80 rounded transition cursor-pointer shrink-0"
                 title={isSidebarCollapsed ? "Fijar menú lateral (Pin)" : "Ocultar automáticamente (Collapse)"}
               >
                 {isSidebarCollapsed ? <Unlock className="w-3.5 h-3.5" /> : <Lock className="w-3.5 h-3.5" />}
@@ -3079,10 +3511,10 @@ export default function AdminPanel({
           </div>
 
           {/* Tasa BCV Row */}
-          <div className="flex items-center justify-between pt-2 border-t border-blue-100/80">
+          <div className="flex items-center justify-between pt-2 border-t border-[#1D3557]/10">
             <div className="flex items-center gap-1.5">
-              <TrendingUp className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-              <span className="text-[10px] font-bold text-gray-700">Tasa BCV:</span>
+              <TrendingUp className="w-3.5 h-3.5 text-[#00BFFF] shrink-0" />
+              <span className="text-[10px] font-bold text-[#2B2D42]">Tasa BCV:</span>
             </div>
             <div className="flex items-center gap-1">
               {isEditingBcv ? (
@@ -3110,16 +3542,26 @@ export default function AdminPanel({
                   autoFocus
                 />
               ) : (
-                <span 
-                  onDoubleClick={() => {
-                    setBcvInputValue(bcvRate.toString());
-                    setIsEditingBcv(true);
-                  }}
-                  className="text-xs font-black text-emerald-950 bg-white border border-emerald-200/90 px-2 py-0.5 rounded-lg cursor-pointer hover:bg-emerald-50 transition flex items-center shadow-2xs"
-                  title="Doble clic para editar tasa"
-                >
-                  Bs. {bcvRate.toFixed(2)}
-                </span>
+                <div className="flex items-center gap-1">
+                  <span 
+                    onDoubleClick={() => {
+                      setBcvInputValue(bcvRate.toString());
+                      setIsEditingBcv(true);
+                    }}
+                    className="text-xs font-montserrat font-black text-[#1D3557] bg-white border border-[#40E0D0]/60 px-2 py-0.5 rounded-lg cursor-pointer hover:bg-[#40E0D0]/10 transition flex items-center shadow-2xs"
+                    title="Doble clic para editar tasa"
+                  >
+                    Bs. {bcvRate.toFixed(2)}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => window.dispatchEvent(new CustomEvent('bellavista_open_manual_bcv_modal'))}
+                    className="p-1 text-gray-500 hover:text-[#005da9] hover:bg-blue-50 rounded-md transition cursor-pointer"
+                    title="Ajustar y chequear con portal oficial BCV"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                  </button>
+                </div>
               )}
             </div>
           </div>
@@ -3140,9 +3582,9 @@ export default function AdminPanel({
 
             return (
               <div key={sIdx} className="space-y-1.5">
-                <div className="flex items-center gap-1.5 px-2 pt-2 pb-1 border-b border-gray-150/70">
-                  <span className="text-[10px] font-black text-[#005da9]">{section.sectionNumber}.</span>
-                  <span className="text-[9px] font-black uppercase tracking-wider text-gray-500">
+                <div className="flex items-center gap-1.5 px-2 pt-2 pb-1 border-b border-gray-200">
+                  <span className="text-[10px] font-black font-montserrat text-[#1D3557]">{section.sectionNumber}.</span>
+                  <span className="text-[9.5px] font-montserrat font-black uppercase tracking-wider text-[#2B2D42]/70">
                     {section.sectionTitle}
                   </span>
                 </div>
@@ -3166,18 +3608,18 @@ export default function AdminPanel({
                             handleMenuChange(group.directId as AdminMenuType);
                             if (isMobile) setIsMobileDrawerOpen(false);
                           }}
-                          className={`w-full flex items-center justify-between px-3 py-2.5 text-xs rounded-xl transition-all text-left cursor-pointer min-h-[38px] select-none ${
+                          className={`w-full flex items-center justify-between px-3 py-2.5 text-xs rounded-xl transition-all text-left cursor-pointer min-h-[38px] select-none font-montserrat ${
                             isActive
-                              ? 'bg-[#005da9] text-white font-black shadow-md tracking-tight'
-                              : 'text-gray-700 hover:bg-blue-50/80 hover:text-[#005da9] font-bold'
+                              ? 'bg-[#1D3557] text-white font-black shadow-md tracking-tight border-l-4 border-[#40E0D0]'
+                              : 'text-[#2B2D42] hover:bg-[#1D3557]/5 hover:text-[#1D3557] font-bold'
                           }`}
                         >
                           <div className="flex items-center gap-2.5 min-w-0">
-                            <GroupIcon className={`w-4 h-4 shrink-0 ${isActive ? 'text-white' : 'text-gray-500'}`} />
+                            <GroupIcon className={`w-4 h-4 shrink-0 ${isActive ? 'text-[#40E0D0]' : 'text-gray-500'}`} />
                             <span className="truncate font-black">{group.title}</span>
                           </div>
                           {group.badge && (
-                            <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-black ${isActive ? 'bg-white/20 text-white' : 'bg-blue-100 text-[#005da9]'}`}>
+                            <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-black ${isActive ? 'bg-[#40E0D0] text-[#1D3557]' : 'bg-[#1D3557]/10 text-[#1D3557]'}`}>
                               {group.badge}
                             </span>
                           )}
@@ -3192,19 +3634,19 @@ export default function AdminPanel({
                       <div key={group.groupId} className="space-y-0.5">
                         <button
                           onClick={() => toggleGroup(group.groupId)}
-                          className={`w-full flex items-center justify-between px-3 py-2 text-xs rounded-xl transition-all text-left cursor-pointer select-none ${
+                          className={`w-full flex items-center justify-between px-3 py-2 text-xs rounded-xl transition-all text-left cursor-pointer select-none font-montserrat ${
                             isGroupActive && !isExpanded
-                              ? 'bg-blue-50/90 text-[#005da9] font-black border border-blue-200/80'
-                              : 'text-gray-800 hover:bg-gray-100/80 font-black'
+                              ? 'bg-[#1D3557]/10 text-[#1D3557] font-black border border-[#1D3557]/20'
+                              : 'text-[#2B2D42] hover:bg-gray-100 font-bold'
                           }`}
                         >
                           <div className="flex items-center gap-2 min-w-0">
-                            <GroupIcon className={`w-4 h-4 shrink-0 ${isGroupActive ? 'text-[#005da9]' : 'text-gray-500'}`} />
+                            <GroupIcon className={`w-4 h-4 shrink-0 ${isGroupActive ? 'text-[#1D3557]' : 'text-gray-500'}`} />
                             <span className="truncate text-xs font-black">{group.title}</span>
                           </div>
                           <div className="flex items-center gap-1.5">
                             {group.badge && (
-                              <span className="text-[9px] bg-blue-100 text-[#005da9] px-1.5 py-0.5 rounded-full font-black">
+                              <span className="text-[9px] bg-[#40E0D0]/20 text-[#1D3557] px-1.5 py-0.5 rounded-full font-black">
                                 {group.badge}
                               </span>
                             )}
@@ -3218,25 +3660,35 @@ export default function AdminPanel({
 
                         {/* Sub-items list */}
                         {isExpanded && (
-                          <div className="ml-3.5 pl-2.5 border-l-2 border-blue-150/70 space-y-0.5 py-0.5">
+                          <div className="ml-3.5 pl-2.5 border-l-2 border-[#1D3557]/20 space-y-0.5 py-0.5">
                             {visibleSubItems.map((sub) => {
                               const SubIcon = sub.icon;
-                              const isSubActive = currentMenu === sub.id || (sub.id === 'clientes' && currentMenu === 'clientes_proveedores' && contactsTab === 'clientes') || (sub.id === 'proveedores' && currentMenu === 'clientes_proveedores' && contactsTab === 'proveedores');
+                              const isSubActive =
+                                (sub.id === 'products' && currentMenu === 'products' && activeTab === 'products') ||
+                                (sub.id === 'movimiento' && (currentMenu === 'movimiento' || (currentMenu === 'products' && activeTab === 'movimiento'))) ||
+                                (sub.id !== 'products' && sub.id !== 'movimiento' && currentMenu === sub.id) ||
+                                (sub.id === 'clientes' && currentMenu === 'clientes_proveedores' && contactsTab === 'clientes') ||
+                                (sub.id === 'proveedores' && currentMenu === 'clientes_proveedores' && contactsTab === 'proveedores');
 
                               return (
                                 <button
                                   key={sub.id}
                                   onClick={() => {
-                                    handleMenuChange(sub.id);
-                                    if (sub.id === 'orders') {
-                                      setActiveTab('orders');
-                                      fetchOrders();
+                                    if (sub.id === 'movimiento') {
+                                      handleMenuChange('movimiento');
                                     } else if (sub.id === 'products') {
+                                      handleMenuChange('products');
                                       setActiveTab('products');
-                                    } else if (sub.id === 'clientes') {
-                                      setContactsTab('clientes');
-                                    } else if (sub.id === 'proveedores') {
-                                      setContactsTab('proveedores');
+                                    } else {
+                                      handleMenuChange(sub.id);
+                                      if (sub.id === 'orders') {
+                                        setActiveTab('orders');
+                                        fetchOrders();
+                                      } else if (sub.id === 'clientes') {
+                                        setContactsTab('clientes');
+                                      } else if (sub.id === 'proveedores') {
+                                        setContactsTab('proveedores');
+                                      }
                                     }
                                     if (isMobile) {
                                       setIsMobileDrawerOpen(false);
@@ -3244,8 +3696,8 @@ export default function AdminPanel({
                                   }}
                                   className={`w-full flex items-center justify-between px-2.5 py-1.5 text-xs rounded-lg transition-all text-left cursor-pointer min-h-[32px] select-none ${
                                     isSubActive
-                                      ? 'bg-[#005da9] text-white font-bold shadow-xs'
-                                      : 'text-gray-600 hover:bg-blue-50/70 hover:text-[#005da9] font-medium'
+                                      ? 'bg-[#1D3557] text-white font-montserrat font-bold shadow-xs border-r-2 border-[#40E0D0]'
+                                      : 'text-[#2B2D42] hover:bg-[#1D3557]/5 hover:text-[#1D3557] font-medium'
                                   }`}
                                 >
                                   <div className="flex items-center gap-2 min-w-0">
@@ -3291,12 +3743,16 @@ export default function AdminPanel({
               <LayoutDashboard className="w-3.5 h-3.5 text-white" />
             </div>
             <h1 className="font-black text-[#131921] text-xs uppercase tracking-tight truncate max-w-[130px]">
-              {currentMenu === 'orders' ? 'Pedidos' :
+              {currentMenu === 'indicadores' ? 'Indicadores' :
+               currentMenu === 'orders' ? 'Pedidos' :
                currentMenu === 'sales' ? 'Venta Flash' :
+               currentMenu === 'sales_report' ? 'Reporte Ventas' :
                currentMenu === 'products' ? 'Productos' :
+               currentMenu === 'movimiento' ? 'Movimientos' :
                currentMenu === 'caja' ? 'Caja' :
                currentMenu === 'balance' ? 'Cuentas Pendientes' :
-               (currentMenu === 'gastos' || currentMenu === 'reportes_gastos') ? 'Gastos fijos' :
+               currentMenu === 'reportes_cuentas' ? 'Reportes de Cuentas' :
+               (currentMenu === 'gastos' || currentMenu === 'reportes_gastos') ? 'Gastos' :
                currentMenu === 'reportes_balance' ? 'Balance' :
                currentMenu === 'reportes_ganancias' ? 'Ganancias y pérdidas' :
                currentMenu === 'reportes' ? 'Reportes' :
@@ -3401,7 +3857,25 @@ export default function AdminPanel({
         </aside>
 
         {/* Main Content Area */}
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-0 space-y-4">
+          {/* VIEW: INDICADORES DEL NEGOCIO */}
+          {currentMenu === 'indicadores' && (
+            <Suspense fallback={<AdminSubmoduleLoader name="Indicadores" />}>
+              <IndicadoresDashboard
+                products={products}
+                orders={orders}
+                bcvRate={bcvRate}
+                currencyRates={currencyRates}
+                currentUser={currentUser}
+                activeCurrency={activeCurrency}
+                onNavigateMenu={(menu) => handleMenuChange(menu)}
+                onRefreshData={() => {
+                  onRefreshData();
+                  fetchCajaData();
+                }}
+              />
+            </Suspense>
+          )}
 
           {/* VIEW: SALES (FACTURACIÓN / POS) */}
           {currentMenu === 'sales' && (
@@ -3417,7 +3891,7 @@ export default function AdminPanel({
                 onRefreshData={() => {
                   onRefreshData();
                   fetchCajaData();
-                }} 
+                }}
                 onOpenProductForm={() => handleOpenProductForm(null)}
                 onOpenBalance={() => {
                   fetchCajaData();
@@ -3449,6 +3923,17 @@ export default function AdminPanel({
             </Suspense>
           )}
 
+          {/* VIEW: REPORTES DE CUENTAS */}
+          {currentMenu === 'reportes_cuentas' && (
+            <Suspense fallback={<AdminSubmoduleLoader name="Reportes de Cuentas" />}>
+              <ReportesCuentasPage 
+                bcvRate={bcvRate}
+                currentUser={currentUser}
+                onRefreshData={fetchCajaData}
+              />
+            </Suspense>
+          )}
+
           {/* VIEW: GASTOS FIJOS/VARIABLES */}
           {(currentMenu === 'gastos' || currentMenu === 'reportes_gastos') && (
             <Suspense fallback={<AdminSubmoduleLoader name="Gastos Fijos/Variables" />}>
@@ -3462,7 +3947,7 @@ export default function AdminPanel({
 
           {/* VIEW: COTIZACIONES */}
           {currentMenu === 'cotizaciones' && (
-            <Suspense fallback={<AdminSubmoduleLoader name="Cotizaciones y Presupuestos" />}>
+            <Suspense fallback={<AdminSubmoduleLoader name="Presupuestos" />}>
               <CotizacionesPage 
                 products={products}
                 bcvRate={bcvRate}
@@ -3472,6 +3957,17 @@ export default function AdminPanel({
                     fetchCajaData();
                   }
                 }}
+              />
+            </Suspense>
+          )}
+
+          {/* VIEW: SALES REPORT (REPORTE DE VENTAS Y LIBRO DE TRANSACCIONES) */}
+          {currentMenu === 'sales_report' && (
+            <Suspense fallback={<AdminSubmoduleLoader name="Reporte de Ventas" />}>
+              <SalesReportPage
+                activeCurrency={activeCurrency}
+                currencyRates={currencyRates}
+                currentUser={currentUser}
               />
             </Suspense>
           )}
@@ -3604,13 +4100,13 @@ export default function AdminPanel({
 
                 return (
                   <>
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-150 pb-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-150 pb-4 font-poppins">
                       <div>
-                        <h2 className="text-xl font-black text-[#131921] uppercase tracking-tight flex items-center gap-2">
-                          <Store className="w-6 h-6 text-amber-600" />
+                        <h2 className="text-xl font-montserrat font-extrabold text-[#1D3557] uppercase tracking-tight flex items-center gap-2">
+                          <Store className="w-6 h-6 text-[#40E0D0]" />
                           <span>Control de Caja</span>
                         </h2>
-                        <p className="text-xs text-gray-500 font-medium mt-0.5">
+                        <p className="text-xs text-[#2B2D42]/70 font-medium mt-0.5">
                           Monitoreo de ingresos y egresos diarios, control de fondo fijo, y verificación de balances en bolívares y dólares.
                         </p>
                       </div>
@@ -3618,9 +4114,9 @@ export default function AdminPanel({
                       {/* Header Session Action Controls */}
                       <div className="flex items-center gap-3">
                         {activeSession ? (
-                          <div className="flex items-center gap-3 bg-emerald-50 border border-emerald-100 px-4 py-2 rounded-xl">
+                          <div className="flex items-center gap-3 bg-emerald-50 border border-emerald-200 px-4 py-2 rounded-xl">
                             <div className="text-right">
-                              <p className="text-[9px] text-emerald-800 font-black uppercase tracking-wider">Caja Abierta</p>
+                              <p className="text-[9px] text-emerald-800 font-montserrat font-extrabold uppercase tracking-wider">Caja Abierta</p>
                               <p className="text-[11px] text-emerald-600 font-mono font-bold leading-none mt-0.5">{activeSession.apertura}</p>
                             </div>
                             <button
@@ -3629,16 +4125,16 @@ export default function AdminPanel({
                                 setCajaObservaciones('');
                                 setShowCloseCajaModal(true);
                               }}
-                              className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white text-xs font-black uppercase tracking-wider rounded-lg transition cursor-pointer flex items-center gap-1.5 shadow-sm"
+                              className="px-4 py-2 bg-white hover:bg-gray-50 text-[#1D3557] text-xs font-montserrat font-extrabold uppercase tracking-wider rounded-full transition shadow-sm hover:shadow-md border border-gray-200 cursor-pointer flex items-center gap-1.5 active:scale-95"
                             >
-                              <Lock className="w-3.5 h-3.5" />
+                              <Lock className="w-3.5 h-3.5 text-[#00BFFF]" />
                               <span>Cerrar Caja</span>
                             </button>
                           </div>
                         ) : (
-                          <div className="flex items-center gap-3 bg-rose-50 border border-rose-100 px-4 py-2 rounded-xl">
+                          <div className="flex items-center gap-3 bg-rose-50 border border-rose-200 px-4 py-2 rounded-xl">
                             <div>
-                              <p className="text-[9px] text-rose-800 font-black uppercase tracking-wider">Caja Cerrada</p>
+                              <p className="text-[9px] text-rose-800 font-montserrat font-extrabold uppercase tracking-wider">Caja Cerrada</p>
                               <p className="text-[10px] text-rose-500 font-semibold leading-none mt-0.5">Debe abrir caja para facturar</p>
                             </div>
                             <button
@@ -3647,9 +4143,9 @@ export default function AdminPanel({
                                 setCajaObservaciones('');
                                 setShowOpenCajaModal(true);
                               }}
-                              className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black uppercase tracking-wider rounded-lg transition cursor-pointer flex items-center gap-1.5 shadow-sm"
+                              className="px-4 py-2 bg-white hover:bg-gray-50 text-[#1D3557] text-xs font-montserrat font-extrabold uppercase tracking-wider rounded-full transition shadow-sm hover:shadow-md border border-gray-200 cursor-pointer flex items-center gap-1.5 active:scale-95"
                             >
-                              <Unlock className="w-3.5 h-3.5" />
+                              <Unlock className="w-3.5 h-3.5 text-[#00BFFF] stroke-[2.5]" />
                               <span>Aperturar Caja</span>
                             </button>
                           </div>
@@ -3658,45 +4154,45 @@ export default function AdminPanel({
                     </div>
 
                     {/* Cash balance metrics widgets */}
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 font-poppins">
                       <div className="bg-emerald-50/50 border border-emerald-100 rounded-xl p-4">
-                        <p className="text-[10px] text-gray-400 font-black uppercase tracking-wider">Fondo de Apertura</p>
-                        <p className="text-lg font-black text-emerald-800 mt-1">{formatBs(initialFondoBs)}</p>
-                        <p className="text-[10px] text-emerald-600 font-bold mt-0.5">({formatUSD(initialFondoUsd)})</p>
+                        <p className="text-[10px] text-[#2B2D42]/60 font-montserrat font-extrabold uppercase tracking-wider">Fondo de Apertura</p>
+                        <p className="text-lg font-black font-mono text-emerald-800 mt-1">{formatBs(initialFondoBs)}</p>
+                        <p className="text-[10px] text-emerald-600 font-bold mt-0.5 font-mono">({formatUSD(initialFondoUsd)})</p>
                       </div>
-                      <div className="bg-blue-50/50 border border-blue-100 rounded-xl p-4">
-                        <p className="text-[10px] text-gray-400 font-black uppercase tracking-wider">Ingresos del Turno</p>
-                        <p className="text-lg font-black text-blue-800 mt-1">+{formatBs(sessionIngressesBs)}</p>
-                        <p className="text-[10px] text-blue-600 font-bold mt-0.5">(+{formatUSD(sessionIngressesUsd)})</p>
+                      <div className="bg-[#1D3557]/5 border border-[#1D3557]/15 rounded-xl p-4">
+                        <p className="text-[10px] text-[#2B2D42]/60 font-montserrat font-extrabold uppercase tracking-wider">Ingresos del Turno</p>
+                        <p className="text-lg font-black font-mono text-[#1D3557] mt-1">+{formatBs(sessionIngressesBs)}</p>
+                        <p className="text-[10px] text-[#00BFFF] font-bold mt-0.5 font-mono">(+{formatUSD(sessionIngressesUsd)})</p>
                       </div>
                       <div className="bg-rose-50/50 border border-rose-100 rounded-xl p-4">
-                        <p className="text-[10px] text-gray-400 font-black uppercase tracking-wider">Egresos del Turno</p>
-                        <p className="text-lg font-black text-rose-800 mt-1">-{formatBs(sessionEgressesBs)}</p>
-                        <p className="text-[10px] text-rose-600 font-bold mt-0.5">(-{formatUSD(sessionEgressesUsd)})</p>
+                        <p className="text-[10px] text-[#2B2D42]/60 font-montserrat font-extrabold uppercase tracking-wider">Egresos del Turno</p>
+                        <p className="text-lg font-black font-mono text-rose-800 mt-1">-{formatBs(sessionEgressesBs)}</p>
+                        <p className="text-[10px] text-rose-600 font-bold mt-0.5 font-mono">(-{formatUSD(sessionEgressesUsd)})</p>
                       </div>
-                      <div className="bg-amber-50/50 border border-amber-100 rounded-xl p-4">
-                        <p className="text-[10px] text-gray-400 font-black uppercase tracking-wider">Saldo Esperado</p>
-                        <p className="text-lg font-black text-amber-800 mt-1">{formatBs(esperadoSessionBs)}</p>
-                        <p className="text-[10px] text-amber-600 font-bold mt-0.5">({formatUSD(esperadoSessionUsd)})</p>
+                      <div className="bg-[#F8F9FA] border border-gray-200 rounded-xl p-4">
+                        <p className="text-[10px] text-[#2B2D42]/60 font-montserrat font-extrabold uppercase tracking-wider">Saldo Esperado</p>
+                        <p className="text-lg font-black font-mono text-[#2B2D42] mt-1">{formatBs(esperadoSessionBs)}</p>
+                        <p className="text-[10px] text-[#1D3557] font-bold mt-0.5 font-mono">({formatUSD(esperadoSessionUsd)})</p>
                       </div>
                     </div>
 
                     {/* Manual Cash Movement Form */}
-                    <div className="bg-gray-50 border border-gray-150 rounded-2xl p-5 relative overflow-hidden">
+                    <div className="bg-[#F8F9FA] border border-gray-200 rounded-2xl p-5 relative overflow-hidden font-poppins">
                       {!activeSession && (
                         <div className="absolute inset-0 bg-white/70 backdrop-blur-xs flex items-center justify-center z-10 p-6 text-center select-none">
                           <div className="max-w-xs space-y-2">
                             <Lock className="w-8 h-8 text-rose-500 mx-auto" />
-                            <p className="text-xs font-black uppercase text-gray-800 tracking-tight">Formulario Bloqueado</p>
-                            <p className="text-[11px] text-gray-500 font-medium leading-relaxed">Debe aperturar la caja diaria para registrar ingresos o egresos manuales de caja.</p>
+                            <p className="text-xs font-montserrat font-extrabold uppercase text-[#1D3557] tracking-tight">Formulario Bloqueado</p>
+                            <p className="text-[11px] text-[#2B2D42]/70 font-medium leading-relaxed">Debe aperturar la caja diaria para registrar ingresos o egresos manuales de caja.</p>
                           </div>
                         </div>
                       )}
                       
-                      <h3 className="text-xs font-extrabold uppercase tracking-wider text-gray-800 mb-3">Registrar Movimiento de Caja Manual</h3>
+                      <h3 className="text-xs font-montserrat font-extrabold uppercase tracking-wider text-[#1D3557] mb-3">Registrar Movimiento de Caja Manual</h3>
                       
                       {cajaSuccessMsg && (
-                        <div className="mb-4 p-3 bg-emerald-100 border border-emerald-200 text-emerald-800 text-xs font-bold rounded-lg flex items-center gap-2">
+                        <div className="mb-4 p-3 bg-emerald-100 border border-emerald-200 text-emerald-800 text-xs font-bold rounded-xl flex items-center gap-2">
                           <Check className="w-4 h-4 shrink-0" />
                           <span>{cajaSuccessMsg}</span>
                         </div>
@@ -3704,19 +4200,19 @@ export default function AdminPanel({
 
                       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                         <div>
-                          <label className="block text-[10px] font-bold text-gray-500 uppercase mb-1">Concepto o Descripción</label>
+                          <label className="block text-[10px] font-montserrat font-extrabold text-[#2B2D42]/80 uppercase mb-1">Concepto o Descripción</label>
                           <input
                             type="text"
                             placeholder="Ej. Pago de Delivery / Repuestos"
                             value={newOpConcept}
                             onChange={(e) => setNewOpConcept(e.target.value)}
                             disabled={!activeSession}
-                            className="w-full p-2 bg-white border border-gray-300 rounded-lg text-xs font-semibold text-gray-700 focus:ring-2 focus:ring-[#005da9] focus:outline-none disabled:bg-gray-100 disabled:text-gray-400"
+                            className="w-full p-2.5 bg-white border border-gray-300 rounded-xl text-xs font-semibold text-[#2B2D42] focus:border-[#1D3557] focus:outline-none disabled:bg-gray-100 disabled:text-gray-400"
                           />
                         </div>
 
                         <div>
-                          <label className="block text-[10px] font-bold text-gray-500 uppercase mb-1">Monto ($ USD)</label>
+                          <label className="block text-[10px] font-montserrat font-extrabold text-[#2B2D42]/80 uppercase mb-1">Monto ($ USD)</label>
                           <input
                             type="number"
                             step="0.01"
@@ -3724,22 +4220,22 @@ export default function AdminPanel({
                             value={newOpAmount}
                             onChange={(e) => setNewOpAmount(e.target.value)}
                             disabled={!activeSession}
-                            className="w-full p-2 bg-white border border-gray-300 rounded-lg text-xs font-semibold text-gray-700 focus:ring-2 focus:ring-[#005da9] focus:outline-none disabled:bg-gray-100 disabled:text-gray-400"
+                            className="w-full p-2.5 bg-white border border-gray-300 rounded-xl text-xs font-mono font-bold text-[#2B2D42] focus:border-[#1D3557] focus:outline-none disabled:bg-gray-100 disabled:text-gray-400"
                           />
                           {newOpAmount && !isNaN(parseFloat(newOpAmount)) && (
-                            <span className="text-[9px] text-gray-400 font-bold mt-1 block">
-                              Equivale a: <span className="text-gray-600">{(parseFloat(newOpAmount) * bcvRate).toFixed(2)} Bs.</span>
+                            <span className="text-[9px] text-[#2B2D42]/70 font-bold mt-1 block">
+                              Equivale a: <span className="text-[#1D3557] font-mono">{(parseFloat(newOpAmount) * bcvRate).toFixed(2)} Bs.</span>
                             </span>
                           )}
                         </div>
 
                         <div>
-                          <label className="block text-[10px] font-bold text-gray-500 uppercase mb-1">Tipo de Movimiento</label>
+                          <label className="block text-[10px] font-montserrat font-extrabold text-[#2B2D42]/80 uppercase mb-1">Tipo de Movimiento</label>
                           <select
                             value={newOpType}
                             onChange={(e) => setNewOpType(e.target.value as any)}
                             disabled={!activeSession}
-                            className="w-full p-2 bg-white border border-gray-300 rounded-lg text-xs font-semibold text-gray-700 focus:ring-2 focus:ring-[#005da9] focus:outline-none disabled:bg-gray-100 disabled:text-gray-400"
+                            className="w-full p-2.5 bg-white border border-gray-300 rounded-xl text-xs font-semibold text-[#2B2D42] focus:border-[#1D3557] focus:outline-none disabled:bg-gray-100 disabled:text-gray-400"
                           >
                             <option value="ingreso">Ingreso (+)</option>
                             <option value="egreso">Egreso (-)</option>
@@ -3751,30 +4247,31 @@ export default function AdminPanel({
                         <button
                           onClick={handleRegisterManualMovement}
                           disabled={!activeSession}
-                          className="px-5 py-2 bg-gray-800 hover:bg-gray-900 text-white text-xs font-black uppercase tracking-wider rounded-xl transition cursor-pointer shadow-sm disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed"
+                          className="px-5 py-2.5 bg-white hover:bg-gray-50 text-[#1D3557] text-xs font-montserrat font-extrabold uppercase tracking-wider rounded-full transition shadow-sm hover:shadow-md border border-gray-200 cursor-pointer flex items-center justify-center gap-1.5 disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed active:scale-95"
                         >
-                          Registrar Movimiento
+                          <Save className="w-4 h-4 text-[#00BFFF]" />
+                          <span>Registrar Movimiento</span>
                         </button>
                       </div>
                     </div>
 
                     {/* Cash Movements Table for current open session */}
-                    <div className="bg-white border border-gray-200 rounded-xl shadow-xs overflow-hidden">
-                      <div className="p-4 bg-gray-50 border-b border-gray-150">
-                        <h3 className="text-xs font-black uppercase text-gray-800 tracking-wider">Detalle de Operaciones de la Sesión Activa</h3>
+                    <div className="bg-white border border-gray-200/80 rounded-2xl shadow-xs overflow-hidden font-poppins">
+                      <div className="p-4 bg-[#F8F9FA] border-b border-gray-100">
+                        <h3 className="text-xs font-montserrat font-extrabold uppercase text-[#1D3557] tracking-wider">Detalle de Operaciones de la Sesión Activa</h3>
                       </div>
                       <div className="overflow-x-auto">
                         <table className="w-full text-left border-collapse text-xs">
                           <thead>
-                            <tr className="bg-[#005da9] text-white">
-                              <th className="p-3 font-bold">ID</th>
-                              <th className="p-3 font-bold">Concepto</th>
-                              <th className="p-3 font-bold">Hora</th>
-                              <th className="p-3 font-bold text-right">Ingreso (Bs. / $)</th>
-                              <th className="p-3 font-bold text-right">Egreso (Bs. / $)</th>
+                            <tr className="bg-[#1D3557] text-white font-montserrat font-extrabold text-[10px] uppercase tracking-wider">
+                              <th className="p-3">ID</th>
+                              <th className="p-3">Concepto</th>
+                              <th className="p-3">Hora</th>
+                              <th className="p-3 text-right">Ingreso (Bs. / $)</th>
+                              <th className="p-3 text-right">Egreso (Bs. / $)</th>
                             </tr>
                           </thead>
-                          <tbody className="divide-y divide-gray-100 font-medium text-gray-700">
+                          <tbody className="divide-y divide-gray-100 font-medium text-[#2B2D42]">
                             {activeSessionOps.length === 0 ? (
                               <tr>
                                 <td colSpan={5} className="p-8 text-center text-gray-400 font-semibold italic">
@@ -3783,11 +4280,11 @@ export default function AdminPanel({
                               </tr>
                             ) : (
                               activeSessionOps.map((op: any) => (
-                                <tr key={op.id} className="hover:bg-gray-50">
+                                <tr key={op.id} className="hover:bg-[#F8F9FA]">
                                   <td className="p-3 text-gray-400 font-mono">#{op.id}</td>
-                                  <td className="p-3 font-bold text-gray-800">{op.concept}</td>
+                                  <td className="p-3 font-bold text-[#2B2D42]">{op.concept}</td>
                                   <td className="p-3 text-gray-400 font-mono">{op.time}</td>
-                                  <td className="p-3 text-right text-emerald-600 font-black">
+                                  <td className="p-3 text-right text-emerald-600 font-black font-mono">
                                     {op.type === 'ingreso' ? (
                                       <div className="flex flex-col items-end">
                                         <span>+{formatBs(op.amount_bs || (op.amount * bcvRate))}</span>
@@ -3795,81 +4292,13 @@ export default function AdminPanel({
                                       </div>
                                     ) : ''}
                                   </td>
-                                  <td className="p-3 text-right text-rose-600 font-black">
+                                  <td className="p-3 text-right text-rose-600 font-black font-mono">
                                     {op.type === 'egreso' ? (
                                       <div className="flex flex-col items-end">
                                         <span>-{formatBs(op.amount_bs || (op.amount * bcvRate))}</span>
                                         <span className="text-[10px] text-rose-500 font-semibold">({formatUSD(op.amount)})</span>
                                       </div>
                                     ) : ''}
-                                  </td>
-                                </tr>
-                              ))
-                            )}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-
-                    {/* REPORT: RECENT SESSIONS HISTORY (As requested in 2. - Imagen 1) */}
-                    <div className="bg-white border border-gray-200 rounded-xl shadow-xs overflow-hidden mt-6">
-                      <div className="p-4 bg-gray-50 border-b border-gray-150 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                        <div>
-                          <h3 className="text-xs font-black uppercase text-gray-800 tracking-wider">Historial Reciente de Sesiones y Arqueo (Reporte)</h3>
-                          <p className="text-[10px] text-gray-400 font-medium">Consulte el registro histórico de cierres de caja, balances esperados y diferencias detectadas.</p>
-                        </div>
-                      </div>
-                      <div className="overflow-x-auto">
-                        <table className="w-full text-left border-collapse text-xs">
-                          <thead>
-                            <tr className="bg-gray-800 text-white">
-                              <th className="p-3 font-bold">Apertura</th>
-                              <th className="p-3 font-bold">Cierre</th>
-                              <th className="p-3 font-bold text-right">Apertura Bs.</th>
-                              <th className="p-3 font-bold text-right">Cierre Bs.</th>
-                              <th className="p-3 font-bold text-right">Diferencia</th>
-                              <th className="p-3 font-bold text-center">Estado</th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-gray-100 font-medium text-gray-700">
-                            {cashSessions.length === 0 ? (
-                              <tr>
-                                <td colSpan={6} className="p-8 text-center text-gray-400 font-semibold italic">
-                                  No hay historial de cierres de caja registrado.
-                                </td>
-                              </tr>
-                            ) : (
-                              cashSessions.map((session: any) => (
-                                <tr key={session.id} className="hover:bg-gray-50">
-                                  <td className="p-3 font-bold text-gray-800">{session.apertura}</td>
-                                  <td className="p-3 text-gray-500 font-semibold">{session.cierre || '—'}</td>
-                                  <td className="p-3 text-right text-gray-700 font-mono font-bold">
-                                    {formatBs(session.apertura_bs)}
-                                  </td>
-                                  <td className="p-3 text-right text-gray-700 font-mono font-bold">
-                                    {formatBs(session.cierre_bs)}
-                                  </td>
-                                  <td className="p-3 text-right font-mono font-black">
-                                    {session.diferencia_bs !== null && session.diferencia_bs !== undefined ? (
-                                      <span className={session.diferencia_bs === 0 ? 'text-gray-500' : session.diferencia_bs > 0 ? 'text-emerald-600' : 'text-rose-600'}>
-                                        {session.diferencia_bs > 0 ? '+' : ''}{formatBs(session.diferencia_bs)}
-                                      </span>
-                                    ) : (
-                                      <span className="text-gray-400">—</span>
-                                    )}
-                                  </td>
-                                  <td className="p-3 text-center">
-                                    {session.estado === 'abierta' ? (
-                                      <span className="inline-flex items-center gap-1 px-2.5 py-1 text-[10px] font-black uppercase tracking-wider rounded-full bg-blue-50 text-blue-800 border border-blue-100">
-                                        <span className="w-1.5 h-1.5 rounded-full bg-blue-600 animate-pulse"></span>
-                                        <span>Abierta</span>
-                                      </span>
-                                    ) : (
-                                      <span className="inline-flex items-center gap-1 px-2.5 py-1 text-[10px] font-black uppercase tracking-wider rounded-full bg-gray-50 text-gray-600 border border-gray-150">
-                                        <span className="w-1.5 h-1.5 rounded-full bg-gray-400"></span>
-                                        <span>Cerrada</span>
-                                      </span>
-                                    )}
                                   </td>
                                 </tr>
                               ))
@@ -3917,48 +4346,48 @@ export default function AdminPanel({
 
                     {/* MODAL: CERRAR CAJA / ARQUEO */}
                     {showCloseCajaModal && (
-                      <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 backdrop-blur-xs select-none">
+                      <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 backdrop-blur-xs select-none font-poppins">
                         <div className="bg-white rounded-2xl border border-gray-150 max-w-md w-full shadow-2xl p-6 text-left">
                           <div className="flex justify-between items-center border-b border-gray-100 pb-3 mb-4">
-                            <h3 className="text-sm font-black uppercase text-gray-800 flex items-center gap-2">
+                            <h3 className="text-sm font-montserrat font-extrabold uppercase text-[#1D3557] flex items-center gap-2">
                               <Lock className="w-5 h-5 text-rose-600" />
                               <span>Cerrar Caja y Arqueo</span>
                             </h3>
-                            <button onClick={() => setShowCloseCajaModal(false)} className="text-gray-400 hover:text-gray-600">
+                            <button onClick={() => setShowCloseCajaModal(false)} className="text-gray-400 hover:text-[#1D3557] cursor-pointer">
                               <X className="w-4 h-4" />
                             </button>
                           </div>
                           
                           <div className="space-y-4">
-                            <div className="p-3 bg-gray-50 border border-gray-150 rounded-xl space-y-1 text-xs font-mono">
-                              <div className="flex justify-between text-gray-500 font-bold">
+                            <div className="p-3 bg-[#F8F9FA] border border-gray-150 rounded-xl space-y-1 text-xs font-mono">
+                              <div className="flex justify-between text-[#2B2D42]/70 font-bold">
                                 <span>Fondo Inicial:</span>
-                                <span className="text-gray-800 font-black">{formatBs(initialFondoBs)}</span>
+                                <span className="text-[#1D3557] font-black">{formatBs(initialFondoBs)}</span>
                               </div>
-                              <div className="flex justify-between text-gray-500 font-bold">
+                              <div className="flex justify-between text-[#2B2D42]/70 font-bold">
                                 <span>(+) Ingresos del Turno:</span>
                                 <span className="text-emerald-600 font-black">+{formatBs(sessionIngressesBs)}</span>
                               </div>
-                              <div className="flex justify-between text-gray-500 font-bold">
+                              <div className="flex justify-between text-[#2B2D42]/70 font-bold">
                                 <span>(-) Egresos del Turno:</span>
                                 <span className="text-rose-600 font-black">-{formatBs(sessionEgressesBs)}</span>
                               </div>
                               <hr className="border-gray-200 my-1 font-sans" />
-                              <div className="flex justify-between text-gray-700 font-black text-sm">
+                              <div className="flex justify-between text-[#1D3557] font-black text-sm font-montserrat">
                                 <span>Saldo Esperado en Caja:</span>
-                                <span className="text-blue-800">{formatBs(esperadoSessionBs)}</span>
+                                <span className="text-[#00BFFF]">{formatBs(esperadoSessionBs)}</span>
                               </div>
                             </div>
 
                             <div>
-                              <label className="block text-[10px] font-bold text-gray-500 uppercase mb-1">Monto Real Contado en Caja (Bs.)</label>
+                              <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase mb-1">Monto Real Contado en Caja (Bs.)</label>
                               <input
                                 type="number"
                                 step="0.01"
                                 placeholder="Monto contado físicamente"
                                 value={closeCajaAmountBs}
                                 onChange={(e) => setCloseCajaAmountBs(e.target.value)}
-                                className="w-full p-2 bg-gray-50 border border-gray-200 rounded-lg text-xs font-semibold text-gray-700 font-mono"
+                                className="w-full p-2.5 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-semibold text-[#2B2D42] font-mono focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                               />
                               {closeCajaAmountBs && !isNaN(parseFloat(closeCajaAmountBs)) && (
                                 <div className="mt-2 p-2 rounded-lg text-[11px] font-bold">
@@ -3967,21 +4396,21 @@ export default function AdminPanel({
                                     const dif = contado - esperadoSessionBs;
                                     if (dif === 0) {
                                       return (
-                                        <div className="text-emerald-700 bg-emerald-50 border border-emerald-100 p-1.5 rounded flex items-center gap-1">
+                                        <div className="text-emerald-700 bg-emerald-50 border border-emerald-100 p-1.5 rounded-lg flex items-center gap-1">
                                           <Check className="w-3.5 h-3.5" />
                                           <span>La caja cuadra perfectamente (Diferencia: 0,00 Bs.)</span>
                                         </div>
                                       );
                                     } else if (dif > 0) {
                                       return (
-                                        <div className="text-blue-700 bg-blue-50 border border-blue-100 p-1.5 rounded flex items-center gap-1">
-                                          <Check className="w-3.5 h-3.5" />
+                                        <div className="text-[#1D3557] bg-[#40E0D0]/20 border border-[#40E0D0]/40 p-1.5 rounded-lg flex items-center gap-1 font-montserrat">
+                                          <Check className="w-3.5 h-3.5 text-[#1D3557]" />
                                           <span>Sobrante en Caja: +{formatBs(dif)}</span>
                                         </div>
                                       );
                                     } else {
                                       return (
-                                        <div className="text-rose-700 bg-rose-50 border border-rose-100 p-1.5 rounded flex items-center gap-1">
+                                        <div className="text-rose-700 bg-rose-50 border border-rose-100 p-1.5 rounded-lg flex items-center gap-1">
                                           <AlertTriangle className="w-3.5 h-3.5" />
                                           <span>Faltante en Caja: {formatBs(dif)}</span>
                                         </div>
@@ -3993,13 +4422,13 @@ export default function AdminPanel({
                             </div>
 
                             <div>
-                              <label className="block text-[10px] font-bold text-gray-500 uppercase mb-1">Observaciones de Cierre</label>
+                              <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase mb-1">Observaciones de Cierre</label>
                               <textarea
                                 rows={2}
                                 placeholder="Ej. Todo en orden. Caja cuadrada."
                                 value={cajaObservaciones}
                                 onChange={(e) => setCajaObservaciones(e.target.value)}
-                                className="w-full p-2 bg-gray-50 border border-gray-200 rounded-lg text-xs font-semibold text-gray-700"
+                                className="w-full p-2.5 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-medium text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                               />
                             </div>
                           </div>
@@ -4007,9 +4436,10 @@ export default function AdminPanel({
                           <div className="mt-5 flex justify-end gap-2 border-t border-gray-100 pt-3">
                             <button
                               onClick={() => setShowCloseCajaModal(false)}
-                              className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-600 text-xs font-bold rounded-lg transition"
+                              className="px-4 py-2 bg-white hover:bg-gray-50 text-[#1D3557] text-xs font-montserrat font-extrabold uppercase tracking-wider rounded-full transition shadow-sm hover:shadow-md border border-gray-200 cursor-pointer flex items-center gap-1.5 active:scale-95"
                             >
-                              Cancelar
+                              <X className="w-4 h-4 text-gray-500" />
+                              <span>Cancelar</span>
                             </button>
                             <button
                               onClick={() => {
@@ -4020,9 +4450,10 @@ export default function AdminPanel({
                                 }
                                 closeSession(bs, cajaObservaciones.trim());
                               }}
-                              className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white text-xs font-black rounded-lg transition"
+                              className="px-4 py-2 bg-white hover:bg-gray-50 text-[#1D3557] text-xs font-montserrat font-extrabold uppercase tracking-wider rounded-full transition shadow-sm hover:shadow-md border border-gray-200 cursor-pointer flex items-center gap-1.5 active:scale-95"
                             >
-                              Confirmar Cierre de Caja
+                              <Lock className="w-4 h-4 text-rose-500" />
+                              <span>Confirmar Cierre</span>
                             </button>
                           </div>
                         </div>
@@ -4036,18 +4467,18 @@ export default function AdminPanel({
 
           {/* VIEW: CLIENTES CON IDENTIFICACIÓN VENEZOLANA */}
           {(currentMenu === 'clientes' || (currentMenu === 'clientes_proveedores' && contactsTab === 'clientes')) && (
-            <div className="space-y-6 text-left">
+            <div className="space-y-6 text-left font-poppins">
               {/* Unified Contact Tab Switcher */}
-              <div className="flex items-center gap-2 p-1 bg-gray-100 rounded-2xl w-fit border border-gray-200 shadow-2xs">
+              <div className="flex items-center gap-2 p-1 bg-[#F8F9FA] rounded-2xl w-fit border border-gray-200 shadow-2xs font-montserrat font-extrabold">
                 <button
                   type="button"
                   onClick={() => {
                     setContactsTab('clientes');
                     if (currentMenu !== 'clientes_proveedores') setCurrentMenu('clientes');
                   }}
-                  className="px-4 py-2 rounded-xl text-xs font-black uppercase transition-all flex items-center gap-2 cursor-pointer bg-[#005da9] text-white shadow-xs"
+                  className="px-4 py-2 rounded-xl text-xs uppercase transition-all flex items-center gap-2 cursor-pointer bg-[#1D3557] text-white shadow-xs"
                 >
-                  <Users className="w-4 h-4" />
+                  <Users className="w-4 h-4 text-[#40E0D0]" />
                   <span>Clientes ({dbClients.length})</span>
                 </button>
                 <button
@@ -4056,173 +4487,35 @@ export default function AdminPanel({
                     setContactsTab('proveedores');
                     if (currentMenu === 'clientes') setCurrentMenu('proveedores');
                   }}
-                  className="px-4 py-2 rounded-xl text-xs font-black uppercase transition-all flex items-center gap-2 cursor-pointer text-gray-600 hover:text-gray-900 hover:bg-gray-200/60"
+                  className="px-4 py-2 rounded-xl text-xs uppercase transition-all flex items-center gap-2 cursor-pointer text-[#2B2D42] hover:text-[#1D3557] hover:bg-white"
                 >
-                  <Truck className="w-4 h-4" />
+                  <Truck className="w-4 h-4 text-[#00BFFF]" />
                   <span>Proveedores ({providers.length})</span>
                 </button>
               </div>
 
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div>
-                  <h2 className="text-xl font-black text-[#131921] uppercase tracking-tight flex items-center gap-2">
-                    <Users className="w-6 h-6 text-[#005da9]" />
-                    <span>Clientes</span>
-                  </h2>
-                  <p className="text-xs text-gray-500 font-medium">
-                    Gestión de clientes con identificación venezolana
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={fetchClients}
-                    disabled={loadingClients}
-                    className="px-3.5 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50 active:scale-98"
-                    title="Recargar y sincronizar clientes con Supabase"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${loadingClients ? 'animate-spin text-[#005da9]' : ''}`} />
-                    <span className="hidden sm:inline">Sincronizar</span>
-                  </button>
-                  <button
-                    onClick={openAddClientModal}
-                    className="px-4 py-2.5 bg-[#005da9] hover:bg-[#004b88] text-white font-black text-xs uppercase tracking-wider rounded-xl transition shadow-xs flex items-center gap-2 cursor-pointer active:scale-98"
-                  >
-                    <Plus className="w-4 h-4" />
-                    <span>Nuevo cliente</span>
-                  </button>
-                </div>
-              </div>
-
-              {/* Search & Filter bar */}
-              <div className="bg-white border border-gray-200 rounded-xl shadow-xs p-4 flex flex-col md:flex-row gap-4 items-center justify-between">
-                <div className="relative w-full md:w-96">
-                  <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-gray-400">
-                    <Search className="w-4 h-4" />
-                  </div>
-                  <input
-                    type="text"
-                    placeholder="Buscar por nombre, código o documento..."
-                    className="w-full pl-9 pr-4 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:bg-white transition"
-                    value={clientSearch}
-                    onChange={(e) => setClientSearch(e.target.value)}
-                  />
-                  {clientSearch && (
-                    <button 
-                      onClick={() => setClientSearch('')} 
-                      className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-gray-600"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  )}
-                </div>
-
-                <div className="text-[10px] text-gray-400 font-bold uppercase shrink-0">
-                  Total en directorio: <span className="text-gray-800 font-black">{dbClients.length} clientes</span>
-                </div>
-              </div>
-
-              {/* Table of Clientes */}
-              <div className="bg-white border border-gray-200 rounded-xl shadow-xs overflow-hidden">
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse text-xs">
-                    <thead>
-                      <tr className="bg-gray-50 text-gray-500 font-bold uppercase text-[10px] border-b border-gray-200">
-                        <th className="p-4">Código</th>
-                        <th className="p-4">Documento</th>
-                        <th className="p-4">Nombre</th>
-                        <th className="p-4">Tipo</th>
-                        <th className="p-4">Teléfono</th>
-                        <th className="p-4">Correo</th>
-                        <th className="p-4">Crédito USD</th>
-                        <th className="p-4 text-center">Acciones</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-gray-100 text-gray-700 font-semibold">
-                      {loadingClients ? (
-                        <tr>
-                          <td colSpan={8} className="p-12 text-center text-gray-400 font-semibold">
-                            <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2 text-gray-400" />
-                            Cargando directorio de clientes...
-                          </td>
-                        </tr>
-                      ) : filteredDbClients.length === 0 ? (
-                        <tr>
-                          <td colSpan={8} className="p-12 text-center text-gray-400 font-semibold">
-                            Sin clientes registrados
-                          </td>
-                        </tr>
-                      ) : (
-                        filteredDbClients.map((client) => (
-                          <tr key={client.id} className="hover:bg-gray-50/50">
-                            <td className="p-4">
-                              <span className="bg-blue-50 text-[#005da9] text-[10px] font-black uppercase px-2 py-1 rounded-lg border border-blue-100 font-mono">
-                                {client.code}
-                              </span>
-                            </td>
-                            <td className="p-4 font-mono font-bold text-gray-600">{client.document}</td>
-                            <td className="p-4">
-                              <div className="flex items-center gap-2">
-                                <span className="w-7 h-7 rounded-full bg-gray-100 text-gray-600 font-black flex items-center justify-center text-[10px] shrink-0 uppercase border border-gray-200">
-                                  {(client.name || '').substring(0, 2).toUpperCase()}
-                                </span>
-                                <span className="font-extrabold text-gray-900">{client.name}</span>
-                              </div>
-                            </td>
-                            <td className="p-4">
-                              <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase ${
-                                client.type === 'Jurídico' 
-                                  ? 'bg-purple-50 text-purple-700 border border-purple-100' 
-                                  : 'bg-emerald-50 text-emerald-700 border border-emerald-100'
-                              }`}>
-                                {client.type || 'Natural'}
-                              </span>
-                            </td>
-                            <td className="p-4 font-mono text-gray-500">{client.phone || 'Sin teléfono'}</td>
-                            <td className="p-4 font-mono text-gray-500 max-w-[150px] truncate" title={client.email}>
-                              {client.email || <span className="text-gray-350 italic text-[11px]">Sin correo</span>}
-                            </td>
-                            <td className="p-4 font-black text-gray-900">
-                              ${(client.credit_usd || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                            </td>
-                            <td className="p-4">
-                              <div className="flex items-center justify-center gap-2">
-                                <button
-                                  onClick={() => openEditClientModal(client)}
-                                  className="p-1.5 bg-blue-50 text-blue-700 hover:bg-blue-100 rounded-lg transition"
-                                  title="Editar Cliente"
-                                >
-                                  <Edit3 className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  onClick={() => handleDeleteClient(client.id, client.name)}
-                                  className="p-1.5 bg-red-50 text-red-700 hover:bg-red-100 rounded-lg transition"
-                                  title="Eliminar Cliente"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </td>
-                          </tr>
-                        ))
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
+              {/* Dynamic Enhanced Clients Module */}
+              <Suspense fallback={<AdminSubmoduleLoader name="Directorio y Métricas de Clientes" />}>
+                <ClientsManagerModule
+                  onOpenNewClient={openAddClientModal}
+                  onOpenEditClient={openEditClientModal}
+                  onDeleteClient={handleDeleteClient}
+                  orders={orders}
+                />
+              </Suspense>
 
               {/* -------------------- MODAL: NUEVO / EDITAR CLIENTE -------------------- */}
               {showClientModal && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 select-none font-poppins">
                   <div className="bg-white rounded-3xl border border-gray-150 w-full max-w-md shadow-2xl overflow-hidden text-left flex flex-col">
-                    <div className="p-4 bg-gray-50 border-b border-gray-100 flex justify-between items-center">
-                      <span className="text-xs font-black text-gray-800 uppercase tracking-wider flex items-center gap-2">
-                        <Users className="w-4 h-4 text-gray-500" />
+                    <div className="p-4 bg-[#1D3557] text-white flex justify-between items-center">
+                      <span className="text-xs font-montserrat font-extrabold uppercase tracking-wider flex items-center gap-2 text-white">
+                        <Users className="w-4 h-4 text-[#40E0D0]" />
                         <span>{selectedClientForEdit ? 'Editar Cliente' : 'Nuevo Cliente'}</span>
                       </span>
                       <button 
                         onClick={() => setShowClientModal(false)}
-                        className="p-1.5 hover:bg-gray-200 text-gray-400 hover:text-gray-600 rounded-lg transition"
+                        className="p-1.5 hover:bg-white/10 text-gray-300 hover:text-white rounded-lg transition cursor-pointer"
                       >
                         <X className="w-4 h-4" />
                       </button>
@@ -4230,24 +4523,24 @@ export default function AdminPanel({
 
                     <form onSubmit={handleSaveClient} className="p-5 space-y-4">
                       <div>
-                        <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Nombre Completo / Razón Social *</label>
+                        <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Nombre Completo / Razón Social *</label>
                         <input
                           type="text"
                           required
                           value={clientFormName}
                           onChange={(e) => setClientFormName(e.target.value)}
                           placeholder="Ej: Inversiones Pérez C.A., María Gómez"
-                          className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                          className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                         />
                       </div>
 
                       <div className="grid grid-cols-2 gap-4">
                         <div>
-                          <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Tipo Identificación *</label>
+                          <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Tipo Identificación *</label>
                           <select
                             value={clientFormType}
                             onChange={(e) => setClientFormType(e.target.value)}
-                            className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                           >
                             <option value="Natural">Natural (V / E)</option>
                             <option value="Jurídico">Jurídico (J / G)</option>
@@ -4255,67 +4548,80 @@ export default function AdminPanel({
                         </div>
 
                         <div>
-                          <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Cédula o RIF *</label>
+                          <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Cédula o RIF *</label>
                           <input
                             type="text"
                             required
                             value={clientFormDocument}
                             onChange={(e) => setClientFormDocument(e.target.value)}
                             placeholder="Ej: V-12345678 o J-31456987-0"
-                            className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                           />
                         </div>
                       </div>
 
                       <div className="grid grid-cols-2 gap-4">
                         <div>
-                          <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Teléfono / WhatsApp</label>
+                          <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Teléfono / WhatsApp</label>
                           <input
                             type="text"
                             value={clientFormPhone}
                             onChange={(e) => setClientFormPhone(e.target.value)}
                             placeholder="Ej: 0412-5551234"
-                            className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                           />
                         </div>
 
                         <div>
-                          <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Límite de Crédito (USD)</label>
+                          <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Límite de Crédito (USD)</label>
                           <input
                             type="number"
                             step="0.01"
                             value={clientFormCredit}
                             onChange={(e) => setClientFormCredit(Number(e.target.value))}
                             placeholder="Ej: 100.00"
-                            className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                           />
                         </div>
                       </div>
 
                       <div>
-                        <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Correo Electrónico</label>
+                        <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Correo Electrónico</label>
                         <input
                           type="email"
                           value={clientFormEmail}
                           onChange={(e) => setClientFormEmail(e.target.value)}
                           placeholder="Ej: cliente@ejemplo.com"
-                          className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                          className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                         />
                       </div>
 
-                      <div className="flex gap-2 pt-3 border-t border-gray-100">
+                      <div>
+                        <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Dirección</label>
+                        <textarea
+                          value={clientFormAddress}
+                          onChange={(e) => setClientFormAddress(e.target.value)}
+                          placeholder="Ej: Av. Bella Vista, Calle 72, Sector Tierra Negra"
+                          rows={2}
+                          className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] resize-none"
+                        />
+                      </div>
+
+                      <div className="flex gap-2 pt-3 border-t border-gray-100 font-montserrat font-bold">
                         <button
                           type="button"
                           onClick={() => setShowClientModal(false)}
-                          className="flex-1 py-2 bg-gray-100 hover:bg-gray-200 text-gray-600 font-bold text-xs rounded-xl transition"
+                          className="flex-1 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-xs transition shadow-2xs hover:shadow-xs cursor-pointer active:scale-98 flex items-center justify-center gap-1.5"
                         >
-                          Cancelar
+                          <X className="w-4 h-4 text-[#005da9]" />
+                          <span>Cancelar</span>
                         </button>
                         <button
                           type="submit"
-                          className="flex-1 py-2 bg-[#005da9] hover:bg-[#004b88] text-white font-black text-xs uppercase rounded-xl transition"
+                          className="flex-1 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-xs uppercase tracking-wider transition shadow-2xs hover:shadow-xs cursor-pointer active:scale-98 flex items-center justify-center gap-1.5 font-bold"
                         >
-                          Guardar
+                          <Check className="w-4 h-4 text-[#005da9] stroke-[2.5]" />
+                          <span>Guardar Cliente</span>
                         </button>
                       </div>
                     </form>
@@ -4364,14 +4670,24 @@ export default function AdminPanel({
           {/* VIEW: AUDITORÍA */}
           {currentMenu === 'audit' && (
             <div className="space-y-6 text-left">
-              <div>
-                <h2 className="text-xl font-black text-[#131921] uppercase tracking-tight flex items-center gap-2">
-                  <Activity className="w-6 h-6 text-rose-600" />
-                  <span>Bitácora de Auditoría de Sistemas</span>
-                </h2>
-                <p className="text-xs text-gray-500 font-medium">
-                  Registro histórico de operaciones realizadas por los administradores y operadores autorizados.
-                </p>
+              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                <div>
+                  <h2 className="text-xl font-black text-[#131921] uppercase tracking-tight flex items-center gap-2">
+                    <Activity className="w-6 h-6 text-rose-600" />
+                    <span>Bitácora de Auditoría de Sistemas</span>
+                  </h2>
+                  <p className="text-xs text-gray-500 font-medium">
+                    Registro histórico de operaciones realizadas por los administradores y operadores autorizados.
+                  </p>
+                </div>
+
+                <button 
+                  onClick={() => handleMenuChange('settings')}
+                  className="bg-slate-100 hover:bg-slate-200 text-slate-800 font-montserrat font-extrabold text-xs px-4 py-2.5 rounded-full flex items-center gap-2 transition cursor-pointer shadow-xs border border-slate-200 uppercase tracking-wider"
+                >
+                  <ArrowLeft className="w-4 h-4 text-slate-600 stroke-[2.5]" />
+                  <span>Volver a Configuración</span>
+                </button>
               </div>
 
               {/* Logs Timeline list */}
@@ -4414,18 +4730,18 @@ export default function AdminPanel({
 
           {/* VIEW: PROVEEDORES */}
           {(currentMenu === 'proveedores' || (currentMenu === 'clientes_proveedores' && contactsTab === 'proveedores')) && (
-            <div className="space-y-6 text-left" id="module-proveedores">
+            <div className="space-y-6 text-left font-poppins" id="module-proveedores">
               {/* Unified Contact Tab Switcher */}
-              <div className="flex items-center gap-2 p-1 bg-gray-100 rounded-2xl w-fit border border-gray-200 shadow-2xs">
+              <div className="flex items-center gap-2 p-1 bg-[#F8F9FA] rounded-2xl w-fit border border-gray-200 shadow-2xs font-montserrat font-extrabold">
                 <button
                   type="button"
                   onClick={() => {
                     setContactsTab('clientes');
                     if (currentMenu === 'proveedores') setCurrentMenu('clientes');
                   }}
-                  className="px-4 py-2 rounded-xl text-xs font-black uppercase transition-all flex items-center gap-2 cursor-pointer text-gray-600 hover:text-gray-900 hover:bg-gray-200/60"
+                  className="px-4 py-2 rounded-xl text-xs uppercase transition-all flex items-center gap-2 cursor-pointer text-[#2B2D42] hover:text-[#1D3557] hover:bg-white"
                 >
-                  <Users className="w-4 h-4" />
+                  <Users className="w-4 h-4 text-[#00BFFF]" />
                   <span>Clientes ({dbClients.length})</span>
                 </button>
                 <button
@@ -4434,66 +4750,66 @@ export default function AdminPanel({
                     setContactsTab('proveedores');
                     if (currentMenu !== 'clientes_proveedores') setCurrentMenu('proveedores');
                   }}
-                  className="px-4 py-2 rounded-xl text-xs font-black uppercase transition-all flex items-center gap-2 cursor-pointer bg-[#005da9] text-white shadow-xs"
+                  className="px-4 py-2 rounded-xl text-xs uppercase transition-all flex items-center gap-2 cursor-pointer bg-[#1D3557] text-white shadow-xs"
                 >
-                  <Truck className="w-4 h-4" />
+                  <Truck className="w-4 h-4 text-[#40E0D0]" />
                   <span>Proveedores ({providers.length})</span>
                 </button>
               </div>
 
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div>
-                  <h2 className="text-xl font-black text-[#131921] uppercase tracking-tight flex items-center gap-2">
-                    <Truck className="w-6 h-6 text-[#005da9]" />
+                  <h2 className="text-xl font-montserrat font-extrabold text-[#1D3557] uppercase tracking-tight flex items-center gap-2">
+                    <Truck className="w-6 h-6 text-[#00BFFF]" />
                     <span>Proveedores</span>
                   </h2>
-                  <p className="text-xs text-gray-500 font-medium">
+                  <p className="text-xs text-[#2B2D42]/70 font-medium">
                     Gestión de proveedores con datos fiscales venezolanos
                   </p>
                 </div>
                 <button
                   onClick={openAddProviderModal}
-                  className="px-4 py-2.5 bg-[#005da9] hover:bg-[#004b88] text-white font-black text-xs uppercase tracking-wider rounded-xl transition shadow-xs flex items-center gap-2"
+                  className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-montserrat font-bold text-xs uppercase tracking-wider rounded-full transition shadow-2xs hover:shadow-xs flex items-center gap-2 cursor-pointer active:scale-98"
                 >
-                  <Plus className="w-4 h-4" />
+                  <Plus className="w-4 h-4 text-[#005da9] stroke-[2.5]" />
                   <span>Nuevo proveedor</span>
                 </button>
               </div>
 
               {/* Search & Filter bar */}
-              <div className="bg-white border border-gray-200 rounded-xl shadow-xs p-4 flex flex-col md:flex-row gap-4 items-center justify-between">
+              <div className="bg-white border border-gray-200 rounded-2xl shadow-xs p-4 flex flex-col md:flex-row gap-4 items-center justify-between">
                 <div className="relative w-full md:w-96">
-                  <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-gray-400">
+                  <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-[#00BFFF]">
                     <Search className="w-4 h-4" />
                   </div>
                   <input
                     type="text"
                     placeholder="Buscar por razón social, RIF o código..."
-                    className="w-full pl-9 pr-4 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:bg-white transition"
+                    className="w-full pl-9 pr-4 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-medium text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
                     value={providerSearch}
                     onChange={(e) => setProviderSearch(e.target.value)}
                   />
                   {providerSearch && (
                     <button 
                       onClick={() => setProviderSearch('')} 
-                      className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-gray-600"
+                      className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-[#1D3557]"
                     >
                       <X className="w-3.5 h-3.5" />
                     </button>
                   )}
                 </div>
 
-                <div className="text-[10px] text-gray-400 font-bold uppercase shrink-0">
-                  Total proveedores: <span className="text-gray-800 font-black">{providers.length}</span>
+                <div className="text-[10px] text-[#2B2D42]/60 font-montserrat font-bold uppercase shrink-0">
+                  Total proveedores: <span className="text-[#1D3557] font-extrabold">{providers.length}</span>
                 </div>
               </div>
 
               {/* Table of Proveedores */}
-              <div className="bg-white border border-gray-200 rounded-xl shadow-xs overflow-hidden">
+              <div className="bg-white border border-gray-200 rounded-2xl shadow-xs overflow-hidden">
                 <div className="overflow-x-auto">
                   <table className="w-full text-left border-collapse text-xs">
                     <thead>
-                      <tr className="bg-gray-50 text-gray-500 font-bold uppercase text-[10px] border-b border-gray-200">
+                      <tr className="bg-[#1D3557] text-white font-montserrat font-extrabold uppercase text-[11px] tracking-wider">
                         <th className="p-4">Código</th>
                         <th className="p-4">RIF</th>
                         <th className="p-4">Razón social</th>
@@ -4503,11 +4819,11 @@ export default function AdminPanel({
                         <th className="p-4 text-center">Acciones</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-gray-100 text-gray-700 font-semibold">
+                    <tbody className="divide-y divide-gray-100 text-[#2B2D42] font-semibold">
                       {loadingProviders ? (
                         <tr>
                           <td colSpan={7} className="p-12 text-center text-gray-400 font-semibold">
-                            <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2 text-gray-400" />
+                            <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2 text-[#00BFFF]" />
                             Cargando proveedores...
                           </td>
                         </tr>
@@ -4519,37 +4835,37 @@ export default function AdminPanel({
                         </tr>
                       ) : (
                         filteredProviders.map((prov) => (
-                          <tr key={prov.id} className="hover:bg-gray-50/50">
+                          <tr key={prov.id} className="hover:bg-[#F8F9FA] transition">
                             <td className="p-4">
-                              <span className="bg-orange-50 text-orange-700 text-[10px] font-black uppercase px-2 py-1 rounded-lg border border-orange-100 font-mono">
+                              <span className="bg-[#1D3557]/10 text-[#1D3557] text-[10px] font-montserrat font-black uppercase px-2 py-1 rounded-lg border border-[#1D3557]/20 font-mono">
                                 {prov.code}
                               </span>
                             </td>
-                            <td className="p-4 font-mono font-bold text-gray-600">{prov.rif}</td>
-                            <td className="p-4 font-extrabold text-gray-900">{prov.name}</td>
+                            <td className="p-4 font-mono font-bold text-[#2B2D42]">{prov.rif}</td>
+                            <td className="p-4 font-extrabold text-[#1D3557]">{prov.name}</td>
                             <td className="p-4">
-                              <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase ${
+                              <span className={`px-2 py-0.5 rounded text-[9px] font-montserrat font-extrabold uppercase ${
                                 prov.type === 'Jurídico' 
                                   ? 'bg-purple-50 text-purple-700 border border-purple-100' 
-                                  : 'bg-emerald-50 text-emerald-700 border border-emerald-100'
+                                  : 'bg-[#40E0D0]/20 text-[#1D3557] border border-[#40E0D0]/40'
                               }`}>
                                 {prov.type || 'Jurídico'}
                               </span>
                             </td>
-                            <td className="p-4 font-mono text-gray-500">{prov.phone || 'Sin teléfono'}</td>
-                            <td className="p-4 text-gray-600">{prov.bank_name || 'No especificado'}</td>
+                            <td className="p-4 font-mono text-[#2B2D42]/80">{prov.phone || 'Sin teléfono'}</td>
+                            <td className="p-4 text-[#2B2D42]">{prov.bank_name || 'No especificado'}</td>
                             <td className="p-4">
                               <div className="flex items-center justify-center gap-2">
                                 <button
                                   onClick={() => openEditProviderModal(prov)}
-                                  className="p-1.5 bg-blue-50 text-blue-700 hover:bg-blue-100 rounded-lg transition"
+                                  className="p-1.5 bg-[#00BFFF]/10 text-[#00BFFF] hover:bg-[#00BFFF]/20 rounded-lg transition cursor-pointer"
                                   title="Editar Proveedor"
                                 >
                                   <Edit3 className="w-3.5 h-3.5" />
                                 </button>
                                 <button
                                   onClick={() => handleDeleteProvider(prov.id, prov.name)}
-                                  className="p-1.5 bg-red-50 text-red-700 hover:bg-red-100 rounded-lg transition"
+                                  className="p-1.5 bg-red-50 text-red-600 hover:bg-red-100 rounded-lg transition cursor-pointer"
                                   title="Eliminar Proveedor"
                                 >
                                   <Trash2 className="w-3.5 h-3.5" />
@@ -4566,16 +4882,16 @@ export default function AdminPanel({
 
               {/* -------------------- MODAL: NUEVO / EDITAR PROVEEDOR -------------------- */}
               {showProviderModal && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 select-none font-poppins">
                   <div className="bg-white rounded-3xl border border-gray-150 w-full max-w-md shadow-2xl overflow-hidden text-left flex flex-col">
-                    <div className="p-4 bg-gray-50 border-b border-gray-100 flex justify-between items-center">
-                      <span className="text-xs font-black text-gray-800 uppercase tracking-wider flex items-center gap-2">
-                        <Truck className="w-4 h-4 text-gray-500" />
+                    <div className="p-4 bg-[#1D3557] text-white flex justify-between items-center">
+                      <span className="text-xs font-montserrat font-extrabold uppercase tracking-wider flex items-center gap-2 text-white">
+                        <Truck className="w-4 h-4 text-[#40E0D0]" />
                         <span>{selectedProviderForEdit ? 'Editar Proveedor' : 'Nuevo Proveedor'}</span>
                       </span>
                       <button 
                         onClick={() => setShowProviderModal(false)}
-                        className="p-1.5 hover:bg-gray-200 text-gray-400 hover:text-gray-600 rounded-lg transition"
+                        className="p-1.5 hover:bg-white/10 text-gray-300 hover:text-white rounded-lg transition cursor-pointer"
                       >
                         <X className="w-4 h-4" />
                       </button>
@@ -4584,36 +4900,36 @@ export default function AdminPanel({
                     <form onSubmit={handleSaveProvider} className="p-5 space-y-4">
                       <div className="grid grid-cols-3 gap-4">
                         <div className="col-span-1">
-                          <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Código *</label>
+                          <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Código *</label>
                           <input
                             type="text"
                             required
                             value={providerFormCode}
                             onChange={(e) => setProviderFormCode(e.target.value)}
                             placeholder="PROV-001"
-                            className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                           />
                         </div>
                         <div className="col-span-2">
-                          <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Razón Social *</label>
+                          <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Razón Social *</label>
                           <input
                             type="text"
                             required
                             value={providerFormName}
                             onChange={(e) => setProviderFormName(e.target.value)}
                             placeholder="Ej: Distribuidora Bella Vista C.A."
-                            className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                           />
                         </div>
                       </div>
 
                       <div className="grid grid-cols-2 gap-4">
                         <div>
-                          <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Tipo de Firma *</label>
+                          <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Tipo de Firma *</label>
                           <select
                             value={providerFormType}
                             onChange={(e) => setProviderFormType(e.target.value)}
-                            className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                           >
                             <option value="Jurídico">Jurídico (J / G)</option>
                             <option value="Natural">Natural (V / E)</option>
@@ -4621,55 +4937,57 @@ export default function AdminPanel({
                         </div>
 
                         <div>
-                          <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">RIF / Cédula *</label>
+                          <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">RIF / Cédula *</label>
                           <input
                             type="text"
                             required
                             value={providerFormRif}
                             onChange={(e) => setProviderFormRif(e.target.value)}
                             placeholder="Ej: J-12345678-9"
-                            className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                           />
                         </div>
                       </div>
 
                       <div className="grid grid-cols-2 gap-4">
                         <div>
-                          <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Teléfono</label>
+                          <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Teléfono</label>
                           <input
                             type="text"
                             value={providerFormPhone}
                             onChange={(e) => setProviderFormPhone(e.target.value)}
                             placeholder="Ej: 0261-7000123"
-                            className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                           />
                         </div>
 
                         <div>
-                          <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Banco Receptor</label>
+                          <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Banco Receptor</label>
                           <input
                             type="text"
                             value={providerFormBankName}
                             onChange={(e) => setProviderFormBankName(e.target.value)}
                             placeholder="Ej: Banesco, Banco de Venezuela"
-                            className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                           />
                         </div>
                       </div>
 
-                      <div className="flex gap-2 pt-3 border-t border-gray-100">
+                      <div className="flex gap-2 pt-3 border-t border-gray-100 font-montserrat font-bold">
                         <button
                           type="button"
                           onClick={() => setShowProviderModal(false)}
-                          className="flex-1 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold text-xs uppercase tracking-wider rounded-xl transition"
+                          className="flex-1 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-xs uppercase tracking-wider transition shadow-2xs hover:shadow-xs cursor-pointer active:scale-98 flex items-center justify-center gap-1.5"
                         >
-                          Cancelar
+                          <X className="w-4 h-4 text-[#005da9]" />
+                          <span>Cancelar</span>
                         </button>
                         <button
                           type="submit"
-                          className="flex-1 py-2 bg-[#005da9] hover:bg-[#004b88] text-white font-black text-xs uppercase tracking-wider rounded-xl transition shadow-xs"
+                          className="flex-1 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-xs uppercase tracking-wider transition shadow-2xs hover:shadow-xs cursor-pointer active:scale-98 flex items-center justify-center gap-1.5 font-bold"
                         >
-                          Guardar
+                          <Check className="w-4 h-4 text-[#005da9] stroke-[2.5]" />
+                          <span>Guardar Proveedor</span>
                         </button>
                       </div>
                     </form>
@@ -4685,341 +5003,89 @@ export default function AdminPanel({
               <ComprasModule
                 products={products}
                 providers={providers}
-                onRefreshData={onRefreshData}
+                categories={categories}
+                brands={brands}
+                adminTaxes={adminTaxes}
+                businessBranchesList={businessBranchesList}
+                onRefreshData={() => {
+                  fetchProviders();
+                  if (onRefreshData) onRefreshData();
+                }}
                 currencyRates={currencyRates}
                 activeRole={activeRole}
               />
             </Suspense>
           )}
 
-          {/* VIEW: USUARIOS Y ACCESOS DEL PERSONAL INTERNO */}
-          {currentMenu === 'users' && (
-            <div className="space-y-6 text-left" id="module-usuarios">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-4 rounded-2xl border border-gray-200 shadow-xs">
-                <div>
-                  <h2 className="text-xl font-black text-[#131921] uppercase tracking-tight flex items-center gap-2">
-                    <UserCheck className="w-6 h-6 text-[#005da9]" />
-                    <span>Configuración de Usuarios Internos y Permisos</span>
-                  </h2>
-                  <p className="text-xs text-gray-500 font-medium mt-1">
-                    Administración exclusiva del personal de tienda, asignación de roles y activación/desactivación de botones de acceso por módulo.
-                  </p>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2 shrink-0">
-                  {((activeRole as string) === 'Admin' || (activeRole as string) === 'Gerente' || activeRole === 'admin' || activeRole === 'vendedor') ? (
-                    <button 
-                      onClick={() => {
-                        setEditingUserId(null);
-                        setUserFormName('');
-                        setUserFormEmail('');
-                        setUserFormPassword('');
-                        setUserFormRole('Cajero');
-                        setUserFormClientCode('');
-                        setUserFormError('');
-                        setShowUserModal(true);
-                      }}
-                      className="px-4 py-2.5 bg-[#28a745] hover:bg-[#218838] text-white text-xs font-black rounded-xl transition shadow-sm uppercase tracking-wider flex items-center gap-2 shrink-0 cursor-pointer"
-                    >
-                      <Plus className="w-4 h-4 stroke-[3]" />
-                      <span>+ Incorporar Nuevo Usuario Interno</span>
-                    </button>
-                  ) : (
-                    <span className="px-3 py-1.5 bg-amber-50 border border-amber-200 text-amber-800 text-[11px] font-bold rounded-xl shrink-0">
-                      🔒 Permisos Restringidos
-                    </span>
-                  )}
-                </div>
-              </div>
-
-              {/* INTERNAL STAFF TABLE */}
-              <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4 relative pb-6">
-                <div className="flex items-center justify-between gap-3 mb-4 border-b border-gray-100 pb-3">
-                  <h3 className="text-sm font-black text-gray-800 uppercase flex items-center gap-2">
-                    <UserCheck className="w-4 h-4 text-[#005da9]" />
-                    <span>Personal Registrado en la Tienda ({storeUsers.filter(u => u.role !== 'Cliente').length}):</span>
-                  </h3>
-                  <span className="text-[11px] text-gray-500 font-medium">
-                    Haz clic en <span className="font-bold text-[#005da9]">🔑 Botones de Accesos</span> en cada fila para activar/desactivar módulos individuales.
-                  </span>
-                </div>
-                
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-xs border-collapse">
-                    <thead className="bg-gray-50 border-b border-gray-200 text-gray-500 font-bold uppercase tracking-wider">
-                      <tr>
-                        <th className="px-4 py-3">Nombre del Personal</th>
-                        <th className="px-4 py-3">Correo / Usuario</th>
-                        <th className="px-4 py-3">Contraseña</th>
-                        <th className="px-4 py-3">Rol Interno</th>
-                        <th className="px-4 py-3">Botones de Acceso / Permisos</th>
-                        <th className="px-4 py-3">Estado</th>
-                        <th className="px-4 py-3 text-right">Acciones</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-gray-100">
-                      {loadingUsers ? (
-                        <tr>
-                          <td colSpan={7} className="px-4 py-8 text-center text-gray-500">Cargando usuarios internos...</td>
-                        </tr>
-                      ) : storeUsers
-                          .filter(u => u.role !== 'Cliente')
-                          .filter(user => {
-                            const isCurrentAdmin = (activeRole as string) === 'Admin' || (activeRole as string) === 'admin' || (activeRole as string) === 'Administrador';
-                            const isCurrentGerente = (activeRole as string) === 'Gerente' || (activeRole as string) === 'gerente';
-                            if (isCurrentAdmin && !isCurrentGerente && (user.role === 'Gerente' || user.role === 'gerente')) {
-                              return false; // El gerente no será visible para el administrador
-                            }
-                            return true;
-                          }).length === 0 ? (
-                        <tr>
-                          <td colSpan={7} className="px-4 py-8 text-center text-gray-500">No hay usuarios internos registrados.</td>
-                        </tr>
-                      ) : (
-                        storeUsers
-                          .filter(u => u.role !== 'Cliente')
-                          .filter(user => {
-                            const isCurrentAdmin = (activeRole as string) === 'Admin' || (activeRole as string) === 'admin' || (activeRole as string) === 'Administrador';
-                            const isCurrentGerente = (activeRole as string) === 'Gerente' || (activeRole as string) === 'gerente';
-                            if (isCurrentAdmin && !isCurrentGerente && (user.role === 'Gerente' || user.role === 'gerente')) {
-                              return false; // El gerente no será visible para el administrador
-                            }
-                            return true;
-                          })
-                          .map(user => {
-                            const currentPerms = user.permissions && user.permissions.length > 0 
-                              ? user.permissions 
-                              : getDefaultPermissionsForRole(user.role);
-
-                            return (
-                              <tr key={user.id || user.email} className={!user.is_active ? 'opacity-50 bg-gray-50' : 'hover:bg-gray-50/80 transition'}>
-                                <td className="px-4 py-3.5 font-bold text-[#131921]">{user.name}</td>
-                                <td className="px-4 py-3.5 font-mono font-medium text-gray-700">{user.email}</td>
-                                <td className="px-4 py-3.5 font-mono text-gray-600">
-                                  <div className="flex items-center gap-2">
-                                    <span>
-                                      {visiblePasswords[user.id || user.email] 
-                                        ? (user.password || 'Sin clave') 
-                                        : '••••••••'}
-                                    </span>
-                                    <button 
-                                      type="button"
-                                      onClick={() => {
-                                        const key = user.id || user.email;
-                                        setVisiblePasswords(prev => ({ ...prev, [key]: !prev[key] }));
-                                      }}
-                                      className="text-gray-400 hover:text-gray-700 text-[10px] underline cursor-pointer"
-                                    >
-                                      {visiblePasswords[user.id || user.email] ? 'Ocultar' : 'Ver'}
-                                    </button>
-                                  </div>
-                                </td>
-                                <td className="px-4 py-3.5">
-                                  <span className={`inline-block px-2.5 py-1 rounded-full border font-black text-[10px] uppercase tracking-wider ${
-                                    user.role === 'Gerente'
-                                      ? 'border-purple-200 text-purple-700 bg-purple-50'
-                                      : user.role === 'Admin' || user.role === 'Administrador'
-                                      ? 'border-blue-200 text-blue-700 bg-blue-50'
-                                      : user.role === 'Cajero'
-                                      ? 'border-emerald-200 text-emerald-700 bg-emerald-50'
-                                      : user.role === 'Despachador'
-                                      ? 'border-amber-200 text-amber-700 bg-amber-50'
-                                      : 'border-indigo-200 text-indigo-700 bg-indigo-50'
-                                  }`}>
-                                    {user.role}
-                                  </span>
-                                </td>
-                                <td className="px-4 py-3.5">
-                                  <button
-                                    type="button"
-                                    onClick={() => handleOpenPermissionsModal(user)}
-                                    className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 text-emerald-800 rounded-xl font-bold text-[11px] transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
-                                  >
-                                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
-                                    <span>🔑 Botones de Accesos ({currentPerms.length} activos)</span>
-                                  </button>
-                                </td>
-                                <td className="px-4 py-3.5">
-                                  {((activeRole as string) === 'Admin' || (activeRole as string) === 'Gerente' || activeRole === 'admin' || activeRole === 'vendedor') ? (
-                                    <button 
-                                      onClick={() => handleToggleStoreUserStatus(user.id || user.email, user.is_active)}
-                                      className={`text-xs font-bold cursor-pointer px-2.5 py-1 rounded-full transition ${
-                                        user.is_active 
-                                          ? 'bg-green-50 text-green-700 border border-green-200 hover:bg-green-100' 
-                                          : 'bg-red-50 text-red-700 border border-red-200 hover:bg-red-100'
-                                      }`}
-                                    >
-                                      {user.is_active ? '🟢 Activo' : '🔴 Inactivo'}
-                                    </button>
-                                  ) : (
-                                    <span className={`text-xs font-bold px-2.5 py-1 rounded-full ${user.is_active ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>
-                                      {user.is_active ? '🟢 Activo' : '🔴 Inactivo'}
-                                    </span>
-                                  )}
-                                </td>
-                                <td className="px-4 py-3.5 text-right">
-                                  <div className="flex items-center justify-end gap-1">
-                                    <button 
-                                      onClick={() => handleOpenPermissionsModal(user)}
-                                      className="p-1.5 text-emerald-600 hover:bg-emerald-50 rounded-lg transition cursor-pointer"
-                                      title="Configurar Botones de Permisos"
-                                    >
-                                      <ShieldCheck className="w-4 h-4" />
-                                    </button>
-                                    {((activeRole as string) === 'Admin' || (activeRole as string) === 'Gerente' || activeRole === 'admin' || activeRole === 'vendedor') && (
-                                      <>
-                                        <button 
-                                          onClick={() => {
-                                            setEditingUserId(user.id || user.email);
-                                            setUserFormName(user.name);
-                                            setUserFormEmail(user.email);
-                                            setUserFormPassword(user.password || '');
-                                            setUserFormRole(user.role);
-                                            setUserFormClientCode(user.client_code || '');
-                                            setUserFormError('');
-                                            setShowUserModal(true);
-                                          }}
-                                          className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg transition cursor-pointer"
-                                          title="Editar Usuario Interno"
-                                        >
-                                          <Edit3 className="w-4 h-4" />
-                                        </button>
-                                        <button 
-                                          onClick={() => handleDeleteStoreUser(user.id || user.email, user.name)}
-                                          className="p-1.5 text-red-500 hover:bg-red-50 rounded-lg transition cursor-pointer"
-                                          title="Eliminar Usuario Interno"
-                                        >
-                                          <Trash2 className="w-4 h-4" />
-                                        </button>
-                                      </>
-                                    )}
-                                  </div>
-                                </td>
-                              </tr>
-                            );
-                          })
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
-              {/* PERMISSIONS REFERENCE MATRIX */}
-              <div className="bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden p-4">
-                <div className="flex items-center justify-between mb-3 pb-2 border-b border-gray-100">
-                  <h3 className="text-xs font-black text-gray-800 uppercase flex items-center gap-1.5">
-                    <ShieldCheck className="w-4 h-4 text-[#005da9]" />
-                    <span>Matriz de Referencia de Accesos Predeterminados por Rol</span>
-                  </h3>
-                </div>
-                
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-xs">
-                    <thead className="bg-gray-50 border-b border-gray-200 text-gray-600 font-bold uppercase text-[10px]">
-                      <tr>
-                        <th className="px-3 py-2">Rol / Función</th>
-                        <th className="px-3 py-2 text-center">Pedidos</th>
-                        <th className="px-3 py-2 text-center">Facturación</th>
-                        <th className="px-3 py-2 text-center">Productos</th>
-                        <th className="px-3 py-2 text-center">Caja</th>
-                        <th className="px-3 py-2 text-center">Clientes</th>
-                        <th className="px-3 py-2 text-center">Proveedores</th>
-                        <th className="px-3 py-2 text-center">Compras</th>
-                        <th className="px-3 py-2 text-center">Reportes</th>
-                        <th className="px-3 py-2 text-center">Configuración</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-gray-100 font-medium">
-                      <tr className="hover:bg-gray-50">
-                        <td className="px-3 py-2 font-bold text-purple-700">Gerente General</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Acceso Total</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Acceso Total</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Acceso Total</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Acceso Total</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Acceso Total</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Acceso Total</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Acceso Total</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Acceso Total</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Acceso Total</td>
-                      </tr>
-                      <tr className="hover:bg-gray-50">
-                        <td className="px-3 py-2 font-bold text-blue-700">Administrador</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Activo</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Activo</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Activo</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Activo</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Activo</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Activo</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Activo</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Activo</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Activo</td>
-                      </tr>
-                      <tr className="hover:bg-gray-50">
-                        <td className="px-3 py-2 font-bold text-emerald-700">Cajero (POS)</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Activo</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Activo</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Activo</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Activo</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                      </tr>
-                      <tr className="hover:bg-gray-50">
-                        <td className="px-3 py-2 font-bold text-amber-700">Despachador</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Solo Productos</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                      </tr>
-                      <tr className="hover:bg-gray-50">
-                        <td className="px-3 py-2 font-bold text-indigo-700">Repartidor</td>
-                        <td className="px-3 py-2 text-center text-emerald-600 font-bold">✓ Solo Pedidos</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                        <td className="px-3 py-2 text-center text-gray-300">-</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              </div>
+          {/* VIEW: MOVIMIENTOS DE INVENTARIOS */}
+          {currentMenu === 'movimiento' && (
+            <div className="space-y-6 text-left font-poppins" id="module-movimientos">
+              <Suspense fallback={<AdminSubmoduleLoader name="Movimientos de Inventarios" />}>
+                <GlobalKardex
+                  products={products}
+                  bcvRate={bcvRate}
+                  currencySymbol="$"
+                  onStockUpdated={onRefreshData}
+                />
+              </Suspense>
             </div>
           )}
 
-          {/* VIEW: CONFIGURACIÓN */}
-          {currentMenu === 'settings' && (
-            <div className="space-y-6 text-left">
+          {/* VIEW: CONFIGURACIÓN UNIFICADA (MI NEGOCIO, MI CUENTA, USUARIOS ASOCIADOS, FACTURACIÓN, INVENTARIO, IMPRESIÓN, RESPALDO) */}
+          {(currentMenu === 'settings' || currentMenu === 'users') && (
+            <div className="space-y-6 text-left font-poppins" id="module-configuracion">
+              {/* TOP HEADER: CONFIGURACIÓN */}
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-                <div>
-                  <h2 className="text-xl font-black text-[#131921] uppercase tracking-tight flex items-center gap-2">
-                    <Settings className="w-6 h-6 text-gray-600" />
-                    <span>Configuración General</span>
-                  </h2>
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 rounded-full bg-slate-200/70 flex items-center justify-center text-slate-700">
+                    <Settings className="w-4 h-4 text-slate-700" />
+                  </div>
+                  <h1 className="text-base sm:text-lg font-montserrat font-black uppercase tracking-wider text-slate-800">
+                    CONFIGURACIÓN
+                  </h1>
                 </div>
-                
+
                 <button 
                   onClick={() => handleMenuChange('audit')}
-                  className="bg-rose-50 text-rose-600 hover:bg-rose-100 border border-rose-200 font-bold text-xs px-4 py-2 rounded-lg flex items-center gap-2 transition cursor-pointer"
+                  className="bg-[#1D3557] text-white hover:bg-[#152741] font-montserrat font-extrabold text-xs px-4 py-2 rounded-full flex items-center gap-2 transition cursor-pointer shadow-xs uppercase tracking-wider"
                 >
-                  <Activity className="w-4 h-4" />
-                  Registro de Auditoría
+                  <Activity className="w-3.5 h-3.5 text-[#40E0D0]" />
+                  <span>Registro de Auditoría</span>
                 </button>
               </div>
 
+              {/* HORIZONTAL TABLIST: HOJA ÚNICA DE CONFIGURACIÓN */}
+              <div className="flex items-center gap-6 sm:gap-8 border-b border-gray-200 overflow-x-auto pb-1 text-xs sm:text-sm font-medium">
+                {[
+                  { id: 'mi_negocio', label: 'Mi Negocio' },
+                  { id: 'mi_cuenta', label: 'Mi Cuenta' },
+                  { id: 'usuarios_asociados', label: 'Usuarios Asociados' },
+                  { id: 'facturacion', label: 'Facturación' },
+                  { id: 'inventario', label: 'Inventario' },
+                  { id: 'impresion', label: 'Impresión' },
+                  { id: 'respaldo', label: 'Respaldo' },
+                ].map(tab => (
+                  <button 
+                    key={tab.id}
+                    onClick={() => setConfigMainTab(tab.id as any)}
+                    className={`pb-3 transition font-montserrat cursor-pointer whitespace-nowrap ${
+                      configMainTab === tab.id 
+                        ? 'text-[#7928CA] font-bold border-b-2 border-[#7928CA]' 
+                        : 'text-gray-400 hover:text-gray-700 font-medium'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+
+
+
+              {/* TABS DE CONFIGURACIÓN DEL SISTEMA */}
               <Suspense fallback={<AdminSubmoduleLoader name="Panel de Configuración del Sistema" />}>
                 <SystemConfigPanel
-                  initialSubTab={systemConfigSubTab}
+                  activeSubTab={configMainTab === 'respaldo' ? 'mantenimiento' : (configMainTab as any)}
+                  hideInternalTabs={true}
                   currentUser={currentUser}
                   activeCurrency={activeCurrency}
                   onCurrencyChange={onCurrencyChange}
@@ -5037,6 +5103,21 @@ export default function AdminPanel({
                   setConfigIva={setConfigIva}
                   configPhone={configPhone}
                   setConfigPhone={setConfigPhone}
+                  // User management props passed down
+                  storeUsers={storeUsers}
+                  loadingUsers={loadingUsers}
+                  fetchStoreUsers={fetchStoreUsers}
+                  lastStoreUsersSync={lastStoreUsersSync}
+                  handleToggleStoreUserStatus={handleToggleStoreUserStatus}
+                  handleOpenPermissionsModal={handleOpenPermissionsModal}
+                  setEditingUserId={setEditingUserId}
+                  setUserFormName={setUserFormName}
+                  setUserFormEmail={setUserFormEmail}
+                  setUserFormPassword={setUserFormPassword}
+                  setUserFormRole={setUserFormRole}
+                  setUserFormError={setUserFormError}
+                  setShowUserModal={setShowUserModal}
+                  handleDeleteStoreUser={handleDeleteStoreUser}
                 />
               </Suspense>
             </div>
@@ -5045,57 +5126,39 @@ export default function AdminPanel({
             <div className="space-y-6">
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 text-left">
                 <div>
-                  <h2 className="text-xl font-black text-[#131921] uppercase tracking-tight flex items-center gap-2">
-                    <Package className="w-6 h-6 text-[#FF9900]" />
-                    <span>Productos</span>
+                  <h2 className="text-xl font-montserrat font-extrabold text-[#1D3557] uppercase tracking-tight flex items-center gap-2">
+                    <Package className="w-6 h-6 text-[#00BFFF]" />
+                    <span>Mercancías</span>
                   </h2>
-                  <p className="text-xs text-gray-500 font-medium">
-                    Gestión completa de productos, categorías, inventario y marcas del sistema.
-                  </p>
                 </div>
 
                 {/* Top actions */}
                 <div className="flex flex-wrap gap-2">
                   <button
                     onClick={handlePrintInventoryReport}
-                    className="px-4 py-2.5 bg-gray-800 hover:bg-gray-900 text-white text-xs font-black rounded-full flex items-center gap-2 cursor-pointer shadow-md hover:shadow-lg transition active:scale-98"
+                    className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs flex items-center gap-2 cursor-pointer font-montserrat font-bold text-xs active:scale-98"
                   >
-                    <Printer className="w-4 h-4 text-[#FF9900]" />
-                    <span>Imprimir Reporte</span>
+                    <Printer className="w-4 h-4 text-[#005da9]" />
+                    <span>PDF</span>
                   </button>
                   
                   {activeTab === 'products' && (
                     <div className="flex flex-wrap gap-2">
-                      <input
-                        type="file"
-                        ref={fileInputRef}
-                        style={{ display: 'none' }}
-                        accept=".xlsx, .xls"
-                        onChange={handleImportExcel}
-                      />
                       <button
-                        onClick={() => fileInputRef.current?.click()}
-                        className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black rounded-full flex items-center gap-1.5 cursor-pointer shadow-md hover:shadow-lg transition active:scale-98"
-                        id="btn-import-products"
+                        onClick={() => setShowInventoryMgmtModal(true)}
+                        className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs flex items-center gap-2 cursor-pointer font-montserrat font-bold text-xs active:scale-98"
+                        id="btn-inventory-mgmt"
                       >
-                        <Upload className="w-4 h-4" />
-                        <span>Importar Excel</span>
-                      </button>
-                      <button
-                        onClick={handleExportExcel}
-                        className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-black rounded-full flex items-center gap-1.5 cursor-pointer shadow-md hover:shadow-lg transition active:scale-98"
-                        id="btn-export-products"
-                      >
-                        <Download className="w-4 h-4" />
-                        <span>Exportar Excel</span>
+                        <Database className="w-4 h-4 text-[#005da9]" />
+                        <span>Gestión de Inventarios</span>
                       </button>
                       <button
                         onClick={() => handleOpenProductForm(null)}
-                        className="px-4 py-2.5 bg-[#FF9900] hover:bg-[#e68a00] text-[#131921] text-xs font-black rounded-full flex items-center gap-1.5 cursor-pointer shadow-md hover:shadow-lg transition active:scale-98"
+                        className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs flex items-center gap-2 cursor-pointer font-montserrat font-bold text-xs active:scale-98"
                         id="btn-add-product"
                       >
-                        <Plus className="w-4 h-4" />
-                        <span>Nuevo Producto</span>
+                        <PackagePlus className="w-4 h-4 text-[#005da9]" />
+                        <span>+ Crear Producto</span>
                       </button>
                     </div>
                   )}
@@ -5103,10 +5166,10 @@ export default function AdminPanel({
                   {activeTab === 'categories' && (
                     <button
                       onClick={() => handleOpenCategoryForm(null)}
-                      className="px-4 py-2.5 bg-[#FF9900] hover:bg-[#e68a00] text-[#131921] text-xs font-black rounded-full flex items-center gap-1.5 cursor-pointer shadow-md hover:shadow-lg transition active:scale-98"
+                      className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs flex items-center gap-2 cursor-pointer font-montserrat font-bold text-xs active:scale-98"
                       id="btn-add-category"
                     >
-                      <Plus className="w-4 h-4" />
+                      <Plus className="w-4 h-4 text-[#005da9]" />
                       <span>Nueva Categoría</span>
                     </button>
                   )}
@@ -5114,10 +5177,10 @@ export default function AdminPanel({
                   {activeTab === 'brands' && (
                     <button
                       onClick={() => handleOpenBrandForm(null)}
-                      className="px-4 py-2.5 bg-[#FF9900] hover:bg-[#e68a00] text-[#131921] text-xs font-black rounded-full flex items-center gap-1.5 cursor-pointer shadow-md hover:shadow-lg transition active:scale-98"
+                      className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs flex items-center gap-2 cursor-pointer font-montserrat font-bold text-xs active:scale-98"
                       id="btn-add-brand"
                     >
-                      <Plus className="w-4 h-4" />
+                      <Plus className="w-4 h-4 text-[#005da9]" />
                       <span>Nueva Marca</span>
                     </button>
                   )}
@@ -5125,33 +5188,33 @@ export default function AdminPanel({
               </div>
 
               {/* Tabs Navigation */}
-              <div className="flex border-b border-gray-200">
+              <div className="flex bg-gray-100 p-1 rounded-full text-xs font-montserrat font-bold gap-1 flex-wrap">
                 <button
                   onClick={() => handleTabClick('products')}
-                  className={`px-5 py-3 text-xs font-extrabold uppercase tracking-wider border-b-2 transition ${
+                  className={`px-4 py-2 text-xs font-montserrat font-bold transition-all rounded-full cursor-pointer border ${
                     activeTab === 'products'
-                      ? 'border-[#FF9900] text-[#131921]'
-                      : 'border-transparent text-gray-400 hover:text-gray-700'
+                      ? 'bg-white text-[#1D3557] border-slate-300 shadow-2xs font-extrabold'
+                      : 'text-[#2B2D42]/70 hover:text-[#1D3557] border-transparent hover:bg-slate-50'
                   }`}
                 >
                   Artículos del Catálogo ({totalProducts})
                 </button>
                 <button
                   onClick={() => handleTabClick('categories')}
-                  className={`px-5 py-3 text-xs font-extrabold uppercase tracking-wider border-b-2 transition ${
+                  className={`px-4 py-2 text-xs font-montserrat font-bold transition-all rounded-full cursor-pointer border ${
                     activeTab === 'categories'
-                      ? 'border-[#FF9900] text-[#131921]'
-                      : 'border-transparent text-gray-400 hover:text-gray-700'
+                      ? 'bg-white text-[#1D3557] border-slate-300 shadow-2xs font-extrabold'
+                      : 'text-[#2B2D42]/70 hover:text-[#1D3557] border-transparent hover:bg-slate-50'
                   }`}
                 >
                   Categorías ({totalCategories})
                 </button>
                 <button
                   onClick={() => handleTabClick('brands')}
-                  className={`px-5 py-3 text-xs font-extrabold uppercase tracking-wider border-b-2 transition ${
+                  className={`px-4 py-2 text-xs font-montserrat font-bold transition-all rounded-full cursor-pointer border ${
                     activeTab === 'brands'
-                      ? 'border-[#FF9900] text-[#131921]'
-                      : 'border-transparent text-gray-400 hover:text-gray-700'
+                      ? 'bg-white text-[#1D3557] border-slate-300 shadow-2xs font-extrabold'
+                      : 'text-[#2B2D42]/70 hover:text-[#1D3557] border-transparent hover:bg-slate-50'
                   }`}
                 >
                   Marcas ({totalBrands})
@@ -5165,44 +5228,53 @@ export default function AdminPanel({
             <div className="space-y-6">
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 text-left">
                 <div>
-                  <h2 className="text-xl font-black text-[#131921] uppercase tracking-tight flex items-center gap-2">
-                    <ClipboardList className="w-6 h-6 text-[#008296]" />
+                  <h2 className="text-xl font-montserrat font-extrabold text-[#1D3557] uppercase tracking-tight flex items-center gap-2">
+                    <ClipboardList className="w-6 h-6 text-[#00BFFF]" />
                     <span>Control de Pedidos</span>
                   </h2>
-                  <p className="text-xs text-gray-500 font-medium">
-                    Validación de pagos, despachos, estados de entrega y notificaciones en tiempo real al cliente.
-                  </p>
                 </div>
 
                 {/* Orders top actions */}
                 <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => setCurrentMenu('sales')}
+                    className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs flex items-center gap-2 cursor-pointer font-montserrat font-bold text-xs active:scale-98"
+                    id="btn-pos-orders"
+                    title="Punto de Venta (POS)"
+                  >
+                    <ShoppingCart className="w-4 h-4 text-[#005da9] shrink-0" />
+                    <span>POS</span>
+                  </button>
                   <button
                     onClick={() => {
                       setPedidosFacturadosSearch('');
                       setPedidosFacturadosTab('todos');
                       setShowPedidosFacturadosModal(true);
                     }}
-                    className="px-4 py-2.5 bg-[#005da9] hover:bg-[#004b87] text-white text-xs font-black rounded-full transition shadow-md hover:shadow-lg uppercase tracking-wider flex items-center gap-2 cursor-pointer active:scale-98"
+                    className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs flex items-center gap-2 cursor-pointer font-montserrat font-bold text-xs active:scale-98"
                     id="btn-pedidos-facturados"
+                    title="Pedidos Facturados"
                   >
-                    <FileText className="w-4 h-4" />
+                    <Bike className="w-4 h-4 text-[#005da9] shrink-0" />
                     <span>Pedidos Facturados</span>
                   </button>
                   <button
-                    onClick={fetchOrders}
-                    className="px-4 py-2.5 bg-[#131921] hover:bg-black text-white text-xs font-black rounded-full transition shadow-md hover:shadow-lg uppercase tracking-wider flex items-center gap-2 cursor-pointer active:scale-98"
+                    onClick={() => fetchOrders()}
+                    className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs flex items-center gap-2 cursor-pointer font-montserrat font-bold text-xs active:scale-98"
                     id="btn-refresh-orders"
+                    title="Actualizar Pedidos"
                   >
-                    <RefreshCw className={`w-4 h-4 ${loadingOrders ? 'animate-spin' : ''}`} />
-                    <span>Actualizar Pedidos</span>
+                    <RefreshCw className={`w-4 h-4 text-[#005da9] shrink-0 ${loadingOrders ? 'animate-spin' : ''}`} />
+                    <span>Actualizar</span>
                   </button>
                   <button
                     onClick={handleExportOrdersExcel}
-                    className="px-4 py-2.5 bg-[#16a34a] hover:bg-[#15803d] text-white text-xs font-black rounded-full transition shadow-md hover:shadow-lg uppercase tracking-wider flex items-center gap-2 cursor-pointer active:scale-98"
+                    className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs flex items-center gap-2 cursor-pointer font-montserrat font-bold text-xs active:scale-98"
                     id="btn-export-orders"
+                    title="Exportar Pedidos a Excel"
                   >
-                    <Download className="w-4 h-4" />
-                    <span>Exportar Pedidos</span>
+                    <FileSpreadsheet className="w-4 h-4 text-[#005da9] shrink-0" />
+                    <span>Exportar Excel</span>
                   </button>
                 </div>
               </div>
@@ -5211,22 +5283,33 @@ export default function AdminPanel({
 
           {/* Conditional rendering of table views */}
           {currentMenu === 'products' && (
-            <div className="bg-white border border-gray-200 rounded-lg overflow-x-auto shadow-sm">
+            <>
+              {activeTab === 'movimiento' ? (
+                <Suspense fallback={<AdminSubmoduleLoader name="Kardex e Historial de Movimientos" />}>
+                  <GlobalKardex
+                    products={products}
+                    bcvRate={bcvRate}
+                    currencySymbol="$"
+                    onStockUpdated={onRefreshData}
+                  />
+                </Suspense>
+              ) : (
+                <div className="bg-white border border-gray-200 rounded-lg overflow-x-auto shadow-sm">
         
         {/* Products Table */}
         {activeTab === 'products' && (
           <div>
             {/* Search Bar & Filter Controls */}
-            <div className="p-3 bg-gray-50/70 border-b border-gray-200 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+            <div className="p-3 bg-[#F8F9FA] border-b border-gray-200 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
               {/* Search input */}
               <div className="relative flex-1 max-w-md">
-                <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <Search className="w-4 h-4 text-[#00BFFF] absolute left-3 top-1/2 -translate-y-1/2" />
                 <input
                   type="text"
                   placeholder="Buscar ítems por nombre, SKU, marca..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full pl-9 pr-8 py-1.5 bg-white border border-gray-300 rounded-lg text-xs font-semibold text-gray-900 focus:outline-none focus:ring-1 focus:ring-[#FF9900]"
+                  className="w-full pl-9 pr-8 py-1.5 bg-white border border-gray-200 rounded-xl text-xs font-poppins font-medium text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                 />
                 {searchQuery && (
                   <button
@@ -5244,16 +5327,12 @@ export default function AdminPanel({
                 <button
                   type="button"
                   onClick={() => setShowFilterDropdown(!showFilterDropdown)}
-                  className={`px-3.5 py-1.5 bg-white border rounded-lg text-xs font-bold text-gray-700 flex items-center gap-1.5 shadow-2xs cursor-pointer transition ${
-                    showFilterDropdown || productFilterOption !== 'inventario_venta'
-                      ? 'border-[#FF9900] text-[#131921] bg-amber-50/50'
-                      : 'border-gray-300 hover:bg-gray-50'
-                  }`}
+                  className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs flex items-center gap-1.5 cursor-pointer font-montserrat font-bold text-xs active:scale-98"
                 >
-                  <SlidersHorizontal className="w-4 h-4 text-gray-500" />
+                  <SlidersHorizontal className="w-4 h-4 text-[#005da9]" />
                   <span>Filtros</span>
                   {productFilterOption !== 'inventario_venta' && (
-                    <span className="w-2 h-2 rounded-full bg-[#FF9900]" />
+                    <span className="w-2 h-2 rounded-full bg-[#005da9]" />
                   )}
                 </button>
 
@@ -5266,8 +5345,8 @@ export default function AdminPanel({
                     />
                     <div className="absolute right-0 mt-2 w-64 bg-white rounded-xl shadow-xl border border-gray-200 z-30 p-3 text-left space-y-2">
                       <div className="flex items-center justify-between border-b border-gray-100 pb-2">
-                        <span className="text-xs font-black text-gray-900 uppercase tracking-wide flex items-center gap-1.5">
-                          <SlidersHorizontal className="w-3.5 h-3.5 text-[#FF9900]" />
+                        <span className="text-xs font-montserrat font-black text-[#1D3557] uppercase tracking-wide flex items-center gap-1.5">
+                          <SlidersHorizontal className="w-3.5 h-3.5 text-[#00BFFF]" />
                           Filtros de Productos
                         </span>
                         {productFilterOption !== 'inventario_venta' && (
@@ -5277,14 +5356,14 @@ export default function AdminPanel({
                               setProductFilterOption('inventario_venta');
                               setShowFilterDropdown(false);
                             }}
-                            className="text-[11px] font-bold text-purple-600 hover:text-purple-800 cursor-pointer"
+                            className="text-[11px] font-montserrat font-extrabold text-[#00BFFF] hover:underline cursor-pointer"
                           >
                             Restablecer
                           </button>
                         )}
                       </div>
 
-                      <div className="space-y-1 text-xs font-medium text-gray-700">
+                      <div className="space-y-1 text-xs font-poppins font-medium text-[#2B2D42]">
                         {[
                           { id: 'inventario_venta', label: 'Inventario de Venta (Por defecto)' },
                           { id: 'inventario_costo', label: 'Inventario de Costo' },
@@ -5303,13 +5382,13 @@ export default function AdminPanel({
                             }}
                             className={`w-full text-left px-2.5 py-1.5 rounded-lg flex items-center justify-between transition text-xs font-bold ${
                               productFilterOption === opt.id
-                                ? 'bg-amber-50 text-[#FF9900] border border-amber-200'
-                                : 'hover:bg-gray-100 text-gray-700 border border-transparent'
+                                ? 'bg-[#1D3557]/10 text-[#1D3557] font-montserrat font-extrabold border border-[#1D3557]/20'
+                                : 'hover:bg-[#F8F9FA] text-[#2B2D42] border border-transparent'
                             }`}
                           >
                             <span>{opt.label}</span>
                             {productFilterOption === opt.id && (
-                              <Check className="w-3.5 h-3.5 text-[#FF9900]" />
+                              <Check className="w-3.5 h-3.5 text-[#40E0D0]" />
                             )}
                           </button>
                         ))}
@@ -5321,33 +5400,33 @@ export default function AdminPanel({
             </div>
 
             {/* Products Table */}
-            <table className="w-full text-left border-collapse text-xs">
+            <table className="w-full text-left border-collapse text-xs font-poppins">
               <thead>
-                <tr className="bg-[#131921] text-white">
-                  <th className="p-3 font-extrabold">SKU</th>
-                  <th className="p-3 font-extrabold">Nombre</th>
-                  <th className="p-3 font-extrabold">Categoría</th>
+                <tr className="bg-[#1D3557] text-white font-montserrat font-extrabold uppercase text-[11px] tracking-wider">
+                  <th className="p-3">SKU</th>
+                  <th className="p-3">Nombre</th>
+                  <th className="p-3">Categoría</th>
                   {productFilterOption === 'inventario_costo' ? (
-                    <th className="p-3 font-extrabold text-right">Precio Costo</th>
+                    <th className="p-3 text-right">Precio Costo</th>
                   ) : (
-                    <th className="p-3 font-extrabold text-right">Precio Venta</th>
+                    <th className="p-3 text-right">Precio Venta</th>
                   )}
-                  <th className="p-3 font-extrabold text-center">Cantidad</th>
+                  <th className="p-3 text-center">Cantidad</th>
                   {(productFilterOption === 'mas_vendidos' || productFilterOption === 'sin_rotacion') && (
-                    <th className="p-3 font-extrabold text-center">Unid. Vendidas</th>
+                    <th className="p-3 text-center">Unid. Vendidas</th>
                   )}
                   {productFilterOption === 'inventario_costo' ? (
-                    <th className="p-3 font-extrabold text-right">Valor Inv. Costo</th>
+                    <th className="p-3 text-right">Valor Inv. Costo</th>
                   ) : (
-                    <th className="p-3 font-extrabold text-right">Valor Inventario</th>
+                    <th className="p-3 text-right">Valor Inventario</th>
                   )}
                   {productFilterOption === 'ubicacion' && (
-                    <th className="p-3 font-extrabold">Ubicación</th>
+                    <th className="p-3">Ubicación</th>
                   )}
-                  <th className="p-3 font-extrabold text-right sticky right-0 bg-[#131921] z-10">Acciones</th>
+                  <th className="p-3 text-right sticky right-0 bg-[#1D3557] z-10">Acciones</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-100">
+              <tbody className="divide-y divide-gray-100 text-[#2B2D42]">
                 {filteredProducts.length === 0 ? (
                   <tr>
                     <td colSpan={10} className="p-8 text-center text-gray-400 font-semibold text-xs">
@@ -5365,7 +5444,7 @@ export default function AdminPanel({
                     const locationText = (prod as any).location || 'Almacén Principal';
 
                     return (
-                      <tr key={prod.id} className="hover:bg-gray-50/50 transition">
+                      <tr key={prod.id} className="hover:bg-[#F8F9FA] transition">
                         <td className="p-3 font-mono font-bold text-gray-500">
                           <div>{prod.sku}</div>
                           {prod.barcode_qr && (
@@ -5375,28 +5454,28 @@ export default function AdminPanel({
                             </div>
                           )}
                         </td>
-                        <td className="p-3 font-bold text-gray-900 truncate max-w-xs">
+                        <td className="p-3 font-bold text-[#1D3557] truncate max-w-xs">
                           <div className="flex items-center gap-1.5">
                             <span>{prod.name}</span>
                             {prod.featured && (
-                              <span className="px-1.5 py-0.2 bg-amber-100 text-amber-800 text-[9px] font-black rounded uppercase">
+                              <span className="px-1.5 py-0.2 bg-[#40E0D0]/20 text-[#1D3557] text-[9px] font-montserrat font-extrabold rounded uppercase">
                                 Destacado
                               </span>
                             )}
                           </div>
                         </td>
-                        <td className="p-3 font-semibold text-gray-600">{cat}</td>
+                        <td className="p-3 font-semibold text-[#2B2D42]/80">{cat}</td>
 
                         {/* Price Column */}
                         {productFilterOption === 'inventario_costo' ? (
-                          <td className="p-3 font-bold text-gray-700 text-right">
+                          <td className="p-3 font-bold text-[#2B2D42] text-right">
                             ${costPrice.toFixed(2)}
                           </td>
                         ) : (
-                          <td className="p-3 font-black text-gray-900 text-right">
+                          <td className="p-3 font-black text-[#1D3557] text-right">
                             {prod.offer_price ? (
                               <div className="flex flex-col items-end">
-                                <span className="text-[#FF9900] font-black">${prod.offer_price.toFixed(2)}</span>
+                                <span className="text-[#00BFFF] font-black">${prod.offer_price.toFixed(2)}</span>
                                 <span className="text-[10px] text-gray-400 line-through">${prod.price.toFixed(2)}</span>
                               </div>
                             ) : (
@@ -5412,7 +5491,7 @@ export default function AdminPanel({
                               ? 'bg-red-100 text-red-600' 
                               : prod.stock <= ((prod as any).critical_stock || inventarioLowStockThreshold || 5)
                                 ? 'bg-amber-100 text-amber-700'
-                                : 'bg-emerald-50 text-emerald-600'
+                                : 'bg-[#40E0D0]/20 text-[#1D3557] border border-[#40E0D0]/40'
                           }`}>
                             {prod.stock} disp.
                           </span>
@@ -5427,11 +5506,11 @@ export default function AdminPanel({
 
                         {/* Inv Value */}
                         {productFilterOption === 'inventario_costo' ? (
-                          <td className="p-3 font-black text-blue-600 text-right">
+                          <td className="p-3 font-black text-[#00BFFF] text-right">
                             ${costInvValue.toFixed(2)}
                           </td>
                         ) : (
-                          <td className="p-3 font-black text-emerald-600 text-right">
+                          <td className="p-3 font-black text-[#1D3557] text-right">
                             ${saleInvValue.toFixed(2)}
                           </td>
                         )}
@@ -5450,20 +5529,30 @@ export default function AdminPanel({
                         <td className="p-3 text-right space-x-1.5 whitespace-nowrap sticky right-0 bg-white z-10">
                           <button
                             type="button" 
+                            onClick={(e) => { e.stopPropagation(); setHistoryModalProd(prod); }}
+                            className="p-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs cursor-pointer inline-flex items-center justify-center active:scale-98"
+                            title="Historial de Movimientos y Kardex"
+                            id={`btn-product-history-${prod.id || prod.sku}`}
+                          >
+                            <History className="w-4 h-4 text-[#005da9]" />
+                          </button>
+
+                          <button
+                            type="button" 
                             onClick={(e) => { e.stopPropagation(); handleOpenProductForm(prod); }}
-                            className="p-1.5 text-sky-600 hover:bg-sky-50 rounded border border-transparent hover:border-sky-200 transition cursor-pointer inline-flex items-center gap-1"
+                            className="p-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs cursor-pointer inline-flex items-center justify-center active:scale-98"
                             title="Editar"
                           >
-                            <Edit3 className="w-3.5 h-3.5" />
+                            <Edit3 className="w-4 h-4 text-[#005da9]" />
                           </button>
 
                           <button
                             type="button" 
                             onClick={(e) => { e.stopPropagation(); setMovementModalProd(prod); setMovementQty(1); setMovementType('ingreso'); }}
-                            className="p-1.5 text-amber-600 hover:bg-amber-50 rounded border border-transparent hover:border-amber-200 transition cursor-pointer inline-flex items-center gap-1"
+                            className="p-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs cursor-pointer inline-flex items-center justify-center active:scale-98"
                             title="Movimiento de Producto"
                           >
-                            <ArrowLeftRight className="w-3.5 h-3.5" />
+                            <ArrowLeftRight className="w-4 h-4 text-[#005da9]" />
                           </button>
                         </td>
                       </tr>
@@ -5477,17 +5566,17 @@ export default function AdminPanel({
 
         {/* Categories Table */}
         {activeTab === 'categories' && (
-          <table className="w-full text-left border-collapse text-xs">
+          <table className="w-full text-left border-collapse text-xs font-poppins">
             <thead>
-              <tr className="bg-[#131921] text-white">
-                <th className="p-3 font-extrabold">Miniatura</th>
-                <th className="p-3 font-extrabold">Nombre de Categoría</th>
-                <th className="p-3 font-extrabold">Slug Único</th>
-                <th className="p-3 font-extrabold text-center">Visible</th>
-                <th className="p-3 font-extrabold text-right">Acciones</th>
+              <tr className="bg-[#1D3557] text-white font-montserrat font-extrabold uppercase text-[11px] tracking-wider">
+                <th className="p-3">Miniatura</th>
+                <th className="p-3">Nombre de Categoría</th>
+                <th className="p-3">Slug Único</th>
+                <th className="p-3 text-center">Visible</th>
+                <th className="p-3 text-right">Acciones</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-100">
+            <tbody className="divide-y divide-gray-100 text-[#2B2D42]">
               {filteredCategories.length === 0 ? (
                 <tr>
                   <td colSpan={5} className="p-8 text-center text-gray-400 font-semibold">
@@ -5496,7 +5585,7 @@ export default function AdminPanel({
                 </tr>
               ) : (
                 filteredCategories.map((cat) => (
-                  <tr key={cat.id} className="hover:bg-gray-50/50 transition">
+                  <tr key={cat.id} className="hover:bg-[#F8F9FA] transition">
                     <td className="p-3">
                       <img 
                         src={cat.image_url} 
@@ -5505,16 +5594,16 @@ export default function AdminPanel({
                         referrerPolicy="no-referrer"
                       />
                     </td>
-                    <td className="p-3 font-bold text-gray-900">{cat.name}</td>
+                    <td className="p-3 font-bold text-[#1D3557]">{cat.name}</td>
                     <td className="p-3 font-mono text-gray-400">{cat.slug}</td>
                     <td className="p-3 text-center">
                       <button
                         type="button" onClick={(e) => { e.stopPropagation(); handleToggleActiveCategory(cat); }}
-                        className="text-gray-400 hover:text-[#007185] transition"
+                        className="text-gray-400 hover:text-[#00BFFF] transition"
                         title={cat.active ?? true ? "Ocultar Categoría" : "Mostrar Categoría"}
                       >
                         {cat.active ?? true ? (
-                          <ToggleRight className="w-6 h-6 mx-auto text-emerald-500" />
+                          <ToggleRight className="w-6 h-6 mx-auto text-[#40E0D0]" />
                         ) : (
                           <ToggleLeft className="w-6 h-6 mx-auto text-gray-300" />
                         )}
@@ -5523,18 +5612,18 @@ export default function AdminPanel({
                     <td className="p-3 text-right space-x-1 whitespace-nowrap">
                       <button
                         onClick={() => handleOpenCategoryForm(cat)}
-                        className="p-1 text-sky-600 hover:bg-sky-50 rounded border border-transparent hover:border-sky-200 transition cursor-pointer"
+                        className="p-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs cursor-pointer inline-flex items-center justify-center active:scale-98"
                         title="Editar"
                       >
-                        <Edit3 className="w-3.5 h-3.5" />
+                        <Edit3 className="w-4 h-4 text-[#005da9]" />
                       </button>
                       <button
                         onClick={() => handleDeleteCategory(cat.id)}
-                        className="p-1 text-red-600 hover:bg-red-50 rounded border border-transparent hover:border-red-200 transition cursor-pointer"
+                        className="p-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs cursor-pointer inline-flex items-center justify-center active:scale-98 disabled:opacity-50"
                         title="Eliminar"
                         disabled={activeRole === 'vendedor'}
                       >
-                        <Trash2 className="w-3.5 h-3.5" />
+                        <Trash2 className="w-4 h-4 text-[#005da9]" />
                       </button>
                     </td>
                   </tr>
@@ -5546,16 +5635,16 @@ export default function AdminPanel({
 
         {/* Brands Table */}
         {activeTab === 'brands' && (
-          <table className="w-full text-left border-collapse text-xs">
+          <table className="w-full text-left border-collapse text-xs font-poppins">
             <thead>
-              <tr className="bg-[#131921] text-white">
-                <th className="p-3 font-extrabold">Logo</th>
-                <th className="p-3 font-extrabold">Nombre de Marca</th>
-                <th className="p-3 font-extrabold text-center">Visible</th>
-                <th className="p-3 font-extrabold text-right">Acciones</th>
+              <tr className="bg-[#1D3557] text-white font-montserrat font-extrabold uppercase text-[11px] tracking-wider">
+                <th className="p-3">Logo</th>
+                <th className="p-3">Nombre de Marca</th>
+                <th className="p-3 text-center">Visible</th>
+                <th className="p-3 text-right">Acciones</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-100">
+            <tbody className="divide-y divide-gray-100 text-[#2B2D42]">
               {filteredBrands.length === 0 ? (
                 <tr>
                   <td colSpan={4} className="p-8 text-center text-gray-400 font-semibold">
@@ -5564,7 +5653,7 @@ export default function AdminPanel({
                 </tr>
               ) : (
                 filteredBrands.map((b) => (
-                  <tr key={b.id} className="hover:bg-gray-50/50 transition">
+                  <tr key={b.id} className="hover:bg-[#F8F9FA] transition">
                     <td className="p-3">
                       <img 
                         src={b.logo_url} 
@@ -5573,15 +5662,15 @@ export default function AdminPanel({
                         referrerPolicy="no-referrer"
                       />
                     </td>
-                    <td className="p-3 font-bold text-gray-900">{b.name}</td>
+                    <td className="p-3 font-bold text-[#1D3557]">{b.name}</td>
                     <td className="p-3 text-center">
                       <button
                         type="button" onClick={(e) => { e.stopPropagation(); handleToggleActiveBrand(b); }}
-                        className="text-gray-400 hover:text-[#007185] transition"
+                        className="text-gray-400 hover:text-[#00BFFF] transition"
                         title={b.active ?? true ? "Ocultar Marca" : "Mostrar Marca"}
                       >
                         {b.active ?? true ? (
-                          <ToggleRight className="w-6 h-6 mx-auto text-emerald-500" />
+                          <ToggleRight className="w-6 h-6 mx-auto text-[#40E0D0]" />
                         ) : (
                           <ToggleLeft className="w-6 h-6 mx-auto text-gray-300" />
                         )}
@@ -5590,18 +5679,18 @@ export default function AdminPanel({
                     <td className="p-3 text-right space-x-1 whitespace-nowrap">
                       <button
                         onClick={() => handleOpenBrandForm(b)}
-                        className="p-1 text-sky-600 hover:bg-sky-50 rounded border border-transparent hover:border-sky-200 transition cursor-pointer"
+                        className="p-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs cursor-pointer inline-flex items-center justify-center active:scale-98"
                         title="Editar"
                       >
-                        <Edit3 className="w-3.5 h-3.5" />
+                        <Edit3 className="w-4 h-4 text-[#005da9]" />
                       </button>
                       <button
                         onClick={() => handleDeleteBrand(b.id)}
-                        className="p-1 text-red-600 hover:bg-red-50 rounded border border-transparent hover:border-red-200 transition cursor-pointer"
+                        className="p-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs cursor-pointer inline-flex items-center justify-center active:scale-98 disabled:opacity-50"
                         title="Eliminar"
                         disabled={activeRole === 'vendedor'}
                       >
-                        <Trash2 className="w-3.5 h-3.5" />
+                        <Trash2 className="w-4 h-4 text-[#005da9]" />
                       </button>
                     </td>
                   </tr>
@@ -5611,78 +5700,80 @@ export default function AdminPanel({
           </table>
         )}
       </div>
-    )}
+      )}
+    </>
+  )}
 
         {/* Orders Table & Panel */}
         {currentMenu === 'orders' && (
-          <div className="p-4 bg-gray-50/50 space-y-4">
+          <div className="p-4 bg-[#F8F9FA]/60 space-y-4">
             
             {/* Header for Orders */}
             <div className="flex justify-end items-center mb-2">
               <button
                 onClick={() => {
                   handleMenuChange('sales');
-                  if (typeof setActiveTab === 'function') setActiveTab('sales');
+                  if (typeof setActiveTab === 'function') setActiveTab('sales' as any);
                 }}
-                className="px-4 py-2.5 bg-[#0284c7] hover:bg-[#0369a1] text-white text-xs font-black rounded-full transition shadow-md hover:shadow-lg uppercase tracking-wider flex items-center gap-2 cursor-pointer active:scale-98"
+                className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs uppercase tracking-wider flex items-center gap-2 cursor-pointer font-montserrat font-bold text-xs active:scale-98"
               >
-                <Plus className="w-4 h-4 stroke-[3]" />
+                <Plus className="w-4 h-4 text-[#005da9] shrink-0 stroke-[2.5]" />
                 <span>Nuevo Pedido</span>
               </button>
             </div>
 
             {/* Orders Tab Subheader Metrics */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <div className="bg-white border border-gray-200 rounded-lg p-3.5 shadow-xs flex items-center gap-3 text-left">
-                <div className="p-2 bg-blue-50 text-blue-600 rounded-full">
-                  <ClipboardList className="w-5 h-5" />
+              <div className="bg-white border border-[#1D3557]/15 rounded-2xl p-4 shadow-2xs flex items-center gap-3.5 text-left">
+                <div className="p-2.5 bg-[#1D3557]/10 text-[#1D3557] rounded-xl">
+                  <ClipboardList className="w-5 h-5 text-[#00BFFF]" />
                 </div>
                 <div>
-                  <p className="text-[10px] text-gray-400 font-extrabold uppercase tracking-wide">Total Pedidos</p>
-                  <p className="text-lg font-black text-[#131921]">{totalOrdersCount}</p>
+                  <p className="text-[10px] text-[#2B2D42]/60 font-montserrat font-extrabold uppercase tracking-wide">Total Pedidos</p>
+                  <p className="text-xl font-montserrat font-black text-[#1D3557]">{totalOrdersCount}</p>
                 </div>
               </div>
 
-              <div className="bg-white border border-gray-200 rounded-lg p-3.5 shadow-xs flex items-center gap-3 text-left">
-                <div className="p-2 bg-amber-50 text-amber-500 rounded-full">
-                  <Clock className="w-5 h-5" />
+              <div className="bg-white border border-[#1D3557]/15 rounded-2xl p-4 shadow-2xs flex items-center gap-3.5 text-left">
+                <div className="p-2.5 bg-amber-500/10 text-amber-700 rounded-xl">
+                  <Clock className="w-5 h-5 text-amber-600" />
                 </div>
                 <div>
-                  <p className="text-[10px] text-gray-400 font-extrabold uppercase tracking-wide">Pendientes</p>
-                  <p className="text-lg font-black text-amber-600">{pendingOrdersCount}</p>
+                  <p className="text-[10px] text-[#2B2D42]/60 font-montserrat font-extrabold uppercase tracking-wide">Pendientes</p>
+                  <p className="text-xl font-montserrat font-black text-amber-700">{pendingOrdersCount}</p>
                 </div>
               </div>
 
-              <div className="bg-white border border-gray-200 rounded-lg p-3.5 shadow-xs flex items-center gap-3 text-left">
-                <div className="p-2 bg-emerald-50 text-emerald-600 rounded-full">
-                  <Check className="w-5 h-5" />
+              <div className="bg-white border border-[#1D3557]/15 rounded-2xl p-4 shadow-2xs flex items-center gap-3.5 text-left">
+                <div className="p-2.5 bg-[#40E0D0]/15 text-[#1D3557] rounded-xl">
+                  <Check className="w-5 h-5 text-[#40E0D0]" />
                 </div>
                 <div>
-                  <p className="text-[10px] text-gray-400 font-extrabold uppercase tracking-wide">Completados</p>
-                  <p className="text-lg font-black text-emerald-600">{completedOrdersCount}</p>
+                  <p className="text-[10px] text-[#2B2D42]/60 font-montserrat font-extrabold uppercase tracking-wide">Completados</p>
+                  <p className="text-xl font-montserrat font-black text-[#1D3557]">{completedOrdersCount}</p>
                 </div>
               </div>
 
-              <div className="bg-white border border-gray-200 rounded-lg p-3.5 shadow-xs flex items-center gap-3 text-left">
-                <div className="p-2 bg-purple-50 text-purple-600 rounded-full">
-                  <Coins className="w-5 h-5" />
+              <div className="bg-white border border-[#1D3557]/15 rounded-2xl p-4 shadow-2xs flex items-center gap-3.5 text-left">
+                <div className="p-2.5 bg-[#00BFFF]/10 text-[#00BFFF] rounded-xl">
+                  <Coins className="w-5 h-5 text-[#00BFFF]" />
                 </div>
                 <div>
-                  <p className="text-[10px] text-gray-400 font-extrabold uppercase tracking-wide">Facturación Activa</p>
-                  <p className="text-lg font-black text-purple-700">${totalRevenue.toFixed(2)}</p>
+                  <p className="text-[10px] text-[#2B2D42]/60 font-montserrat font-extrabold uppercase tracking-wide">Facturación Activa</p>
+                  <p className="text-xl font-montserrat font-black text-[#1D3557]">${totalRevenue.toFixed(2)}</p>
                 </div>
               </div>
             </div>
 
             {/* Sub-filters row */}
-            <div className="bg-white p-3 border border-gray-200 rounded-lg flex flex-wrap gap-4 items-center justify-between text-xs text-left">
+            <div className="bg-white p-4 border border-[#1D3557]/15 rounded-2xl flex flex-wrap gap-4 items-center justify-between text-xs text-left shadow-2xs">
               <div className="flex flex-wrap gap-3 items-center">
                 <div>
-                  <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-wide mb-1">Estado de Entrega</label>
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wide mb-1">Estado de Entrega</label>
                   <select
                     value={statusFilter}
                     onChange={(e) => setStatusFilter(e.target.value)}
-                    className="bg-white border border-gray-300 rounded px-2.5 py-1 text-xs focus:ring-1 focus:ring-[#008296] focus:outline-none font-semibold text-gray-700"
+                    className="bg-[#F8F9FA] border border-gray-200 rounded-xl px-3 py-1.5 text-xs focus:ring-2 focus:ring-[#00BFFF] focus:outline-none font-bold text-[#2B2D42]"
                   >
                     <option value="all">Todos los Estados</option>
                     <option value="recibido">Recibido</option>
@@ -5695,11 +5786,11 @@ export default function AdminPanel({
                 </div>
 
                 <div>
-                  <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-wide mb-1">Estado de Pago</label>
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wide mb-1">Estado de Pago</label>
                   <select
                     value={paymentStatusFilter}
                     onChange={(e) => setPaymentStatusFilter(e.target.value)}
-                    className="bg-white border border-gray-300 rounded px-2.5 py-1 text-xs focus:ring-1 focus:ring-[#008296] focus:outline-none font-semibold text-gray-700"
+                    className="bg-[#F8F9FA] border border-gray-200 rounded-xl px-3 py-1.5 text-xs focus:ring-2 focus:ring-[#00BFFF] focus:outline-none font-bold text-[#2B2D42]"
                   >
                     <option value="all">Todos los Pagos</option>
                     <option value="pendiente">Pendiente</option>
@@ -5709,11 +5800,11 @@ export default function AdminPanel({
                 </div>
 
                 <div>
-                  <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-wide mb-1">Método de Entrega</label>
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wide mb-1">Método de Entrega</label>
                   <select
                     value={deliveryMethodFilter}
                     onChange={(e) => setDeliveryMethodFilter(e.target.value)}
-                    className="bg-white border border-gray-300 rounded px-2.5 py-1 text-xs focus:ring-1 focus:ring-[#008296] focus:outline-none font-semibold text-gray-700"
+                    className="bg-[#F8F9FA] border border-gray-200 rounded-xl px-3 py-1.5 text-xs focus:ring-2 focus:ring-[#00BFFF] focus:outline-none font-bold text-[#2B2D42]"
                   >
                     <option value="all">Todos</option>
                     <option value="retiro">Retiro en Tienda</option>
@@ -5722,21 +5813,22 @@ export default function AdminPanel({
                 </div>
 
                 <div>
-                  <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-wide mb-1">Filtrar por Fecha</label>
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wide mb-1">Filtrar por Fecha</label>
                   <div className="flex items-center gap-1.5">
                     <input
                       type="date"
                       value={dateFilter}
                       onChange={(e) => setDateFilter(e.target.value)}
-                      className="bg-white border border-gray-300 rounded px-2 py-0.5 text-xs focus:ring-1 focus:ring-[#008296] focus:outline-none font-semibold text-gray-700 h-[26px]"
+                      className="bg-[#F8F9FA] border border-gray-200 rounded-xl px-3 py-1 text-xs focus:ring-2 focus:ring-[#00BFFF] focus:outline-none font-bold text-[#2B2D42] h-[30px]"
                     />
                     {dateFilter && (
                       <button
                         onClick={() => setDateFilter('')}
-                        className="px-2.5 py-0.5 bg-[#dc2626] hover:bg-[#b91c1c] text-white rounded-full text-[10px] font-black uppercase tracking-wider shadow-xs transition cursor-pointer"
+                        className="px-3 py-1 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-[10px] font-montserrat font-bold uppercase tracking-wider shadow-2xs transition cursor-pointer flex items-center gap-1 active:scale-98"
                         title="Limpiar fecha"
                       >
-                        Limpiar
+                        <X className="w-3.5 h-3.5 text-[#005da9] shrink-0" />
+                        <span>Limpiar</span>
                       </button>
                     )}
                   </div>
@@ -5749,49 +5841,46 @@ export default function AdminPanel({
                 <button
                   type="button"
                   onClick={() => setSoundAlertEnabled(!soundAlertEnabled)}
-                  className={`p-2 rounded-full transition flex items-center justify-center cursor-pointer shadow-md active:scale-98 ${
-                    soundAlertEnabled
-                      ? 'bg-[#16a34a] hover:bg-[#15803d] text-white'
-                      : 'bg-[#dc2626] hover:bg-[#b91c1c] text-white'
-                  }`}
+                  className="px-3.5 py-1.5 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition flex items-center justify-center cursor-pointer shadow-2xs active:scale-98 font-montserrat font-bold text-xs gap-1.5"
                   title={soundAlertEnabled ? 'Alerta sonora de pedidos activada (ON)' : 'Alerta sonora desactivada (OFF)'}
                 >
                   {soundAlertEnabled ? (
-                    <Volume2 className="w-4 h-4 stroke-[2.5] animate-pulse" />
+                    <Volume2 className="w-4 h-4 text-[#005da9] stroke-[2.5] animate-pulse" />
                   ) : (
-                    <VolumeX className="w-4 h-4 stroke-[2.5]" />
+                    <VolumeX className="w-4 h-4 text-[#005da9] stroke-[2.5]" />
                   )}
+                  <span>Sonido {soundAlertEnabled ? 'ON' : 'OFF'}</span>
                 </button>
 
-                {/* View Switcher Toggle Buttons */}
-                <div className="bg-gray-100 p-1 rounded-full border border-gray-200 flex items-center shadow-xs">
+                {/* View Switcher Toggle Buttons (Frenyer Colors) */}
+                <div className="bg-[#F8F9FA] p-1 rounded-full border border-blue-200/80 flex items-center shadow-2xs gap-1">
                   <button
                     type="button"
                     onClick={() => setOrdersViewMode('kanban')}
-                    className={`px-3.5 py-1.5 rounded-full text-xs font-black transition flex items-center gap-1.5 cursor-pointer uppercase tracking-wider ${
+                    className={`px-4 py-1.5 rounded-full text-xs font-montserrat transition-all duration-300 flex items-center gap-1.5 cursor-pointer uppercase tracking-wider select-none ${
                       ordersViewMode === 'kanban'
-                        ? 'bg-[#0284c7] text-white shadow-md'
-                        : 'text-gray-600 hover:text-gray-900'
+                        ? 'bg-gradient-to-r from-[#1D3557] via-[#005da9] to-[#1D3557] text-white border border-[#005da9]/50 shadow-xs font-black'
+                        : 'text-[#1D3557] hover:text-[#005da9] hover:bg-white/80 font-bold'
                     }`}
                   >
-                    <Kanban className="w-3.5 h-3.5 stroke-[2.5]" />
+                    <Kanban className={`w-3.5 h-3.5 stroke-[2.5] transition-colors ${ordersViewMode === 'kanban' ? 'text-[#40E0D0]' : 'text-[#005da9]'}`} />
                     <span>Kanban</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => setOrdersViewMode('table')}
-                    className={`px-3.5 py-1.5 rounded-full text-xs font-black transition flex items-center gap-1.5 cursor-pointer uppercase tracking-wider ${
+                    className={`px-4 py-1.5 rounded-full text-xs font-montserrat transition-all duration-300 flex items-center gap-1.5 cursor-pointer uppercase tracking-wider select-none ${
                       ordersViewMode === 'table'
-                        ? 'bg-[#0284c7] text-white shadow-md'
-                        : 'text-gray-600 hover:text-gray-900'
+                        ? 'bg-gradient-to-r from-[#1D3557] via-[#005da9] to-[#1D3557] text-white border border-[#005da9]/50 shadow-xs font-black'
+                        : 'text-[#1D3557] hover:text-[#005da9] hover:bg-white/80 font-bold'
                     }`}
                   >
-                    <LayoutGrid className="w-3.5 h-3.5 stroke-[2.5]" />
+                    <LayoutGrid className={`w-3.5 h-3.5 stroke-[2.5] transition-colors ${ordersViewMode === 'table' ? 'text-[#40E0D0]' : 'text-[#005da9]'}`} />
                     <span>Tabla</span>
                   </button>
                 </div>
 
-                <div className="text-[11px] text-gray-400 font-bold hidden lg:block ml-2">
+                <div className="text-[11px] text-[#2B2D42]/60 font-bold hidden lg:block ml-2">
                   {filteredOrders.length} / {orders.length} pedidos
                 </div>
               </div>
@@ -5801,12 +5890,12 @@ export default function AdminPanel({
             {ordersViewMode === 'kanban' ? (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3 overflow-x-auto pb-4">
                 {[
-                  { id: 'recibido', title: 'Recibido', bg: 'bg-slate-50', headerBg: 'bg-[#1e293b] text-white', border: 'border-slate-200', badge: 'bg-slate-200 text-slate-800', nextStatus: 'preparando', nextLabel: 'Preparar ➡️', nextBtnBg: 'bg-[#ea580c] hover:bg-[#c2410c]' },
-                  { id: 'preparando', title: 'Preparando', bg: 'bg-amber-50/50', headerBg: 'bg-[#ea580c] text-white', border: 'border-amber-200', badge: 'bg-amber-100 text-amber-900', nextStatus: 'listo para retirar', nextLabel: 'Listo ➡️', nextBtnBg: 'bg-[#6366f1] hover:bg-[#4f46e5]' },
-                  { id: 'listo para retirar', title: 'Listo p/ Retiro', bg: 'bg-indigo-50/50', headerBg: 'bg-[#6366f1] text-white', border: 'border-indigo-200', badge: 'bg-indigo-100 text-indigo-900', nextStatus: 'en camino', nextLabel: 'Despachar ➡️', nextBtnBg: 'bg-[#0284c7] hover:bg-[#0369a1]' },
-                  { id: 'en camino', title: 'En Camino', bg: 'bg-sky-50/50', headerBg: 'bg-[#0284c7] text-white', border: 'border-sky-200', badge: 'bg-sky-100 text-sky-900', nextStatus: 'entregado', nextLabel: 'Entregado ➡️', nextBtnBg: 'bg-[#059669] hover:bg-[#047857]' },
-                  { id: 'entregado', title: 'Entregado', bg: 'bg-emerald-50/50', headerBg: 'bg-[#059669] text-white', border: 'border-emerald-200', badge: 'bg-emerald-100 text-emerald-900', nextStatus: null, nextLabel: '', nextBtnBg: '' },
-                  { id: 'cancelado', title: 'Cancelado', bg: 'bg-rose-50/50', headerBg: 'bg-[#dc2626] text-white', border: 'border-rose-200', badge: 'bg-rose-100 text-rose-900', nextStatus: null, nextLabel: '', nextBtnBg: '' }
+                  { id: 'recibido', title: 'Recibido', bg: 'bg-[#F8F9FA]', headerBg: 'bg-[#1D3557] text-white', border: 'border-[#1D3557]/15', badge: 'bg-[#1D3557]/10 text-[#1D3557]', nextStatus: 'preparando', nextLabel: 'Preparar ➡️', nextBtnBg: 'bg-amber-600 hover:bg-amber-700' },
+                  { id: 'preparando', title: 'Preparando', bg: 'bg-amber-50/40', headerBg: 'bg-amber-600 text-white', border: 'border-amber-200', badge: 'bg-amber-100 text-amber-900', nextStatus: 'listo para retirar', nextLabel: 'Listo ➡️', nextBtnBg: 'bg-[#00BFFF] hover:bg-[#009bd1]' },
+                  { id: 'listo para retirar', title: 'Listo p/ Retiro', bg: 'bg-sky-50/40', headerBg: 'bg-[#00BFFF] text-white', border: 'border-sky-200', badge: 'bg-sky-100 text-sky-900', nextStatus: 'en camino', nextLabel: 'Despachar ➡️', nextBtnBg: 'bg-[#1D3557] hover:bg-[#152742]' },
+                  { id: 'en camino', title: 'En Camino', bg: 'bg-[#1D3557]/5', headerBg: 'bg-[#1D3557] text-white', border: 'border-[#1D3557]/20', badge: 'bg-[#1D3557]/10 text-[#1D3557]', nextStatus: 'entregado', nextLabel: 'Entregado ➡️', nextBtnBg: 'bg-[#40E0D0] hover:bg-[#36cebe] text-[#1D3557]' },
+                  { id: 'entregado', title: 'Entregado', bg: 'bg-[#40E0D0]/10', headerBg: 'bg-[#40E0D0] text-[#1D3557]', border: 'border-[#40E0D0]/30', badge: 'bg-[#40E0D0]/20 text-[#1D3557]', nextStatus: null, nextLabel: '', nextBtnBg: '' },
+                  { id: 'cancelado', title: 'Cancelado', bg: 'bg-rose-50/40', headerBg: 'bg-rose-600 text-white', border: 'border-rose-200', badge: 'bg-rose-100 text-rose-900', nextStatus: null, nextLabel: '', nextBtnBg: '' }
                 ].map((col) => {
                   const colOrders = filteredOrders.filter(o => {
                     const rawSt = pendingChanges[o.id]?.status ?? (o.status || 'recibido');
@@ -5816,16 +5905,16 @@ export default function AdminPanel({
                   const colRevenue = colOrders.reduce((sum, o) => sum + Number(o.total_price || 0), 0);
 
                   return (
-                    <div key={col.id} className={`${col.bg} border ${col.border} rounded-xl p-2 flex flex-col min-w-[230px] max-h-[700px]`}>
+                    <div key={col.id} className={`${col.bg} border ${col.border} rounded-2xl p-2.5 flex flex-col min-w-[230px] max-h-[700px]`}>
                       {/* Column Header */}
-                      <div className={`${col.headerBg} p-2 rounded-lg flex items-center justify-between mb-2 shadow-xs`}>
+                      <div className={`${col.headerBg} p-2.5 rounded-xl flex items-center justify-between mb-2 shadow-2xs`}>
                         <div>
-                          <h3 className="font-black text-xs tracking-tight uppercase flex items-center gap-1.5">
+                          <h3 className="font-montserrat font-extrabold text-xs tracking-tight uppercase flex items-center gap-1.5">
                             <span>{col.title}</span>
                           </h3>
                           <p className="text-[10px] opacity-80 font-mono">${colRevenue.toFixed(2)} USD</p>
                         </div>
-                        <span className="text-xs font-black bg-white/20 px-2 py-0.5 rounded-full">
+                        <span className="text-xs font-montserrat font-black bg-white/20 px-2 py-0.5 rounded-full">
                           {colOrders.length}
                         </span>
                       </div>
@@ -5834,11 +5923,11 @@ export default function AdminPanel({
                       <div className="flex-1 overflow-y-auto space-y-2 pr-0.5">
                         {loadingOrders ? (
                           <div className="p-4 text-center text-gray-400">
-                            <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-1 text-[#008296]" />
+                            <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-1 text-[#00BFFF]" />
                             <span className="text-[10px]">Cargando...</span>
                           </div>
                         ) : colOrders.length === 0 ? (
-                          <div className="p-4 text-center text-gray-400 text-[11px] font-medium border border-dashed border-gray-300 rounded-lg my-2">
+                          <div className="p-4 text-center text-gray-400 text-[11px] font-medium border border-dashed border-gray-300 rounded-xl my-2">
                             Sin pedidos
                           </div>
                         ) : (
@@ -5851,17 +5940,17 @@ export default function AdminPanel({
                             return (
                               <div 
                                 key={order.id} 
-                                className="bg-white border border-gray-200 hover:border-gray-400 rounded-xl p-3 shadow-2xs transition flex flex-col justify-between text-left group"
+                                className="bg-white border border-gray-200 hover:border-[#00BFFF] rounded-2xl p-3.5 shadow-2xs transition flex flex-col justify-between text-left group"
                               >
                                 {/* Top Row: Order # & Delivery Badge */}
                                 <div className="flex items-center justify-between gap-1 mb-1.5">
-                                  <span className="font-mono font-black text-xs text-gray-900">
+                                  <span className="font-mono font-black text-xs text-[#1D3557]">
                                     #{formattedNum}
                                   </span>
-                                  <span className={`text-[9px] font-black uppercase px-2 py-0.5 rounded-full ${
+                                  <span className={`text-[9px] font-montserrat font-extrabold uppercase px-2 py-0.5 rounded-full ${
                                     order.delivery_method === 'retiro' 
                                       ? 'bg-amber-100 text-amber-900 border border-amber-200' 
-                                      : 'bg-blue-100 text-blue-900 border border-blue-200'
+                                      : 'bg-[#1D3557]/10 text-[#1D3557] border border-[#1D3557]/20'
                                   }`}>
                                     {order.delivery_method === 'retiro' ? '🏪 Retiro' : '🛵 Envío'}
                                   </span>
@@ -5869,7 +5958,7 @@ export default function AdminPanel({
 
                                 {/* Customer Info */}
                                 <div className="mb-2">
-                                  <p className="font-bold text-xs text-gray-900 truncate">
+                                  <p className="font-montserrat font-bold text-xs text-[#2B2D42] truncate">
                                     {order.customer_name || 'Cliente general'}
                                   </p>
                                   {order.phone_number && (
@@ -5881,7 +5970,7 @@ export default function AdminPanel({
 
                                 {/* Items snippet */}
                                 {Array.isArray(order.items) && order.items.length > 0 && (
-                                  <div className="bg-gray-50 p-1.5 rounded-lg text-[10px] text-gray-600 mb-2 border border-gray-100 line-clamp-2">
+                                  <div className="bg-[#F8F9FA] p-2 rounded-xl text-[10px] text-[#2B2D42] mb-2 border border-gray-200 line-clamp-2">
                                     {order.items.map((it: any) => `${it.quantity || 1}x ${it.name || 'Producto'}`).join(', ')}
                                   </div>
                                 )}
@@ -5890,7 +5979,7 @@ export default function AdminPanel({
                                 <div className="flex items-center justify-between border-t border-gray-100 pt-2 mb-2">
                                   <OrderTimer createdAt={order.created_at} status={order.status} currentTime={currentTime} />
                                   <div className="text-right">
-                                    <span className="text-sm font-black text-gray-900 block">
+                                    <span className="text-sm font-montserrat font-black text-[#1D3557] block">
                                       ${Number(order.total_price || 0).toFixed(2)}
                                     </span>
                                   </div>
@@ -5903,7 +5992,7 @@ export default function AdminPanel({
                                     disabled={isUpdating}
                                     value={(currentPaymentStatus || '').toLowerCase()}
                                     onChange={(e) => handlePendingChange(order.id, 'payment_status', e.target.value)}
-                                    className={`text-[10px] font-extrabold rounded px-2 py-0.5 border cursor-pointer ${
+                                    className={`text-[10px] font-extrabold rounded-lg px-2 py-0.5 border cursor-pointer ${
                                       (currentPaymentStatus || '').toLowerCase() === 'pendiente' ? 'bg-amber-100 text-amber-800 border-amber-300' :
                                       (currentPaymentStatus || '').toLowerCase() === 'pagado' ? 'bg-emerald-100 text-emerald-800 border-emerald-300' :
                                       'bg-red-100 text-red-800 border-red-300'
@@ -5919,10 +6008,10 @@ export default function AdminPanel({
                                 <div className="flex items-center justify-between gap-1.5 pt-2 border-t border-gray-100">
                                   <button
                                     onClick={() => setSelectedOrder(order)}
-                                    className="px-2.5 py-1 bg-[#1e293b] hover:bg-[#0f172a] text-white rounded-full transition cursor-pointer text-[10px] font-black uppercase tracking-wider shadow-sm flex items-center gap-1 active:scale-95"
+                                    className="px-3 py-1 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition cursor-pointer text-[10px] font-montserrat font-bold uppercase tracking-wider shadow-2xs flex items-center gap-1 active:scale-95"
                                     title="Ver detalle completo"
                                   >
-                                    <Eye className="w-3.5 h-3.5 stroke-[2.5]" />
+                                    <Eye className="w-3.5 h-3.5 text-[#005da9] stroke-[2.5]" />
                                     <span>Detalle</span>
                                   </button>
 
@@ -5930,18 +6019,18 @@ export default function AdminPanel({
                                     <button
                                       onClick={() => handleConfirmOrderChanges(order.id)}
                                       disabled={isUpdating}
-                                      className="px-3 py-1 bg-[#059669] hover:bg-[#047857] text-white font-black rounded-full text-[10px] uppercase tracking-wider flex items-center gap-1 cursor-pointer shadow-md transition animate-pulse active:scale-95"
+                                      className="px-3 py-1 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-montserrat font-bold rounded-full text-[10px] uppercase tracking-wider flex items-center gap-1 cursor-pointer shadow-2xs transition active:scale-95"
                                     >
-                                      <Check className="w-3 h-3 stroke-[3]" />
+                                      <Check className="w-3.5 h-3.5 text-[#005da9] stroke-[3]" />
                                       <span>Confirmar</span>
                                     </button>
                                   ) : col.nextStatus ? (
                                     <button
                                       onClick={() => handlePendingChange(order.id, 'status', col.nextStatus!)}
-                                      className={`px-3 py-1 ${col.nextBtnBg} text-white text-[10px] font-black rounded-full shadow-md transition cursor-pointer uppercase tracking-wider flex items-center gap-1 active:scale-95`}
+                                      className="px-3 py-1 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 text-[10px] font-montserrat font-bold rounded-full shadow-2xs transition cursor-pointer uppercase tracking-wider flex items-center gap-1 active:scale-95"
                                       title={`Avanzar a ${col.nextStatus}`}
                                     >
-                                      {col.nextLabel}
+                                      <span className="text-[#005da9]">{col.nextLabel}</span>
                                     </button>
                                   ) : null}
                                 </div>
@@ -5956,10 +6045,10 @@ export default function AdminPanel({
               </div>
             ) : (
               /* Table View */
-              <div className="bg-white border border-gray-200 rounded-lg shadow-xs overflow-x-auto max-h-[650px] overflow-y-auto">
+              <div className="bg-white border border-[#1D3557]/15 rounded-2xl shadow-xs overflow-x-auto max-h-[650px] overflow-y-auto">
               {loadingOrders ? (
                 <div className="p-12 text-center text-gray-400">
-                  <RefreshCw className="w-8 h-8 animate-spin mx-auto mb-3 text-[#008296]" />
+                  <RefreshCw className="w-8 h-8 animate-spin mx-auto mb-3 text-[#00BFFF]" />
                   <p className="font-semibold text-xs">Cargando lista de pedidos desde la base de datos...</p>
                 </div>
               ) : filteredOrders.length === 0 ? (
@@ -5969,20 +6058,20 @@ export default function AdminPanel({
                 </div>
               ) : (
                 <table className="w-full text-left border-collapse text-xs">
-                  <thead className="sticky top-0 z-20 bg-[#131921] shadow-xs">
-                    <tr className="bg-[#131921] text-white">
-                      <th className="p-3 font-extrabold">Pedido N°</th>
-                      <th className="p-3 font-extrabold">Cliente / Contacto</th>
-                      <th className="p-3 font-extrabold">Método Entrega</th>
-                      <th className="p-3 font-extrabold">Método Pago</th>
-                      <th className="p-3 font-extrabold text-right">Total (USD)</th>
-                      <th className="p-3 font-extrabold text-left">Tiempo / Inicio</th>
-                      <th className="p-3 font-extrabold text-center">Estado de la Entrega</th>
-                      <th className="p-3 font-extrabold text-center">Estado del Pago</th>
-                      <th className="p-3 font-extrabold text-right">Detalles</th>
+                  <thead className="sticky top-0 z-20 bg-[#1D3557] shadow-xs">
+                    <tr className="bg-[#1D3557] text-white">
+                      <th className="p-3.5 font-montserrat font-extrabold">Pedido N°</th>
+                      <th className="p-3.5 font-montserrat font-extrabold">Cliente / Contacto</th>
+                      <th className="p-3.5 font-montserrat font-extrabold">Método Entrega</th>
+                      <th className="p-3.5 font-montserrat font-extrabold">Método Pago</th>
+                      <th className="p-3.5 font-montserrat font-extrabold text-right">Total (USD)</th>
+                      <th className="p-3.5 font-montserrat font-extrabold text-left">Tiempo / Inicio</th>
+                      <th className="p-3.5 font-montserrat font-extrabold text-center">Estado de la Entrega</th>
+                      <th className="p-3.5 font-montserrat font-extrabold text-center">Estado del Pago</th>
+                      <th className="p-3.5 font-montserrat font-extrabold text-right">Detalles</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-gray-100 font-medium">
+                  <tbody className="divide-y divide-gray-100 font-medium text-[#2B2D42]">
                     {filteredOrders.map((order) => {
                       const formattedNum = String(order.order_number || '').padStart(7, '0');
                       const orderDate = order.created_at ? new Date(order.created_at).toLocaleDateString() : 'N/A';
@@ -5993,15 +6082,15 @@ export default function AdminPanel({
                       const hasPendingChanges = !!pendingChanges[order.id];
 
                       return (
-                        <tr key={order.id} className="hover:bg-gray-50/50 transition">
+                        <tr key={order.id} className="hover:bg-[#F8F9FA] transition">
                           {/* Order number with padding */}
-                          <td className="p-3 font-mono font-black text-[#008296] text-[13px]">
-                            {formattedNum}
+                          <td className="p-3 font-mono font-black text-[#1D3557] text-[13px]">
+                            #{formattedNum}
                           </td>
 
                           {/* Customer contact info */}
                           <td className="p-3 text-left">
-                            <div className="font-bold text-gray-900">{order.customer_name}</div>
+                            <div className="font-montserrat font-bold text-[#2B2D42]">{order.customer_name}</div>
                             <div className="text-gray-400 text-[10px] font-mono">{order.phone_number}</div>
                           </td>
 
@@ -6043,14 +6132,14 @@ export default function AdminPanel({
                                 disabled={isUpdating}
                                 value={(currentStatus || '').toLowerCase()}
                                 onChange={(e) => handlePendingChange(order.id, 'status', e.target.value)}
-                                className={`text-[11px] font-black rounded-lg border px-2 py-1 focus:ring-1 focus:ring-[#008296] focus:outline-none font-bold select-none cursor-pointer text-center ${
-                                  (currentStatus || '').toLowerCase() === 'recibido' ? 'bg-gray-100 text-gray-700 border-gray-300' :
-                                  (currentStatus || '').toLowerCase() === 'preparando' ? 'bg-amber-50 text-amber-700 border-amber-300' :
-                                  (currentStatus || '').toLowerCase() === 'listo para retirar' ? 'bg-indigo-50 text-indigo-700 border-indigo-300' :
-                                  (currentStatus || '').toLowerCase() === 'en camino' ? 'bg-sky-50 text-sky-700 border-sky-300' :
-                                  (currentStatus || '').toLowerCase() === 'entregado' ? 'bg-emerald-50 text-emerald-700 border-emerald-300' :
-                                  'bg-red-50 text-red-700 border-red-300'
-                                } ${pendingChanges[order.id]?.status ? 'ring-2 ring-emerald-500 ring-offset-1' : ''}`}
+                                className={`text-[11px] font-black rounded-xl border px-2.5 py-1 focus:ring-2 focus:ring-[#00BFFF] focus:outline-none select-none cursor-pointer text-center ${
+                                  (currentStatus || '').toLowerCase() === 'recibido' ? 'bg-[#F8F9FA] text-[#1D3557] border-[#1D3557]/20' :
+                                  (currentStatus || '').toLowerCase() === 'preparando' ? 'bg-amber-50 text-amber-800 border-amber-300' :
+                                  (currentStatus || '').toLowerCase() === 'listo para retirar' ? 'bg-sky-50 text-sky-800 border-sky-300' :
+                                  (currentStatus || '').toLowerCase() === 'en camino' ? 'bg-[#1D3557]/10 text-[#1D3557] border-[#1D3557]/30' :
+                                  (currentStatus || '').toLowerCase() === 'entregado' ? 'bg-[#40E0D0]/15 text-[#1D3557] border-[#40E0D0]/40 font-bold' :
+                                  'bg-rose-50 text-rose-800 border-rose-300'
+                                } ${pendingChanges[order.id]?.status ? 'ring-2 ring-[#40E0D0] ring-offset-1' : ''}`}
                               >
                                 <option value="recibido">Recibido</option>
                                 <option value="preparando">Preparando</option>
@@ -6060,8 +6149,8 @@ export default function AdminPanel({
                                 <option value="cancelado">Cancelado</option>
                               </select>
                               {isUpdating && (
-                                <div className="absolute inset-0 bg-white/70 flex items-center justify-center rounded">
-                                  <RefreshCw className="w-3 h-3 animate-spin text-gray-500" />
+                                <div className="absolute inset-0 bg-white/70 flex items-center justify-center rounded-xl">
+                                  <RefreshCw className="w-3 h-3 animate-spin text-[#00BFFF]" />
                                 </div>
                               )}
                             </div>
@@ -6074,19 +6163,19 @@ export default function AdminPanel({
                                 disabled={isUpdating}
                                 value={(currentPaymentStatus || '').toLowerCase()}
                                 onChange={(e) => handlePendingChange(order.id, 'payment_status', e.target.value)}
-                                className={`text-[11px] font-black rounded-lg border px-2.5 py-1 focus:ring-1 focus:ring-[#008296] focus:outline-none font-bold select-none cursor-pointer text-center ${
+                                className={`text-[11px] font-black rounded-xl border px-2.5 py-1 focus:ring-2 focus:ring-[#00BFFF] focus:outline-none select-none cursor-pointer text-center ${
                                   (currentPaymentStatus || '').toLowerCase() === 'pendiente' ? 'bg-amber-100 text-amber-800 border-amber-300' :
                                   (currentPaymentStatus || '').toLowerCase() === 'pagado' ? 'bg-emerald-100 text-emerald-800 border-emerald-300' :
                                   'bg-red-100 text-red-800 border-red-300'
-                                } ${pendingChanges[order.id]?.payment_status ? 'ring-2 ring-emerald-500 ring-offset-1' : ''}`}
+                                } ${pendingChanges[order.id]?.payment_status ? 'ring-2 ring-[#40E0D0] ring-offset-1' : ''}`}
                               >
                                 <option value="pendiente">Pendiente</option>
                                 <option value="pagado">Pagado</option>
                                 <option value="reembolsado">Reembolsado</option>
                               </select>
                               {isUpdating && (
-                                <div className="absolute inset-0 bg-white/70 flex items-center justify-center rounded">
-                                  <RefreshCw className="w-3 h-3 animate-spin text-gray-500" />
+                                <div className="absolute inset-0 bg-white/70 flex items-center justify-center rounded-xl">
+                                  <RefreshCw className="w-3 h-3 animate-spin text-[#00BFFF]" />
                                 </div>
                               )}
                             </div>
@@ -6099,19 +6188,19 @@ export default function AdminPanel({
                                 <button
                                   onClick={() => handleConfirmOrderChanges(order.id)}
                                   disabled={isUpdating}
-                                  className="px-3 py-1 bg-[#059669] hover:bg-[#047857] text-white font-black rounded-full text-[10px] uppercase tracking-wider flex items-center gap-1 cursor-pointer shadow-md transition animate-pulse active:scale-95"
+                                  className="px-3 py-1 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-montserrat font-bold rounded-full text-[10px] uppercase tracking-wider flex items-center gap-1 cursor-pointer shadow-2xs transition active:scale-95"
                                   title="Confirmar cambios de estado en la base de datos"
                                 >
-                                  <Check className="w-3 h-3 stroke-[3]" />
+                                  <Check className="w-3.5 h-3.5 text-[#005da9] stroke-[3]" />
                                   <span>Confirmar</span>
                                 </button>
                               )}
                               <button
                                 onClick={() => setSelectedOrder(order)}
-                                className="px-2.5 py-1 bg-[#0284c7] hover:bg-[#0369a1] text-white rounded-full transition cursor-pointer text-[10px] font-black uppercase tracking-wider shadow-sm flex items-center gap-1 active:scale-95"
+                                className="px-3 py-1 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition cursor-pointer text-[10px] font-montserrat font-bold uppercase tracking-wider shadow-2xs flex items-center gap-1 active:scale-95"
                                 title="Ver Detalle"
                               >
-                                <Eye className="w-3.5 h-3.5 stroke-[2.5]" />
+                                <Eye className="w-3.5 h-3.5 text-[#005da9] stroke-[2.5]" />
                                 <span>Detalle</span>
                               </button>
                             </div>
@@ -6138,13 +6227,17 @@ export default function AdminPanel({
       {/* 1. PRODUCT CREATE/EDIT MODAL */}
       {showProductModal && (
         <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4 backdrop-blur-xs overflow-y-auto">
-          <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[90vh] flex flex-col overflow-hidden text-left">
-            <div className="bg-[#131921] text-white p-4 flex justify-between items-center">
-              <h3 className="font-bold text-sm uppercase tracking-wider flex items-center gap-1.5">
-                <Package className="w-5 h-5 text-[#FF9900]" />
-                {editingProduct ? 'Editar Producto del Catálogo' : 'Añadir Nuevo Producto'}
+          <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[92vh] flex flex-col overflow-hidden text-left border border-[#005da9]/20">
+            {/* Modal Header: Frenyer Brand Gradient */}
+            <div className="bg-gradient-to-r from-[#1D3557] via-[#005da9] to-[#1D3557] text-white p-4.5 flex justify-between items-center shrink-0 shadow-md">
+              <h3 className="font-montserrat font-extrabold text-sm uppercase tracking-wider flex items-center gap-2">
+                <Package className="w-5 h-5 text-[#40E0D0]" />
+                <span>{editingProduct ? 'Editar Producto del Catálogo' : 'Añadir Nuevo Producto'}</span>
               </h3>
-              <button onClick={() => setShowProductModal(false)} className="text-gray-400 hover:text-white transition cursor-pointer">
+              <button 
+                onClick={() => setShowProductModal(false)} 
+                className="text-white/80 hover:text-white p-1 rounded-lg hover:bg-white/10 transition cursor-pointer"
+              >
                 <X className="w-5 h-5" />
               </button>
             </div>
@@ -6153,103 +6246,109 @@ export default function AdminPanel({
               <div className="grid grid-cols-2 gap-4">
                 {/* SKU */}
                 <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">Código SKU</label>
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">Código SKU</label>
                   <input
                     type="text"
                     value={prodSku}
                     onChange={(e) => setProdSku(e.target.value)}
                     required
-                    className="w-full bg-gray-50 border border-gray-300 rounded px-3 py-1.5 text-xs font-mono font-bold focus:ring-1 focus:ring-[#FF9900] focus:outline-none"
+                    className="w-full bg-[#F8F9FA] border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono font-bold text-[#1D3557] focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none transition"
                   />
                 </div>
 
                 {/* Name */}
                 <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">Nombre Completo del Producto</label>
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">Nombre Completo del Producto</label>
                   <input
                     type="text"
                     value={prodName}
                     onChange={(e) => setProdName(e.target.value)}
                     required
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-xs focus:ring-1 focus:ring-[#FF9900] focus:outline-none font-semibold"
+                    className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-semibold text-[#1D3557] focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none transition"
                   />
                 </div>
               </div>
 
               {/* Description */}
               <div>
-                <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">Descripción y Detalles del Producto</label>
+                <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">Descripción y Detalles del Producto</label>
                 <textarea
                   value={prodDescription}
                   onChange={(e) => setProdDescription(e.target.value)}
                   required
                   rows={3}
                   placeholder="Especificaciones, funcionalidades, para qué sirve, etc."
-                  className="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-xs focus:ring-1 focus:ring-[#FF9900] focus:outline-none font-medium leading-relaxed"
+                  className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-medium leading-relaxed text-gray-800 focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none transition"
                 />
               </div>
 
               {/* Cost, Profit & Sale Price Grid */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">
-                    Precio Costo ($ USD) *
-                  </label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    min="0"
-                    value={prodCostPrice}
-                    onChange={(e) => handleCostChange(e.target.value)}
-                    required
-                    placeholder="0.00"
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-xs focus:ring-1 focus:ring-[#FF9900] focus:outline-none font-bold text-gray-900"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">
-                    % Ganancia *
-                  </label>
-                  <div className="relative">
+              <div className="bg-[#F8F9FA] p-3.5 rounded-xl border border-gray-200 space-y-2.5">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
+                  <div>
+                    <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
+                      Precio Costo ($ USD) *
+                    </label>
                     <input
                       type="number"
                       step="0.01"
-                      value={prodMargin1}
-                      onChange={(e) => handleMarginChange(e.target.value)}
-                      placeholder="30.00"
-                      className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-xs focus:ring-1 focus:ring-[#FF9900] focus:outline-none font-black text-[#131921] pr-7"
+                      min="0"
+                      value={prodCostPrice}
+                      onChange={(e) => handleCostChange(e.target.value)}
+                      required
+                      placeholder="0.00"
+                      className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono font-bold text-[#1D3557] focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none transition"
                     />
-                    <span className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 font-black text-xs pointer-events-none">%</span>
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
+                      % Ganancia *
+                    </label>
+                    <div className="relative">
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={prodMargin1}
+                        onChange={(e) => handleMarginChange(e.target.value)}
+                        placeholder="30.00"
+                        className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono font-bold text-[#1D3557] focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none pr-7 transition"
+                      />
+                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 font-black text-xs pointer-events-none">%</span>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
+                      Precio Final Ventas *
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      value={prodPrice}
+                      onChange={(e) => handlePriceChange(e.target.value)}
+                      required
+                      placeholder="0.00"
+                      className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono font-extrabold text-emerald-700 focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none transition"
+                    />
                   </div>
                 </div>
 
-                <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">
-                    Precio Final Ventas *
-                  </label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    min="0"
-                    value={prodPrice}
-                    onChange={(e) => handlePriceChange(e.target.value)}
-                    required
-                    placeholder="0.00"
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-xs focus:ring-1 focus:ring-[#FF9900] focus:outline-none font-black text-gray-900"
-                  />
-                  <p className="text-[9px] text-emerald-700 font-bold mt-1">
-                    💡 Ganancia neta: ${(
+                <div className="flex items-center gap-1.5 text-[11px] font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-md border border-emerald-200/60 w-fit">
+                  <span>💡 Ganancia neta:</span>
+                  <span className="font-mono font-black">
+                    ${(
                       Math.max(0, (typeof prodPrice === 'number' ? prodPrice : parseFloat(String(prodPrice).replace(',', '.')) || 0) - (parseFloat(String(prodCostPrice).replace(',', '.')) || 0))
                     ).toFixed(2)} USD
-                  </p>
+                  </span>
                 </div>
               </div>
 
               {/* Offer, Stock & Units Grid */}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
                     Precio Oferta
                   </label>
                   <input
@@ -6259,12 +6358,12 @@ export default function AdminPanel({
                     value={prodOfferPrice}
                     onChange={(e) => setProdOfferPrice(e.target.value)}
                     placeholder="Ninguno"
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-xs focus:ring-1 focus:ring-[#FF9900] focus:outline-none font-bold text-red-600"
+                    className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-bold text-red-600 focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none transition"
                   />
                 </div>
 
                 <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
                     Stock Actual *
                   </label>
                   <input
@@ -6273,19 +6372,19 @@ export default function AdminPanel({
                     value={prodStock}
                     onChange={(e) => setProdStock(Number(e.target.value))}
                     required
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-xs focus:ring-1 focus:ring-[#FF9900] focus:outline-none font-bold text-gray-900"
+                    className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-bold text-[#1D3557] focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none transition"
                   />
                 </div>
 
                 <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
                     Unidades *
                   </label>
                   <select
                     value={prodUnit}
                     onChange={(e) => setProdUnit(e.target.value)}
                     required
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-xs focus:ring-1 focus:ring-[#FF9900] focus:outline-none font-bold text-gray-900 cursor-pointer"
+                    className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-bold text-[#1D3557] focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none cursor-pointer transition"
                   >
                     {[
                       'Unidad',
@@ -6334,12 +6433,12 @@ export default function AdminPanel({
               <div className="grid grid-cols-2 gap-4">
                 {/* Category ID */}
                 <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">Categoría del Catálogo</label>
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">Categoría del Catálogo</label>
                   <select
                     value={prodCategoryId}
                     onChange={(e) => setProdCategoryId(e.target.value)}
                     required
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-xs focus:ring-1 focus:ring-[#FF9900] focus:outline-none font-semibold cursor-pointer"
+                    className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-semibold text-[#1D3557] focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none cursor-pointer transition"
                   >
                     {categories.map(c => (
                       <option key={c.id} value={c.id}>{c.name}</option>
@@ -6349,12 +6448,12 @@ export default function AdminPanel({
 
                 {/* Brand ID */}
                 <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">Marca o Fabricante</label>
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">Marca o Fabricante</label>
                   <select
                     value={prodBrandId}
                     onChange={(e) => setProdBrandId(e.target.value)}
                     required
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-xs focus:ring-1 focus:ring-[#FF9900] focus:outline-none font-semibold cursor-pointer"
+                    className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-semibold text-[#1D3557] focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none cursor-pointer transition"
                   >
                     {brands.map(b => (
                       <option key={b.id} value={b.id}>{b.name}</option>
@@ -6366,7 +6465,7 @@ export default function AdminPanel({
               {/* Stock Crítico & Ubicación */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
                     Stock Crítico *
                   </label>
                   <input
@@ -6376,20 +6475,20 @@ export default function AdminPanel({
                     onChange={(e) => setProdCriticalStock(e.target.value)}
                     required
                     placeholder="5"
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-xs font-bold text-red-600 focus:ring-1 focus:ring-[#FF9900] focus:outline-none"
+                    className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-bold text-red-600 focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none transition"
                   />
                   <p className="text-[9px] text-gray-400 font-medium mt-1">Umbral mínimo de alerta para reabastecimiento</p>
                 </div>
 
                 <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
                     Ubicación *
                   </label>
                   <select
                     value={prodLocation}
                     onChange={(e) => setProdLocation(e.target.value)}
                     required
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-xs font-bold text-gray-900 focus:ring-1 focus:ring-[#FF9900] focus:outline-none cursor-pointer"
+                    className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-bold text-[#1D3557] focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none cursor-pointer transition"
                   >
                     {businessBranchesList.map(branch => {
                       const displayLabel = branch.code ? `${branch.name} (${branch.code})` : branch.name;
@@ -6413,7 +6512,7 @@ export default function AdminPanel({
               {/* Impuesto Trasladado a Factura & Fecha Expiración */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
                     Impuesto *
                   </label>
                   <select
@@ -6428,7 +6527,7 @@ export default function AdminPanel({
                         setProdTaxRate(found ? found.rate : 0);
                       }
                     }}
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-xs font-bold text-gray-900 focus:ring-1 focus:ring-[#FF9900] focus:outline-none cursor-pointer"
+                    className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-bold text-[#1D3557] focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none cursor-pointer transition"
                   >
                     <option value="exento">Exento / Sin Impuesto (0%)</option>
                     {adminTaxes.filter(t => t.is_active !== false).map((tax) => (
@@ -6440,55 +6539,241 @@ export default function AdminPanel({
                 </div>
 
                 <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
                     Fecha Expiración (Opcional)
                   </label>
                   <input
                     type="date"
                     value={prodExpirationDate}
                     onChange={(e) => setProdExpirationDate(e.target.value)}
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-xs font-bold text-gray-900 focus:ring-1 focus:ring-[#FF9900] focus:outline-none cursor-pointer"
+                    className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs font-bold text-[#1D3557] focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none cursor-pointer transition"
                   />
                 </div>
               </div>
 
-              {/* Image URL(s) */}
-              <div>
-                <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">
-                  Enlace(s) de Imágenes (Múltiples separados por comas)
-                </label>
-                <input
-                  type="text"
-                  value={prodImageUrl}
-                  onChange={(e) => setProdImageUrl(e.target.value)}
-                  placeholder="https://example.com/img1.jpg, https://example.com/img2.jpg"
-                  className="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-xs focus:ring-1 focus:ring-[#FF9900] focus:outline-none"
-                />
-                <p className="text-[10px] text-gray-400 mt-1">Sugerencia: puedes usar enlaces directos de Unsplash o cualquier servidor de imágenes.</p>
+              {/* ========================================================
+                  PRODUCT IMAGES DUAL-MODE SELECTOR (MUTUALLY EXCLUSIVE)
+                  - Option 1: File Upload (Imagen 1 & Imagen 2)
+                  - Option 2: Image URLs (Imagen 3)
+                  ======================================================== */}
+              <div className="p-3.5 bg-[#F8F9FA] border border-gray-200 rounded-xl space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-gray-200/80 pb-2.5">
+                  <div>
+                    <label className="block text-[11px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider">
+                      Gestión de Imágenes del Producto
+                    </label>
+                    <p className="text-[10px] text-gray-500 font-medium">
+                      Elige una de las 2 formas exclusivas para cargar las fotos
+                    </p>
+                  </div>
+                  <div className="inline-flex bg-white p-1 rounded-xl border border-gray-300 shadow-2xs self-start sm:self-auto">
+                    <button
+                      type="button"
+                      onClick={() => setProdImageMode('upload')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-montserrat font-extrabold transition-all flex items-center gap-1.5 cursor-pointer ${
+                        prodImageMode === 'upload'
+                          ? 'bg-[#005da9] text-white shadow-xs'
+                          : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
+                      }`}
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      <span>Subir Archivos (Opción 1 y 2)</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setProdImageMode('url')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-montserrat font-extrabold transition-all flex items-center gap-1.5 cursor-pointer ${
+                        prodImageMode === 'url'
+                          ? 'bg-[#005da9] text-white shadow-xs'
+                          : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
+                      }`}
+                    >
+                      <Link2 className="w-3.5 h-3.5" />
+                      <span>Cargar Enlaces (Opción 3)</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* OPCIÓN 1: SUBIR ARCHIVOS (IMÁGENES 1 Y 2) */}
+                {prodImageMode === 'upload' && (
+                  <div className="space-y-3">
+                    {/* Hidden inputs for file picking and replacing */}
+                    <input
+                      type="file"
+                      ref={prodFileInputRef}
+                      onChange={(e) => {
+                        handleImageFilesChange(e.target.files);
+                        if (e.target) e.target.value = '';
+                      }}
+                      multiple
+                      accept="image/png,image/jpeg,image/webp,image/jpg"
+                      className="hidden"
+                    />
+                    <input
+                      type="file"
+                      ref={prodReplaceInputRef}
+                      onChange={(e) => {
+                        if (e.target.files && e.target.files[0] && slotReplaceIndex !== null) {
+                          handleReplaceUploadedImage(slotReplaceIndex, e.target.files[0]);
+                        }
+                        if (e.target) e.target.value = '';
+                      }}
+                      accept="image/png,image/jpeg,image/webp,image/jpg"
+                      className="hidden"
+                    />
+
+                    {/* ESTADO VACÍO (IMAGEN 1): ZONA DE CARGA CON BORDE PUNTEADO AZUL */}
+                    {prodUploadedImages.length === 0 ? (
+                      <div
+                        onClick={() => prodFileInputRef.current?.click()}
+                        onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          if (e.dataTransfer.files) handleImageFilesChange(e.dataTransfer.files);
+                        }}
+                        className="w-full bg-[#EAF5FF] border-2 border-dashed border-[#0099FF] rounded-2xl py-7 px-4 text-center cursor-pointer hover:bg-[#DDF0FF] transition shadow-2xs flex flex-col items-center justify-center group"
+                      >
+                        {isUploadingImages ? (
+                          <div className="flex flex-col items-center justify-center py-2">
+                            <div className="w-8 h-8 border-3 border-[#0077CC]/30 border-t-[#0077CC] rounded-full animate-spin mb-2"></div>
+                            <span className="text-xs font-bold text-[#0077CC]">Procesando y guardando imagen...</span>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="w-8 h-8 flex items-center justify-center text-[#0077CC] mb-1 group-hover:-translate-y-1 transition-transform">
+                              <ArrowUp className="w-7 h-7 stroke-[2.5]" />
+                            </div>
+                            <div className="text-sm md:text-[15px] font-bold text-[#0077CC]">
+                              Carga hasta 3 imagenes
+                            </div>
+                            <div className="text-xs text-[#0077CC]/90 mt-1 font-medium max-w-md">
+                              Recomendamos: Tamaño de 500 x 500 px, formato PNG y peso máximo 2MB.
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    ) : (
+                      /* ESTADO CON IMÁGENES CARGADAS (IMAGEN 2): PORTADA + SLOTS */
+                      <div className="space-y-2">
+                        <div className="text-xs font-bold text-[#1D3557] tracking-tight">
+                          Datos del producto
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-3.5">
+                          {prodUploadedImages.map((imgUrl, idx) => (
+                            <div
+                              key={idx}
+                              className="w-28 h-28 relative rounded-xl overflow-hidden border border-gray-200 shadow-2xs flex flex-col justify-end group bg-white shrink-0"
+                            >
+                              <img
+                                src={imgUrl}
+                                alt={`Producto ${idx + 1}`}
+                                className="w-full h-full object-cover absolute inset-0"
+                              />
+
+                              {/* Barra inferior Portada / Slot adicional */}
+                              <div className="relative z-10 bg-[#1D3557]/95 text-white px-2 py-1 flex items-center justify-between text-[10px] font-bold">
+                                <span className="truncate">{idx === 0 ? 'Portada' : `Imagen ${idx + 1}`}</span>
+                                <div className="flex items-center gap-1 shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setSlotReplaceIndex(idx);
+                                      prodReplaceInputRef.current?.click();
+                                    }}
+                                    className="p-1 bg-white/20 hover:bg-white text-white hover:text-[#1D3557] rounded-full transition cursor-pointer"
+                                    title="Cambiar imagen"
+                                  >
+                                    <Edit3 className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleRemoveUploadedImage(idx);
+                                    }}
+                                    className="p-1 bg-white/20 hover:bg-red-500 text-white rounded-full transition cursor-pointer"
+                                    title="Eliminar imagen"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+
+                          {/* Slot azul punteado para añadir más imágenes (hasta 3) */}
+                          {prodUploadedImages.length < 3 && (
+                            <button
+                              type="button"
+                              onClick={() => prodFileInputRef.current?.click()}
+                              disabled={isUploadingImages}
+                              className="w-28 h-28 rounded-2xl border-2 border-dashed border-[#0099FF] bg-[#EAF5FF] hover:bg-[#DDF0FF] flex flex-col items-center justify-center p-2 text-center cursor-pointer transition shadow-2xs group active:scale-95 disabled:opacity-50 shrink-0"
+                            >
+                              {isUploadingImages ? (
+                                <div className="w-7 h-7 border-2 border-[#0077CC]/30 border-t-[#0077CC] rounded-full animate-spin"></div>
+                              ) : (
+                                <>
+                                  <div className="w-8 h-8 rounded-full border-2 border-[#0077CC] flex items-center justify-center text-[#0077CC] mb-1.5 group-hover:scale-110 transition-transform">
+                                    <Plus className="w-5 h-5 stroke-[3]" />
+                                  </div>
+                                  <span className="text-[11px] font-bold text-[#0077CC] leading-tight px-1">
+                                    Añade {3 - prodUploadedImages.length} {3 - prodUploadedImages.length === 1 ? 'imagen' : 'imágenes'} más
+                                  </span>
+                                </>
+                              )}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* OPCIÓN 2: ENLACE(S) DE IMÁGENES POR URL (IMAGEN 3) */}
+                {prodImageMode === 'url' && (
+                  <div className="space-y-1">
+                    <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider">
+                      ENLACE(S) DE IMÁGENES (MÚLTIPLES SEPARADOS POR COMAS)
+                    </label>
+                    <input
+                      type="text"
+                      value={prodImageUrl}
+                      onChange={(e) => setProdImageUrl(e.target.value)}
+                      placeholder="https://raw.githubusercontent.com/copiasbellavistafp-sys/imagenes-tortas/main/sublimado-copias-bella-vista.jpg"
+                      className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs focus:ring-2 focus:ring-[#005da9] focus:outline-none font-mono text-gray-800"
+                    />
+                    <p className="text-[10px] text-gray-400 font-medium mt-1">
+                      Sugerencia: puedes usar enlaces directos de Unsplash o cualquier servidor de imágenes.
+                    </p>
+                  </div>
+                )}
               </div>
 
               {/* Technical Sheet PDF link & Barcode/QR code */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1">Enlace de Ficha Técnica PDF Oficial (Opcional)</label>
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">Enlace de Ficha Técnica PDF Oficial (Opcional)</label>
                   <input
                     type="url"
                     value={prodTechUrl}
                     onChange={(e) => setProdTechUrl(e.target.value)}
                     placeholder="https://example.com/technical-specs.pdf"
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-xs focus:ring-1 focus:ring-[#FF9900] focus:outline-none"
+                    className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none transition"
                   />
                 </div>
                 <div>
-                  <label className="block text-[10px] font-black text-gray-400 uppercase tracking-wide mb-1 flex items-center justify-between">
+                  <label className="block text-[10px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1 flex items-center justify-between">
                     <span className="flex items-center gap-1">
-                      <Barcode className="w-3.5 h-3.5 text-gray-500" />
+                      <Barcode className="w-3.5 h-3.5 text-[#005da9]" />
                       Código de Barras / QR (Opcional)
                     </span>
                     <button
                       type="button"
                       onClick={() => setShowProductFormScanner(true)}
-                      className="text-[#FF9900] hover:text-[#e08800] text-[9px] font-black uppercase flex items-center gap-0.5 cursor-pointer bg-[#FF9900]/10 px-1.5 py-0.5 rounded-md"
+                      className="text-[#005da9] hover:text-[#004b88] text-[9px] font-montserrat font-extrabold uppercase flex items-center gap-0.5 cursor-pointer bg-[#005da9]/10 hover:bg-[#005da9]/20 px-2 py-0.5 rounded-md transition"
                     >
                       📷 Escanear
                     </button>
@@ -6498,7 +6783,7 @@ export default function AdminPanel({
                     value={prodBarcodeQr}
                     onChange={(e) => setProdBarcodeQr(e.target.value)}
                     placeholder="Ej: 7591234567890 o enlace QR"
-                    className="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-xs focus:ring-1 focus:ring-[#FF9900] focus:outline-none font-mono"
+                    className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-xs focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] focus:outline-none font-mono text-[#1D3557] transition"
                   />
                   {showProductFormScanner && (
                     <Suspense fallback={<AdminSubmoduleLoader name="Lector de Códigos" />}>
@@ -6516,23 +6801,23 @@ export default function AdminPanel({
               </div>
 
               {/* Featured & Active checkboxes */}
-              <div className="flex flex-col gap-3 p-3 bg-gray-50/50 border border-gray-900 rounded-lg">
-                <div className="flex gap-6 items-center">
-                  <label className="flex items-center gap-2 text-xs font-bold text-gray-700 cursor-pointer">
+              <div className="flex flex-col gap-3 p-3.5 bg-[#F8F9FA] border border-gray-200 rounded-xl">
+                <div className="flex flex-wrap gap-6 items-center">
+                  <label className="flex items-center gap-2 text-xs font-bold text-[#1D3557] cursor-pointer select-none">
                     <input
                       type="checkbox"
                       checked={prodFeatured}
                       onChange={(e) => setProdFeatured(e.target.checked)}
-                      className="w-4 h-4 rounded text-[#FF9900] focus:ring-[#FF9900] accent-[#FF9900]"
+                      className="w-4 h-4 rounded text-[#005da9] focus:ring-[#005da9] accent-[#005da9]"
                     />
                     <span>Destacar en Inicio (Oferta Principal)</span>
                   </label>
-                  <label className="flex items-center gap-2 text-xs font-bold text-gray-700 cursor-pointer">
+                  <label className="flex items-center gap-2 text-xs font-bold text-[#1D3557] cursor-pointer select-none">
                     <input
                       type="checkbox"
                       checked={prodActive}
                       onChange={(e) => setProdActive(e.target.checked)}
-                      className="w-4 h-4 rounded text-[#FF9900] focus:ring-[#FF9900] accent-[#FF9900]"
+                      className="w-4 h-4 rounded text-[#005da9] focus:ring-[#005da9] accent-[#005da9]"
                     />
                     <span>Activo y Visible en Catálogo Público</span>
                   </label>
@@ -6541,8 +6826,8 @@ export default function AdminPanel({
                 {prodFeatured && (
                   <div className="flex gap-4 items-center border-t border-gray-200 pt-3 mt-1">
                     <div className="flex-1">
-                      <label className="block text-xs font-bold text-gray-700 mb-1 flex items-center gap-1">
-                        <Star className="w-3.5 h-3.5 text-[#FF9900] fill-[#FF9900]" />
+                      <label className="block text-xs font-bold text-[#1D3557] mb-1 flex items-center gap-1">
+                        <Star className="w-3.5 h-3.5 text-amber-400 fill-amber-400" />
                         Calificación Manual (Estrellas 1-5)
                       </label>
                       <input
@@ -6552,11 +6837,11 @@ export default function AdminPanel({
                         step="0.5"
                         value={prodRatingStars}
                         onChange={(e) => setProdRatingStars(Number(e.target.value))}
-                        className="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-xs focus:ring-1 focus:ring-[#FF9900]"
+                        className="w-full bg-white border border-gray-300 rounded-lg px-3 py-1.5 text-xs focus:ring-2 focus:ring-[#005da9] focus:outline-none"
                       />
                     </div>
                     <div className="flex-1">
-                      <label className="block text-xs font-bold text-gray-700 mb-1">
+                      <label className="block text-xs font-bold text-[#1D3557] mb-1">
                         Número de Usuarios (Reviews)
                       </label>
                       <input
@@ -6564,7 +6849,7 @@ export default function AdminPanel({
                         min="0"
                         value={prodRatingCount}
                         onChange={(e) => setProdRatingCount(Number(e.target.value))}
-                        className="w-full bg-white border border-gray-300 rounded px-3 py-1.5 text-xs focus:ring-1 focus:ring-[#FF9900]"
+                        className="w-full bg-white border border-gray-300 rounded-lg px-3 py-1.5 text-xs focus:ring-2 focus:ring-[#005da9] focus:outline-none"
                       />
                     </div>
                   </div>
@@ -6572,21 +6857,22 @@ export default function AdminPanel({
               </div>
 
               {/* Footer Save button */}
-              <div className="pt-4 border-t border-gray-200 flex justify-end gap-2">
+              <div className="pt-4 border-t border-gray-200 flex justify-end gap-2.5">
                 <button
                   type="button"
                   onClick={() => setShowProductModal(false)}
-                  className="px-4 py-2 border border-gray-300 text-gray-700 rounded text-xs font-bold hover:bg-gray-50 cursor-pointer"
+                  className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-xs font-montserrat font-bold shadow-2xs transition cursor-pointer active:scale-98 flex items-center gap-1.5"
                 >
-                  Cancelar
+                  <X className="w-4 h-4 text-[#005da9]" />
+                  <span>Cancelar</span>
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-[#FF9900] hover:bg-[#e68a00] text-[#131921] font-black rounded text-xs flex items-center gap-1.5 cursor-pointer shadow-md"
+                  className="px-5 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-xs font-montserrat font-bold shadow-2xs hover:shadow-xs transition cursor-pointer active:scale-98 flex items-center gap-2"
                   id="btn-save-product-modal"
                 >
-                  <Check className="w-4 h-4" />
-                  {editingProduct ? 'Guardar Modificaciones' : 'Guardar Producto'}
+                  <Check className="w-4 h-4 text-[#005da9] stroke-[2.5]" />
+                  <span>{editingProduct ? 'Guardar Modificaciones' : 'Guardar Producto'}</span>
                 </button>
               </div>
             </form>
@@ -6677,21 +6963,36 @@ export default function AdminPanel({
                 <button
                   type="button"
                   onClick={() => setMovementModalProd(null)}
-                  className="px-4 py-2 border border-gray-300 text-gray-700 rounded text-xs font-bold hover:bg-gray-50 cursor-pointer"
+                  className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs text-xs font-bold font-montserrat cursor-pointer active:scale-98"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-[#FF9900] hover:bg-[#e68a00] text-[#131921] font-black rounded text-xs flex items-center gap-1.5 cursor-pointer shadow-md"
+                  className="px-5 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs flex items-center gap-1.5 cursor-pointer font-montserrat font-bold text-xs active:scale-98"
                 >
-                  <Check className="w-4 h-4" />
+                  <Check className="w-4 h-4 text-[#005da9]" />
                   <span>Registrar Movimiento</span>
                 </button>
               </div>
             </form>
           </div>
         </div>
+      )}
+
+      {/* 1.2 PRODUCT HISTORY & KARDEX MODAL */}
+      {historyModalProd && (
+        <Suspense fallback={null}>
+          <ProductHistoryModal
+            product={historyModalProd}
+            onClose={() => setHistoryModalProd(null)}
+            onStockUpdated={(newStock) => {
+              if (onRefreshData) onRefreshData();
+            }}
+            currencySymbol={activeCurrency === 'USD' ? '$' : activeCurrency === 'VES' ? 'Bs. ' : `${activeCurrency} `}
+            bcvRate={bcvRate}
+          />
+        </Suspense>
       )}
 
       {/* 2. CATEGORY CREATE/EDIT MODAL */}
@@ -6762,17 +7063,18 @@ export default function AdminPanel({
                 <button
                   type="button"
                   onClick={() => setShowCategoryModal(false)}
-                  className="px-4 py-2 border border-gray-300 text-gray-700 rounded text-xs font-bold hover:bg-gray-50 cursor-pointer"
+                  className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-xs font-montserrat font-bold shadow-2xs transition cursor-pointer active:scale-98 flex items-center gap-1.5"
                 >
-                  Cancelar
+                  <X className="w-4 h-4 text-[#005da9]" />
+                  <span>Cancelar</span>
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-[#FF9900] hover:bg-[#e68a00] text-[#131921] font-black rounded text-xs flex items-center gap-1.5 cursor-pointer shadow-md"
+                  className="px-5 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-xs font-montserrat font-bold shadow-2xs hover:shadow-xs transition cursor-pointer active:scale-98 flex items-center gap-1.5"
                   id="btn-save-category-modal"
                 >
-                  <Check className="w-4 h-4" />
-                  {editingCategory ? 'Guardar Modificaciones' : 'Guardar Categoría'}
+                  <Check className="w-4 h-4 text-[#005da9]" />
+                  <span>{editingCategory ? 'Guardar Modificaciones' : 'Guardar Categoría'}</span>
                 </button>
               </div>
             </form>
@@ -6836,17 +7138,18 @@ export default function AdminPanel({
                 <button
                   type="button"
                   onClick={() => setShowBrandModal(false)}
-                  className="px-4 py-2 border border-gray-300 text-gray-700 rounded text-xs font-bold hover:bg-gray-50 cursor-pointer"
+                  className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-xs font-montserrat font-bold shadow-2xs transition cursor-pointer active:scale-98 flex items-center gap-1.5"
                 >
-                  Cancelar
+                  <X className="w-4 h-4 text-[#005da9]" />
+                  <span>Cancelar</span>
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-[#FF9900] hover:bg-[#e68a00] text-[#131921] font-black rounded text-xs flex items-center gap-1.5 cursor-pointer shadow-md"
+                  className="px-5 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-xs font-montserrat font-bold shadow-2xs hover:shadow-xs transition cursor-pointer active:scale-98 flex items-center gap-1.5"
                   id="btn-save-brand-modal"
                 >
-                  <Check className="w-4 h-4" />
-                  {editingBrand ? 'Guardar Modificaciones' : 'Guardar Marca'}
+                  <Check className="w-4 h-4 text-[#005da9]" />
+                  <span>{editingBrand ? 'Guardar Modificaciones' : 'Guardar Marca'}</span>
                 </button>
               </div>
             </form>
@@ -6857,54 +7160,54 @@ export default function AdminPanel({
       {/* 4. ORDER DETAILS MODAL */}
       {selectedOrder && (
         <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4 backdrop-blur-xs overflow-y-auto">
-          <div className="bg-white rounded-xl shadow-2xl max-w-3xl w-full max-h-[90vh] flex flex-col overflow-hidden text-left border border-gray-200">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-3xl w-full max-h-[90vh] flex flex-col overflow-hidden text-left border border-gray-200">
             {/* Header */}
-            <div className="bg-[#131921] text-white p-4 flex justify-between items-center">
+            <div className="bg-[#1D3557] text-white p-4 flex justify-between items-center">
               <div>
-                <h3 className="font-black text-sm uppercase tracking-wider flex items-center gap-2">
-                  <ClipboardList className="w-5 h-5 text-[#008296]" />
+                <h3 className="font-montserrat font-extrabold text-sm uppercase tracking-wider flex items-center gap-2 text-white">
+                  <ClipboardList className="w-5 h-5 text-[#40E0D0]" />
                   <span>Detalle de Pedido #{String(selectedOrder.order_number || '').padStart(7, '0')}</span>
                 </h3>
-                <p className="text-[10px] text-gray-400 mt-0.5 font-mono">
+                <p className="text-[10px] text-gray-200 mt-0.5 font-mono">
                   ID: {selectedOrder.id || 'N/A'} • Recibido: {selectedOrder.created_at ? new Date(selectedOrder.created_at).toLocaleString() : 'N/A'}
                 </p>
               </div>
-              <button onClick={() => setSelectedOrder(null)} className="text-gray-400 hover:text-white transition cursor-pointer">
+              <button onClick={() => setSelectedOrder(null)} className="text-gray-300 hover:text-white transition cursor-pointer">
                 <X className="w-5 h-5" />
               </button>
             </div>
 
             {/* Content (Scrollable Grid) */}
-            <div className="p-5 overflow-y-auto flex-1 grid grid-cols-1 md:grid-cols-12 gap-5 leading-normal text-xs text-gray-700">
+            <div className="p-5 overflow-y-auto flex-1 grid grid-cols-1 md:grid-cols-12 gap-5 leading-normal text-xs text-[#2B2D42]">
               
               {/* Left Column: Customer and Payment details (col-span-5) */}
               <div className="md:col-span-5 space-y-4">
                 
                 {/* Section: Customer Info */}
-                <div className="bg-gray-50 border border-gray-200 rounded-lg p-3.5 space-y-2.5">
-                  <h4 className="font-extrabold text-[#131921] uppercase tracking-wider text-[10px] border-b border-gray-200 pb-1.5 flex items-center gap-1.5">
+                <div className="bg-[#F8F9FA] border border-gray-200 rounded-2xl p-4 space-y-2.5">
+                  <h4 className="font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider text-[10px] border-b border-gray-200 pb-1.5 flex items-center gap-1.5">
                     Cliente / Contacto
                   </h4>
                   
                   <div className="space-y-1">
                     <p className="text-xs text-gray-400 font-bold uppercase tracking-wide text-[9px]">Nombre completo</p>
-                    <p className="font-black text-gray-950 text-sm">{selectedOrder.customer_name}</p>
+                    <p className="font-montserrat font-black text-[#1D3557] text-sm">{selectedOrder.customer_name}</p>
                   </div>
 
                   <div className="space-y-1">
                     <p className="text-xs text-gray-400 font-bold uppercase tracking-wide text-[9px]">Teléfono de contacto</p>
-                    <p className="font-black text-gray-900 font-mono text-xs">{selectedOrder.phone_number}</p>
+                    <p className="font-bold text-[#2B2D42] font-mono text-xs">{selectedOrder.phone_number}</p>
                   </div>
 
                   {/* WhatsApp contact template selector */}
                   <div className="pt-2 border-t border-gray-200 mt-2 space-y-2">
-                    <label className="block text-[9px] font-black text-gray-400 uppercase tracking-wider">
+                    <label className="block text-[9px] font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider">
                       Plantilla de Mensaje (WhatsApp)
                     </label>
                     <select
                       value={waTemplate}
                       onChange={(e) => setWaTemplate(e.target.value as any)}
-                      className="w-full text-xs font-bold bg-white border border-gray-300 rounded p-1.5 text-[#0F1111] focus:outline-none focus:ring-1 focus:ring-emerald-500 cursor-pointer"
+                      className="w-full text-xs font-bold bg-white border border-gray-300 rounded-xl p-2 text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] cursor-pointer"
                     >
                       <option value="default">1. Predeterminado (Datos + Capture)</option>
                       <option value="availability">2. Disponibilidad de Producto</option>
@@ -6913,7 +7216,7 @@ export default function AdminPanel({
                     </select>
 
                     {/* Simple Message Preview */}
-                    <div className="bg-emerald-50 border border-emerald-100 p-2 rounded text-[10px] text-gray-700 max-h-24 overflow-y-auto whitespace-pre-line font-medium leading-relaxed">
+                    <div className="bg-emerald-50 border border-emerald-100 p-2.5 rounded-xl text-[10px] text-gray-700 max-h-24 overflow-y-auto whitespace-pre-line font-medium leading-relaxed">
                       <span className="font-bold text-emerald-800 text-[9px] block mb-1 uppercase tracking-wide">Vista previa del mensaje:</span>
                       {getWhatsAppMessageText(selectedOrder, waTemplate)}
                     </div>
@@ -6925,25 +7228,26 @@ export default function AdminPanel({
                       target="_blank"
                       referrerPolicy="no-referrer"
                       rel="noopener noreferrer"
-                      className="inline-flex items-center justify-center gap-2 w-full py-2.5 bg-[#25D366] hover:bg-[#128C7E] text-white font-black rounded-full text-xs transition shadow-md hover:shadow-lg cursor-pointer text-center uppercase tracking-wider active:scale-98"
+                      className="inline-flex items-center justify-center gap-2 w-full py-2.5 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-montserrat font-bold rounded-full text-xs transition shadow-2xs hover:shadow-xs cursor-pointer text-center uppercase tracking-wider active:scale-98"
                     >
-                      <span>💬 Contactar por WhatsApp</span>
+                      <MessageSquare className="w-4 h-4 text-[#005da9]" />
+                      <span>Contactar por WhatsApp</span>
                     </a>
                   </div>
                 </div>
 
                 {/* Section: Delivery info */}
-                <div className="bg-gray-50 border border-gray-200 rounded-lg p-3.5 space-y-2.5">
-                  <h4 className="font-extrabold text-[#131921] uppercase tracking-wider text-[10px] border-b border-gray-200 pb-1.5 flex items-center gap-1.5">
+                <div className="bg-[#F8F9FA] border border-gray-200 rounded-2xl p-4 space-y-2.5">
+                  <h4 className="font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider text-[10px] border-b border-gray-200 pb-1.5 flex items-center gap-1.5">
                     Método de Entrega
                   </h4>
 
                   <div className="space-y-1">
                     <p className="text-xs text-gray-400 font-bold uppercase tracking-wide text-[9px]">Tipo de entrega</p>
-                    <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black ${
+                    <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-montserrat font-extrabold ${
                       selectedOrder.delivery_method === 'retiro' 
                         ? 'bg-amber-100 text-amber-800' 
-                        : 'bg-sky-100 text-sky-800'
+                        : 'bg-[#1D3557]/10 text-[#1D3557]'
                     }`}>
                       {selectedOrder.delivery_method === 'retiro' ? <Store className="w-3.5 h-3.5" /> : <Truck className="w-3.5 h-3.5" />}
                       {selectedOrder.delivery_method === 'retiro' ? 'Retiro en Tienda' : 'Envío a Domicilio'}
@@ -6953,7 +7257,7 @@ export default function AdminPanel({
                   {selectedOrder.delivery_method !== 'retiro' && (
                     <div className="space-y-1">
                       <p className="text-xs text-gray-400 font-bold uppercase tracking-wide text-[9px]">Dirección de Envío</p>
-                      <p className="font-bold text-gray-800 text-xs bg-white border border-gray-150 p-2 rounded leading-relaxed">
+                      <p className="font-bold text-[#2B2D42] text-xs bg-white border border-gray-150 p-2 rounded-xl leading-relaxed">
                         {selectedOrder.address_text || 'No proporcionada'}
                       </p>
                     </div>
@@ -6962,7 +7266,7 @@ export default function AdminPanel({
                   {selectedOrder.comments && (
                     <div className="space-y-1">
                       <p className="text-xs text-gray-400 font-bold uppercase tracking-wide text-[9px]">Comentarios / Observaciones</p>
-                      <p className="text-xs text-gray-600 bg-amber-50 border border-amber-100 p-2 rounded leading-relaxed italic">
+                      <p className="text-xs text-gray-700 bg-amber-50 border border-amber-100 p-2 rounded-xl leading-relaxed italic">
                         "{selectedOrder.comments}"
                       </p>
                     </div>
@@ -6970,15 +7274,15 @@ export default function AdminPanel({
                 </div>
 
                 {/* Section: Payment Info */}
-                <div className="bg-gray-50 border border-gray-200 rounded-lg p-3.5 space-y-2.5">
-                  <h4 className="font-extrabold text-[#131921] uppercase tracking-wider text-[10px] border-b border-gray-200 pb-1.5 flex items-center gap-1.5">
+                <div className="bg-[#F8F9FA] border border-gray-200 rounded-2xl p-4 space-y-2.5">
+                  <h4 className="font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider text-[10px] border-b border-gray-200 pb-1.5 flex items-center gap-1.5">
                     Información de Pago
                   </h4>
 
                   <div className="grid grid-cols-2 gap-3">
                     <div className="space-y-1">
                       <p className="text-xs text-gray-400 font-bold uppercase tracking-wide text-[9px]">Método</p>
-                      <p className="font-black text-gray-900 capitalize text-xs">
+                      <p className="font-montserrat font-extrabold text-[#1D3557] capitalize text-xs">
                         {selectedOrder.payment_method || 'N/A'}
                       </p>
                     </div>
@@ -6986,7 +7290,7 @@ export default function AdminPanel({
                     {selectedOrder.payment_amount_with && (
                       <div className="space-y-1">
                         <p className="text-xs text-gray-400 font-bold uppercase tracking-wide text-[9px]">Paga con</p>
-                        <p className="font-black text-gray-900 text-xs">
+                        <p className="font-montserrat font-black text-[#1D3557] text-xs">
                           ${selectedOrder.payment_amount_with.toFixed(2)}
                         </p>
                       </div>
@@ -6994,7 +7298,7 @@ export default function AdminPanel({
                   </div>
 
                   {selectedOrder.points && (
-                    <div className="bg-sky-50 border border-sky-100 p-2 rounded text-sky-800 text-[11px] font-bold flex items-center gap-1.5">
+                    <div className="bg-sky-50 border border-sky-100 p-2 rounded-xl text-sky-900 text-[11px] font-bold flex items-center gap-1.5">
                       <Star className="w-4 h-4 text-[#FF9900] fill-[#FF9900]" />
                       <span>Generó {selectedOrder.points} puntos de fidelidad.</span>
                     </div>
@@ -7004,23 +7308,23 @@ export default function AdminPanel({
               </div>
 
               {/* Right Column: Ordered Items Table (col-span-7) */}
-              <div className="md:col-span-7 border border-gray-200 rounded-xl overflow-hidden flex flex-col h-full bg-white">
-                <div className="bg-[#131921] text-white py-2 px-3 font-extrabold uppercase tracking-wide text-[10px]">
+              <div className="md:col-span-7 border border-gray-200 rounded-2xl overflow-hidden flex flex-col h-full bg-white">
+                <div className="bg-[#1D3557] text-white py-2.5 px-3.5 font-montserrat font-extrabold uppercase tracking-wide text-[10px]">
                   Artículos del Pedido
                 </div>
                 
                 <div className="flex-1 overflow-y-auto divide-y divide-gray-100 max-h-[300px]">
                   {selectedOrder.items && selectedOrder.items.length > 0 ? (
                     selectedOrder.items.map((item, index) => (
-                      <div key={index} className="p-3 flex justify-between items-center hover:bg-gray-50/50 transition gap-2">
+                      <div key={index} className="p-3 flex justify-between items-center hover:bg-[#F8F9FA] transition gap-2">
                         <div className="min-w-0 flex-1">
-                          <p className="font-bold text-gray-900 text-xs truncate" title={item.name}>{item.name}</p>
+                          <p className="font-bold text-[#2B2D42] text-xs truncate" title={item.name}>{item.name}</p>
                           <p className="text-[10px] text-gray-400 font-mono font-bold mt-0.5">SKU: {item.sku}</p>
                         </div>
-                        <div className="text-right flex-shrink-0 font-bold text-xs font-semibold">
+                        <div className="text-right flex-shrink-0 font-bold text-xs">
                           <span className="text-gray-400 font-semibold">{item.quantity} x </span>
-                          <span className="text-gray-900 font-bold">${item.price.toFixed(2)}</span>
-                          <p className="text-[#008296] font-black text-xs mt-0.5">
+                          <span className="text-[#2B2D42] font-bold">${item.price.toFixed(2)}</span>
+                          <p className="text-[#00BFFF] font-black text-xs mt-0.5">
                             ${(item.quantity * item.price).toFixed(2)}
                           </p>
                         </div>
@@ -7034,18 +7338,18 @@ export default function AdminPanel({
                 </div>
 
                 {/* Subtotal & Total summaries */}
-                <div className="bg-gray-50 p-4 border-t border-gray-100 space-y-2">
-                  <div className="flex justify-between font-semibold text-gray-500">
+                <div className="bg-[#F8F9FA] p-4 border-t border-gray-200 space-y-2">
+                  <div className="flex justify-between font-semibold text-gray-500 text-xs">
                     <span>Subtotal</span>
                     <span>${Number(selectedOrder.total_price || 0).toFixed(2)}</span>
                   </div>
-                  <div className="flex justify-between font-semibold text-gray-500">
+                  <div className="flex justify-between font-semibold text-gray-500 text-xs">
                     <span>Cargos de Envío</span>
                     <span>$0.00</span>
                   </div>
-                  <div className="flex justify-between font-black text-gray-950 text-sm border-t border-gray-200 pt-2">
+                  <div className="flex justify-between font-montserrat font-black text-[#1D3557] text-sm border-t border-gray-200 pt-2">
                     <span>TOTAL GENERAL</span>
-                    <span className="text-[#008296] text-base">${Number(selectedOrder.total_price || 0).toFixed(2)} USD</span>
+                    <span className="text-[#1D3557] font-montserrat font-black text-base">${Number(selectedOrder.total_price || 0).toFixed(2)} USD</span>
                   </div>
                 </div>
               </div>
@@ -7053,23 +7357,23 @@ export default function AdminPanel({
             </div>
 
             {/* Quick States Updates in Footer */}
-            <div className="p-4 bg-gray-50 border-t border-gray-200 flex flex-wrap items-center justify-between gap-4 text-xs">
+            <div className="p-4 bg-[#F8F9FA] border-t border-gray-200 flex flex-wrap items-center justify-between gap-4 text-xs">
               
               {/* Quick Status Selects inside modal */}
               <div className="flex flex-wrap items-center gap-4">
                 <div className="flex items-center gap-2">
-                  <span className="font-bold text-gray-500">Estado de la Entrega:</span>
+                  <span className="font-montserrat font-extrabold text-[#1D3557]">Estado de Entrega:</span>
                   <select
                     value={(pendingChanges[selectedOrder.id]?.status ?? (selectedOrder.status || 'recibido')).toLowerCase()}
                     onChange={(e) => handlePendingChange(selectedOrder.id, 'status', e.target.value)}
-                    className={`font-black rounded px-2.5 py-1 text-xs focus:ring-1 focus:ring-[#008296] border cursor-pointer ${
+                    className={`font-black rounded-xl px-2.5 py-1 text-xs focus:ring-2 focus:ring-[#00BFFF] border cursor-pointer ${
                       (pendingChanges[selectedOrder.id]?.status ?? (selectedOrder.status || 'recibido')).toLowerCase() === 'recibido' ? 'bg-gray-100 text-gray-700 border-gray-300' :
                       (pendingChanges[selectedOrder.id]?.status ?? (selectedOrder.status || 'recibido')).toLowerCase() === 'preparando' ? 'bg-amber-50 text-amber-700 border-amber-300' :
-                      (pendingChanges[selectedOrder.id]?.status ?? (selectedOrder.status || 'recibido')).toLowerCase() === 'listo para retirar' ? 'bg-indigo-50 text-indigo-700 border-indigo-300' :
-                      (pendingChanges[selectedOrder.id]?.status ?? (selectedOrder.status || 'recibido')).toLowerCase() === 'en camino' ? 'bg-sky-50 text-sky-700 border-sky-300' :
-                      (pendingChanges[selectedOrder.id]?.status ?? (selectedOrder.status || 'recibido')).toLowerCase() === 'entregado' ? 'bg-emerald-50 text-emerald-700 border-emerald-300' :
-                      'bg-red-50 text-red-700 border-red-300'
-                    } ${(pendingChanges[selectedOrder.id]?.status) ? 'ring-2 ring-emerald-500' : ''}`}
+                      (pendingChanges[selectedOrder.id]?.status ?? (selectedOrder.status || 'recibido')).toLowerCase() === 'listo para retirar' ? 'bg-sky-50 text-sky-700 border-sky-300' :
+                      (pendingChanges[selectedOrder.id]?.status ?? (selectedOrder.status || 'recibido')).toLowerCase() === 'en camino' ? 'bg-[#1D3557]/10 text-[#1D3557] border-[#1D3557]/30' :
+                      (pendingChanges[selectedOrder.id]?.status ?? (selectedOrder.status || 'recibido')).toLowerCase() === 'entregado' ? 'bg-[#40E0D0]/15 text-[#1D3557] border-[#40E0D0]/40' :
+                      'bg-rose-50 text-rose-700 border-rose-300'
+                    } ${(pendingChanges[selectedOrder.id]?.status) ? 'ring-2 ring-[#40E0D0]' : ''}`}
                   >
                     <option value="recibido">Recibido</option>
                     <option value="preparando">Preparando</option>
@@ -7081,15 +7385,15 @@ export default function AdminPanel({
                 </div>
 
                 <div className="flex items-center gap-2">
-                  <span className="font-bold text-gray-500">Estado del Pago:</span>
+                  <span className="font-montserrat font-extrabold text-[#1D3557]">Estado del Pago:</span>
                   <select
                     value={(pendingChanges[selectedOrder.id]?.payment_status ?? (selectedOrder.payment_status || 'pendiente')).toLowerCase()}
                     onChange={(e) => handlePendingChange(selectedOrder.id, 'payment_status', e.target.value)}
-                    className={`font-black rounded px-2.5 py-1 text-xs focus:ring-1 focus:ring-[#008296] border cursor-pointer ${
+                    className={`font-black rounded-xl px-2.5 py-1 text-xs focus:ring-2 focus:ring-[#00BFFF] border cursor-pointer ${
                       (pendingChanges[selectedOrder.id]?.payment_status ?? (selectedOrder.payment_status || 'pendiente')).toLowerCase() === 'pendiente' ? 'bg-amber-100 text-amber-800 border-amber-300' :
                       (pendingChanges[selectedOrder.id]?.payment_status ?? (selectedOrder.payment_status || 'pendiente')).toLowerCase() === 'pagado' ? 'bg-emerald-100 text-emerald-800 border-emerald-300' :
                       'bg-red-100 text-red-800 border-red-300'
-                    } ${(pendingChanges[selectedOrder.id]?.payment_status) ? 'ring-2 ring-emerald-500' : ''}`}
+                    } ${(pendingChanges[selectedOrder.id]?.payment_status) ? 'ring-2 ring-[#40E0D0]' : ''}`}
                   >
                     <option value="pendiente">Pendiente</option>
                     <option value="pagado">Pagado</option>
@@ -7101,9 +7405,9 @@ export default function AdminPanel({
                   <button
                     type="button"
                     onClick={() => handleConfirmOrderChanges(selectedOrder.id)}
-                    className="px-4 py-2 bg-[#059669] hover:bg-[#047857] text-white font-black rounded-full text-xs cursor-pointer shadow-md hover:shadow-lg flex items-center gap-1.5 transition uppercase tracking-wider active:scale-98"
+                    className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-montserrat font-bold rounded-full text-xs cursor-pointer shadow-2xs hover:shadow-xs flex items-center gap-1.5 transition uppercase tracking-wider active:scale-98"
                   >
-                    <Check className="w-4 h-4 stroke-[3]" />
+                    <Check className="w-4 h-4 text-[#005da9] stroke-[3]" />
                     <span>Confirmar Cambios</span>
                   </button>
                 )}
@@ -7114,9 +7418,10 @@ export default function AdminPanel({
                 <button
                   type="button"
                   onClick={() => setSelectedOrder(null)}
-                  className="px-5 py-2 bg-[#1e293b] hover:bg-[#0f172a] text-white font-black rounded-full text-xs cursor-pointer shadow-md hover:shadow-lg uppercase tracking-wider active:scale-98 transition"
+                  className="px-5 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-montserrat font-bold rounded-full text-xs cursor-pointer shadow-2xs hover:shadow-xs uppercase tracking-wider active:scale-98 transition flex items-center gap-1.5"
                 >
-                  Cerrar Detalles
+                  <X className="w-4 h-4 text-[#005da9]" />
+                  <span>Cerrar Detalles</span>
                 </button>
               </div>
 
@@ -7130,21 +7435,25 @@ export default function AdminPanel({
       {showUserModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
           <div className="bg-white rounded-3xl border border-gray-150 w-full max-w-md shadow-2xl overflow-hidden text-left flex flex-col animate-fadeIn">
-            <div className="p-4 bg-gray-50 border-b border-gray-100 flex justify-between items-center">
-              <span className="text-xs font-black text-gray-800 uppercase tracking-wider flex items-center gap-2">
-                <UserCheck className="w-4 h-4 text-[#005da9]" />
-                <span>{editingUserId ? 'Editar Usuario del Sistema' : 'Nuevo Usuario del Sistema'}</span>
+            <div className="p-4 bg-gradient-to-r from-[#1D3557] via-[#005da9] to-[#7928CA] text-white border-b border-gray-100 flex justify-between items-center">
+              <span className="text-xs font-montserrat font-extrabold uppercase tracking-wider flex items-center gap-2 text-white">
+                <UserCheck className="w-4 h-4 text-[#40E0D0]" />
+                <span>{editingUserId ? 'Editar Operador del Sistema' : 'Nuevo Operador del Sistema'}</span>
               </span>
               <button 
                 type="button"
                 onClick={() => setShowUserModal(false)}
-                className="p-1.5 hover:bg-gray-200 text-gray-400 hover:text-gray-600 rounded-lg transition cursor-pointer"
+                className="p-1.5 hover:bg-white/10 text-gray-200 hover:text-white rounded-full transition cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <form onSubmit={(e) => { e.preventDefault(); handleSaveStoreUser(); }} className="p-5 space-y-4">
+            <form onSubmit={(e) => { e.preventDefault(); handleSaveStoreUser(); }} className="p-5 space-y-4 font-poppins">
+              <div className="p-3 bg-purple-50 border border-purple-150 rounded-2xl text-[11px] text-[#7928CA] leading-snug">
+                <strong>Registro Exclusivo de Operadores:</strong> Los usuarios creados aquí tendrán acceso directo al Panel Administrativo según su rol. Los clientes se registran de manera independiente en la tienda.
+              </div>
+
               {userFormError && (
                 <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-red-600 text-xs font-bold flex items-center gap-2">
                   <AlertTriangle className="w-4 h-4 shrink-0" />
@@ -7153,32 +7462,32 @@ export default function AdminPanel({
               )}
 
               <div>
-                <label className="block text-[10px] font-black uppercase text-gray-500 mb-1">Nombre Completo del Usuario *</label>
+                <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Nombre Completo del Operador *</label>
                 <input
                   type="text"
                   required
                   value={userFormName}
                   onChange={(e) => setUserFormName(e.target.value)}
                   placeholder="Ej: Pedro Pérez"
-                  className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                  className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#7928CA]"
                 />
               </div>
 
               <div>
-                <label className="block text-[10px] font-black uppercase text-gray-500 mb-1">Correo Electrónico (Usuario para Login) *</label>
+                <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Correo Electrónico (Usuario para Iniciar Sesión) *</label>
                 <input
                   type="email"
                   required
                   value={userFormEmail}
                   onChange={(e) => setUserFormEmail(e.target.value)}
                   placeholder="Ej: pedro@copiasbellavista.com"
-                  className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                  className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#7928CA]"
                 />
               </div>
 
               <div>
-                <label className="block text-[10px] font-black uppercase text-gray-500 mb-1">
-                  Contraseña / Clave de Acceso {editingUserId ? '(Opcional para mantener)' : '*'}
+                <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">
+                  Contraseña de Acceso {editingUserId ? '(Opcional para mantener)' : '*'}
                 </label>
                 <input
                   type="text"
@@ -7186,86 +7495,106 @@ export default function AdminPanel({
                   value={userFormPassword}
                   onChange={(e) => setUserFormPassword(e.target.value)}
                   placeholder={editingUserId ? "Dejar en blanco para mantener la clave actual" : "Ej: ClaveSegura123"}
-                  className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-mono font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                  className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-mono font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#7928CA]"
                 />
-                <p className="text-[10px] text-gray-400 mt-1">El usuario usará su correo y esta contraseña para iniciar sesión.</p>
+                <p className="text-[10px] text-gray-400 mt-1">El operador usará este correo y contraseña para acceder a la administración.</p>
               </div>
 
               <div>
-                <label className="block text-[10px] font-black uppercase text-gray-500 mb-1">Rol de Acceso al Sistema *</label>
+                <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Rol Operativo en Tienda *</label>
                 <select
                   value={userFormRole}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    setUserFormRole(val);
-                    if (val !== 'Cliente') {
-                      setUserFormClientCode('');
-                    }
-                  }}
-                  className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                  onChange={(e) => setUserFormRole(e.target.value)}
+                  className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#7928CA]"
                 >
-                  <option value="Admin">Admin (Control Total)</option>
+                  <option value="Propietario">Propietario (Acceso Total y Máximo Control)</option>
+                  <option value="Admin">Admin (Control Administrativo)</option>
                   <option value="Gerente">Gerente (Gestión General)</option>
-                  <option value="Cajero">Cajero (Punto de Venta / Facturación)</option>
-                  <option value="Despachador">Despachador (Procesar Pedidos)</option>
-                  <option value="Repartidor">Repartidor (Entregas)</option>
-                  <option value="Cliente">Cliente (Usuario Externo / Comprador)</option>
+                  <option value="Cajero">Cajero / Vendedor (Punto de Venta / Facturación)</option>
+                  <option value="Despachador">Despachador (Almacén y Despacho)</option>
+                  <option value="Repartidor">Repartidor (Delivery y Envíos)</option>
                 </select>
               </div>
 
-              {userFormRole === 'Cliente' && (
-                <div>
-                  <label className="block text-[10px] font-black uppercase text-gray-500 mb-1">
-                    Vincular con Cliente (por Código) *
-                  </label>
-                  <select
-                    value={userFormClientCode}
-                    required
-                    onChange={(e) => {
-                      const selectedCode = e.target.value;
-                      setUserFormClientCode(selectedCode);
-                      const matchedClient = dbClients.find(c => c.code === selectedCode);
-                      if (matchedClient) {
-                        if (!userFormName.trim() || userFormName === 'Pedro Pérez') {
-                          setUserFormName(matchedClient.name);
-                        }
-                        if (!userFormEmail.trim() || userFormEmail === 'pedro@copiasbellavista.com') {
-                          setUserFormEmail(matchedClient.email || '');
-                        }
-                      }
-                    }}
-                    className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
-                  >
-                    <option value="">-- Seleccionar Cliente --</option>
-                    {dbClients.map(c => (
-                      <option key={c.id || c.code} value={c.code}>
-                        {c.code} - {c.name} ({c.document || 'Sin documento'})
-                      </option>
-                    ))}
-                  </select>
-                  <p className="text-[10px] text-[#005da9] mt-1 font-medium">
-                    El usuario externo se vinculará a la cuenta de este cliente por su código.
-                  </p>
-                </div>
-              )}
-
-              <div className="flex gap-2 pt-3 border-t border-gray-100">
+              <div className="flex gap-2 pt-3 border-t border-gray-100 font-montserrat font-bold">
                 <button
                   type="button"
                   onClick={() => setShowUserModal(false)}
-                  className="flex-1 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-600 font-bold text-xs rounded-xl transition cursor-pointer"
+                  className="flex-1 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-full text-xs transition cursor-pointer active:scale-98 flex items-center justify-center gap-1.5 font-bold"
                 >
-                  Cancelar
+                  <X className="w-4 h-4 text-gray-500" />
+                  <span>Cancelar</span>
                 </button>
                 <button
                   type="submit"
-                  className="flex-1 py-2.5 bg-[#28a745] hover:bg-[#218838] text-white font-black text-xs uppercase rounded-xl transition cursor-pointer shadow-sm flex items-center justify-center gap-1.5"
+                  className="flex-1 py-2.5 bg-gradient-to-r from-[#1D3557] via-[#005da9] to-[#7928CA] hover:opacity-95 text-white rounded-full text-xs uppercase tracking-wider transition shadow-md hover:shadow-lg cursor-pointer active:scale-98 flex items-center justify-center gap-1.5 font-extrabold"
                 >
-                  <Save className="w-4 h-4" />
-                  <span>Guardar Usuario</span>
+                  <Save className="w-4 h-4 text-[#40E0D0] stroke-[2.5]" />
+                  <span>Guardar Operador</span>
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* -------------------- MODAL: CONFIRMAR ELIMINACIÓN DE OPERADOR -------------------- */}
+      {userToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-fadeIn">
+          <div className="bg-white rounded-3xl border border-gray-150 w-full max-w-md shadow-2xl overflow-hidden text-left flex flex-col">
+            <div className="p-4 bg-gradient-to-r from-rose-600 to-rose-700 text-white flex justify-between items-center">
+              <span className="text-xs font-montserrat font-extrabold uppercase tracking-wider flex items-center gap-2 text-white">
+                <Trash2 className="w-4 h-4 text-rose-200" />
+                <span>Confirmar Eliminación de Operador</span>
+              </span>
+              <button 
+                type="button"
+                disabled={isDeletingUser}
+                onClick={() => setUserToDelete(null)}
+                className="p-1.5 hover:bg-white/10 text-rose-100 hover:text-white rounded-full transition cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4 font-poppins">
+              <div className="w-12 h-12 rounded-full bg-rose-50 border border-rose-100 flex items-center justify-center text-rose-600 mx-auto">
+                <Trash2 className="w-6 h-6 stroke-[2.2]" />
+              </div>
+
+              <div className="text-center space-y-1.5">
+                <h3 className="text-sm font-bold text-slate-800 font-montserrat">
+                  ¿Eliminar a &quot;{userToDelete.name}&quot;?
+                </h3>
+                <p className="text-xs text-slate-500 font-medium">
+                  {userToDelete.email || userToDelete.id}
+                </p>
+                <p className="text-[11px] text-slate-500 leading-relaxed pt-2">
+                  Esta acción eliminará al operador de la base de datos y revocará inmediatamente su acceso al panel administrativo.
+                </p>
+              </div>
+
+              <div className="flex gap-2.5 pt-3 border-t border-gray-100 font-montserrat font-bold">
+                <button
+                  type="button"
+                  disabled={isDeletingUser}
+                  onClick={() => setUserToDelete(null)}
+                  className="flex-1 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-full text-xs transition cursor-pointer active:scale-98 flex items-center justify-center gap-1.5 font-bold disabled:opacity-50"
+                >
+                  <X className="w-4 h-4 text-gray-500" />
+                  <span>Cancelar</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={isDeletingUser}
+                  onClick={handleConfirmDeleteUser}
+                  className="flex-1 py-2.5 bg-gradient-to-r from-rose-600 to-rose-700 hover:from-rose-700 hover:to-rose-800 text-white rounded-full text-xs uppercase tracking-wider transition shadow-md hover:shadow-lg cursor-pointer active:scale-98 flex items-center justify-center gap-1.5 font-extrabold disabled:opacity-50"
+                >
+                  <Trash2 className="w-4 h-4 stroke-[2.2]" />
+                  <span>{isDeletingUser ? 'Eliminando...' : 'Eliminar'}</span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -7274,9 +7603,9 @@ export default function AdminPanel({
       {showSlideModal && editingSlide && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
           <div className="bg-white rounded-3xl border border-gray-150 w-full max-w-lg shadow-2xl overflow-hidden text-left flex flex-col animate-fadeIn">
-            <div className="p-4 bg-gray-50 border-b border-gray-100 flex justify-between items-center">
-              <span className="text-xs font-black text-gray-800 uppercase tracking-wider flex items-center gap-2">
-                <ImageIcon className="w-4 h-4 text-[#005da9]" />
+            <div className="p-4 bg-[#1D3557] text-white border-b border-gray-100 flex justify-between items-center">
+              <span className="text-xs font-montserrat font-extrabold uppercase tracking-wider flex items-center gap-2 text-white">
+                <ImageIcon className="w-4 h-4 text-[#40E0D0]" />
                 <span>{editingSlide.id ? 'Editar Pantalla del Banner' : 'Nueva Pantalla para el Banner'}</span>
               </span>
               <button
@@ -7285,78 +7614,78 @@ export default function AdminPanel({
                   setShowSlideModal(false);
                   setEditingSlide(null);
                 }}
-                className="p-1.5 hover:bg-gray-200 text-gray-400 hover:text-gray-600 rounded-lg transition cursor-pointer"
+                className="p-1.5 hover:bg-white/10 text-gray-300 hover:text-white rounded-lg transition cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <form onSubmit={handleSaveSlideForm} className="p-5 space-y-4">
+            <form onSubmit={handleSaveSlideForm} className="p-5 space-y-4 font-poppins">
               <div>
-                <label className="block text-[10px] font-black uppercase text-gray-500 mb-1">Título de la Pantalla *</label>
+                <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Título de la Pantalla *</label>
                 <input
                   type="text"
                   required
                   value={editingSlide.title || ''}
                   onChange={(e) => setEditingSlide((prev) => ({ ...prev, title: e.target.value }))}
                   placeholder="Ej: Ofertas Especiales en Papelería"
-                  className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                  className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                 />
               </div>
 
               <div>
-                <label className="block text-[10px] font-black uppercase text-gray-500 mb-1">Subtítulo / Descripción</label>
+                <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Subtítulo / Descripción</label>
                 <input
                   type="text"
                   value={editingSlide.subtitle || ''}
                   onChange={(e) => setEditingSlide((prev) => ({ ...prev, subtitle: e.target.value }))}
                   placeholder="Ej: Todo en fotocopias y útiles de oficina con 20% OFF"
-                  className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-medium text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                  className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-medium text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                 />
               </div>
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-[10px] font-black uppercase text-gray-500 mb-1">Etiqueta / Badge</label>
+                  <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Etiqueta / Badge</label>
                   <input
                     type="text"
                     value={editingSlide.badge || ''}
                     onChange={(e) => setEditingSlide((prev) => ({ ...prev, badge: e.target.value }))}
                     placeholder="Ej: ⚡ Servicio Rápido"
-                    className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                    className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                   />
                 </div>
                 <div>
-                  <label className="block text-[10px] font-black uppercase text-gray-500 mb-1">Texto del Botón</label>
+                  <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Texto del Botón</label>
                   <input
                     type="text"
                     value={editingSlide.button_text || ''}
                     onChange={(e) => setEditingSlide((prev) => ({ ...prev, button_text: e.target.value }))}
                     placeholder="Ej: Ver Productos"
-                    className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                    className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                   />
                 </div>
               </div>
 
               <div>
-                <label className="block text-[10px] font-black uppercase text-gray-500 mb-1">URL Imagen del Banner *</label>
+                <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">URL Imagen del Banner *</label>
                 <input
                   type="url"
                   required
                   value={editingSlide.image_url || ''}
                   onChange={(e) => setEditingSlide((prev) => ({ ...prev, image_url: e.target.value }))}
                   placeholder="https://images.unsplash.com/..."
-                  className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-medium text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                  className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-medium text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                 />
               </div>
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-[10px] font-black uppercase text-gray-500 mb-1">Categoría Destino</label>
+                  <label className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-1">Categoría Destino</label>
                   <select
                     value={editingSlide.target_category || ''}
                     onChange={(e) => setEditingSlide((prev) => ({ ...prev, target_category: e.target.value }))}
-                    className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                    className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                   >
                     <option value="">Ninguna / Todo el Catálogo</option>
                     {categories.map((c) => (
@@ -7373,30 +7702,30 @@ export default function AdminPanel({
                     id="chk-target-offer"
                     checked={editingSlide.target_offer === true}
                     onChange={(e) => setEditingSlide((prev) => ({ ...prev, target_offer: e.target.checked }))}
-                    className="w-4 h-4 text-[#005da9] rounded focus:ring-0 cursor-pointer"
+                    className="w-4 h-4 text-[#00BFFF] rounded focus:ring-0 cursor-pointer"
                   />
-                  <label htmlFor="chk-target-offer" className="text-xs font-bold text-gray-700 cursor-pointer">
+                  <label htmlFor="chk-target-offer" className="text-xs font-bold text-[#2B2D42] cursor-pointer">
                     Filtro Ofertas Activo
                   </label>
                 </div>
               </div>
 
-              <div className="pt-3 border-t border-gray-100 flex justify-end gap-2">
+              <div className="pt-3 border-t border-gray-100 flex justify-end gap-2 font-montserrat font-extrabold">
                 <button
                   type="button"
                   onClick={() => {
                     setShowSlideModal(false);
                     setEditingSlide(null);
                   }}
-                  className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold rounded-xl transition cursor-pointer"
+                  className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-[#2B2D42] text-xs rounded-xl transition cursor-pointer"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-[#005da9] hover:bg-[#004a87] text-[#ffffff] text-xs font-bold rounded-xl transition shadow cursor-pointer flex items-center gap-1.5"
+                  className="px-5 py-2 bg-[#40E0D0] hover:bg-[#36cebe] text-[#1D3557] text-xs font-black rounded-xl transition shadow-md cursor-pointer flex items-center gap-1.5 border-b-2 border-[#1D3557]/20"
                 >
-                  <Check className="w-4 h-4" />
+                  <Check className="w-4 h-4 stroke-[3]" />
                   <span>Guardar Pantalla</span>
                 </button>
               </div>
@@ -7406,17 +7735,17 @@ export default function AdminPanel({
       )}
 
       {/* Fixed Bottom Navigation Bar for Mobile */}
-      <div className="lg:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-gray-200 py-2 px-2 flex justify-around items-center shadow-lg">
+      <div className="lg:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-gray-200 py-2 px-2 flex justify-around items-center shadow-lg font-montserrat font-bold">
         <button
           onClick={() => {
             handleMenuChange('sales');
             setIsMobileDrawerOpen(false);
           }}
           className={`flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-full min-h-[38px] cursor-pointer transition ${
-            currentMenu === 'sales' ? 'bg-[#005da9] text-white font-black shadow-xs' : 'text-gray-600 hover:bg-gray-100 font-bold'
+            currentMenu === 'sales' ? 'bg-[#1D3557] text-white font-extrabold shadow-xs' : 'text-[#2B2D42] hover:bg-[#F8F9FA]'
           }`}
         >
-          <ShoppingBag className="w-4 h-4 shrink-0" />
+          <ShoppingBag className="w-4 h-4 shrink-0 text-[#00BFFF]" />
           <span className="text-[11px] tracking-tight">Venta Flash</span>
         </button>
 
@@ -7426,10 +7755,10 @@ export default function AdminPanel({
             setIsMobileDrawerOpen(false);
           }}
           className={`flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-full min-h-[38px] cursor-pointer transition ${
-            currentMenu === 'caja' ? 'bg-[#005da9] text-white font-black shadow-xs' : 'text-gray-600 hover:bg-gray-100 font-bold'
+            currentMenu === 'caja' ? 'bg-[#1D3557] text-white font-extrabold shadow-xs' : 'text-[#2B2D42] hover:bg-[#F8F9FA]'
           }`}
         >
-          <Store className="w-4 h-4 shrink-0" />
+          <Store className="w-4 h-4 shrink-0 text-[#00BFFF]" />
           <span className="text-[11px] tracking-tight">Caja</span>
         </button>
 
@@ -7441,12 +7770,12 @@ export default function AdminPanel({
             setIsMobileDrawerOpen(false);
           }}
           className={`flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-full min-h-[38px] cursor-pointer transition relative ${
-            currentMenu === 'orders' ? 'bg-[#005da9] text-white font-black shadow-xs' : 'text-gray-600 hover:bg-gray-100 font-bold'
+            currentMenu === 'orders' ? 'bg-[#1D3557] text-white font-extrabold shadow-xs' : 'text-[#2B2D42] hover:bg-[#F8F9FA]'
           }`}
         >
-          <ClipboardList className="w-4 h-4 shrink-0" />
+          <ClipboardList className="w-4 h-4 shrink-0 text-[#00BFFF]" />
           {pendingOrdersCount > 0 && (
-            <span className="bg-amber-500 text-white font-black text-[9px] w-4 h-4 rounded-full flex items-center justify-center border border-white">
+            <span className="bg-[#40E0D0] text-[#1D3557] font-black text-[9px] w-4 h-4 rounded-full flex items-center justify-center border border-white">
               {pendingOrdersCount}
             </span>
           )}
@@ -7460,18 +7789,18 @@ export default function AdminPanel({
             setIsMobileDrawerOpen(false);
           }}
           className={`flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-full min-h-[38px] cursor-pointer transition ${
-            currentMenu === 'products' ? 'bg-[#005da9] text-white font-black shadow-xs' : 'text-gray-600 hover:bg-gray-100 font-bold'
+            currentMenu === 'products' ? 'bg-[#1D3557] text-white font-extrabold shadow-xs' : 'text-[#2B2D42] hover:bg-[#F8F9FA]'
           }`}
         >
-          <Package className="w-4 h-4 shrink-0" />
+          <Package className="w-4 h-4 shrink-0 text-[#00BFFF]" />
           <span className="text-[11px] tracking-tight">Productos</span>
         </button>
 
         <button
           onClick={() => setIsMobileDrawerOpen(true)}
-          className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-full min-h-[38px] cursor-pointer text-gray-600 hover:bg-gray-100 font-bold transition"
+          className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-full min-h-[38px] cursor-pointer text-[#2B2D42] hover:bg-[#F8F9FA] transition"
         >
-          <Menu className="w-4 h-4 shrink-0" />
+          <Menu className="w-4 h-4 shrink-0 text-[#00BFFF]" />
           <span className="text-[11px] tracking-tight">Menú</span>
         </button>
       </div>
@@ -7533,17 +7862,17 @@ export default function AdminPanel({
       {showPedidosFacturadosModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 overflow-y-auto animate-fade-in">
           <div className="bg-white rounded-3xl border border-gray-100 w-full max-w-5xl shadow-2xl overflow-hidden relative text-left my-8 flex flex-col max-h-[90vh]">
-            {/* Header matching Image 1 */}
-            <div className="bg-[#005da9] p-5 text-white flex items-center justify-between shrink-0">
+            {/* Header matching corporate identity */}
+            <div className="bg-[#1D3557] p-5 text-white flex items-center justify-between shrink-0">
               <div className="flex items-center gap-3">
-                <div className="p-2.5 bg-white/10 rounded-2xl">
-                  <FileText className="w-6 h-6 text-white" />
+                <div className="p-2.5 bg-[#40E0D0]/20 rounded-2xl">
+                  <FileText className="w-6 h-6 text-[#40E0D0]" />
                 </div>
                 <div>
-                  <h3 className="font-extrabold text-base tracking-tight text-white uppercase">
+                  <h3 className="font-montserrat font-extrabold text-base tracking-tight text-white uppercase">
                     HISTORIAL Y BÚSQUEDA DE PEDIDOS
                   </h3>
-                  <p className="text-xs text-sky-100 font-medium">
+                  <p className="text-xs text-gray-200 font-medium">
                     Consulta, filtra y busca pedidos registrados ({orders.length} registros en total)
                   </p>
                 </div>
@@ -7552,66 +7881,66 @@ export default function AdminPanel({
                 <button
                   type="button"
                   onClick={() => fetchOrders()}
-                  className="px-3.5 py-2 bg-white/10 hover:bg-white/20 text-white rounded-xl text-xs font-black transition flex items-center gap-1.5 cursor-pointer active:scale-95"
+                  className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-xs font-montserrat font-bold transition flex items-center gap-1.5 cursor-pointer active:scale-95 shadow-2xs"
                 >
-                  <RefreshCw className={`w-3.5 h-3.5 ${loadingOrders ? 'animate-spin' : ''}`} />
+                  <RefreshCw className={`w-3.5 h-3.5 text-[#005da9] ${loadingOrders ? 'animate-spin' : ''}`} />
                   <span>Actualizar</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setShowPedidosFacturadosModal(false)}
-                  className="p-2 text-white/80 hover:text-white hover:bg-white/10 rounded-xl transition cursor-pointer"
+                  className="p-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-full transition cursor-pointer"
                 >
                   <X className="w-5 h-5" />
                 </button>
               </div>
             </div>
 
-            {/* Filter Toolbar matching Image 1 */}
-            <div className="p-4 bg-gray-50 border-b border-gray-200 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4 shrink-0">
+            {/* Filter Toolbar matching corporate identity */}
+            <div className="p-4 bg-[#F8F9FA] border-b border-gray-200 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4 shrink-0">
               {/* Search input */}
               <div className="relative flex-1 max-w-md">
-                <Search className="w-4 h-4 text-gray-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                <Search className="w-4 h-4 text-[#00BFFF] absolute left-3.5 top-1/2 -translate-y-1/2" />
                 <input
                   type="text"
                   placeholder="Buscar por N° pedido, cliente o RIF/C.I..."
                   value={pedidosFacturadosSearch}
                   onChange={(e) => setPedidosFacturadosSearch(e.target.value)}
-                  className="w-full pl-10 pr-4 py-2 bg-white border border-gray-200 rounded-2xl text-xs font-bold text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#005da9] shadow-2xs"
+                  className="w-full pl-10 pr-4 py-2 bg-white border border-gray-200 rounded-2xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] shadow-2xs"
                 />
               </div>
 
-              {/* Tabs matching Image 1 pills */}
-              <div className="flex items-center gap-1.5 bg-gray-200/70 p-1 rounded-2xl text-xs font-black overflow-x-auto">
+              {/* Tabs matching corporate identity */}
+              <div className="flex items-center gap-1.5 bg-gray-200/60 p-1 rounded-2xl text-xs font-montserrat font-extrabold overflow-x-auto">
                 <button
                   type="button"
                   onClick={() => setPedidosFacturadosTab('todos')}
-                  className={`px-3.5 py-1.5 rounded-xl transition cursor-pointer whitespace-nowrap ${
+                  className={`px-3.5 py-1.5 rounded-xl transition cursor-pointer whitespace-nowrap uppercase tracking-wider ${
                     pedidosFacturadosTab === 'todos'
-                      ? 'bg-[#005da9] text-white shadow-xs'
-                      : 'text-gray-600 hover:text-gray-900'
+                      ? 'bg-[#1D3557] text-white shadow-xs'
+                      : 'text-[#2B2D42] hover:text-[#1D3557]'
                   }`}
                 >
-                  Todos <span className="ml-1 px-1.5 py-0.5 bg-black/10 rounded-md text-[10px]">{orders.length}</span>
+                  Todos <span className="ml-1 px-1.5 py-0.5 bg-white/20 rounded-md text-[10px]">{orders.length}</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setPedidosFacturadosTab('facturados')}
-                  className={`px-3.5 py-1.5 rounded-xl transition cursor-pointer whitespace-nowrap ${
+                  className={`px-3.5 py-1.5 rounded-xl transition cursor-pointer whitespace-nowrap uppercase tracking-wider ${
                     pedidosFacturadosTab === 'facturados'
-                      ? 'bg-[#005da9] text-white shadow-xs'
-                      : 'text-gray-600 hover:text-gray-900'
+                      ? 'bg-[#1D3557] text-white shadow-xs'
+                      : 'text-[#2B2D42] hover:text-[#1D3557]'
                   }`}
                 >
-                  Facturados / Entregados <span className="ml-1 px-1.5 py-0.5 bg-emerald-100 text-emerald-800 rounded-md text-[10px]">{orders.filter(o => (o.status || '').toLowerCase() === 'entregado').length}</span>
+                  Facturados / Entregados <span className="ml-1 px-1.5 py-0.5 bg-[#40E0D0]/20 text-[#1D3557] rounded-md text-[10px]">{orders.filter(o => (o.status || '').toLowerCase() === 'entregado').length}</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setPedidosFacturadosTab('pendientes')}
-                  className={`px-3.5 py-1.5 rounded-xl transition cursor-pointer whitespace-nowrap ${
+                  className={`px-3.5 py-1.5 rounded-xl transition cursor-pointer whitespace-nowrap uppercase tracking-wider ${
                     pedidosFacturadosTab === 'pendientes'
-                      ? 'bg-[#005da9] text-white shadow-xs'
-                      : 'text-gray-600 hover:text-gray-900'
+                      ? 'bg-[#1D3557] text-white shadow-xs'
+                      : 'text-[#2B2D42] hover:text-[#1D3557]'
                   }`}
                 >
                   Pendientes <span className="ml-1 px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded-md text-[10px]">{pendingOrdersCount}</span>
@@ -7619,10 +7948,10 @@ export default function AdminPanel({
                 <button
                   type="button"
                   onClick={() => setPedidosFacturadosTab('cancelados')}
-                  className={`px-3.5 py-1.5 rounded-xl transition cursor-pointer whitespace-nowrap ${
+                  className={`px-3.5 py-1.5 rounded-xl transition cursor-pointer whitespace-nowrap uppercase tracking-wider ${
                     pedidosFacturadosTab === 'cancelados'
-                      ? 'bg-[#005da9] text-white shadow-xs'
-                      : 'text-gray-600 hover:text-gray-900'
+                      ? 'bg-[#1D3557] text-white shadow-xs'
+                      : 'text-[#2B2D42] hover:text-[#1D3557]'
                   }`}
                 >
                   Cancelados <span className="ml-1 px-1.5 py-0.5 bg-rose-100 text-rose-800 rounded-md text-[10px]">{orders.filter(o => (o.status || '').toLowerCase() === 'cancelado').length}</span>
@@ -7641,27 +7970,27 @@ export default function AdminPanel({
                 <div className="overflow-x-auto bg-white border border-gray-100 rounded-2xl shadow-2xs">
                   <table className="w-full text-left border-collapse">
                     <thead>
-                      <tr className="bg-gray-50 border-b border-gray-100 text-gray-400 text-[10px] uppercase font-black tracking-wider">
-                        <th className="px-5 py-3">N° Pedido / Cliente</th>
-                        <th className="px-5 py-3">Fecha</th>
-                        <th className="px-5 py-3">Pago</th>
-                        <th className="px-5 py-3">Entrega / Estado</th>
-                        <th className="px-5 py-3">Total USD</th>
-                        <th className="px-5 py-3 text-center">Acciones</th>
+                      <tr className="bg-[#1D3557] text-white text-[10px] uppercase font-montserrat font-extrabold tracking-wider">
+                        <th className="px-5 py-3.5">N° Pedido / Cliente</th>
+                        <th className="px-5 py-3.5">Fecha</th>
+                        <th className="px-5 py-3.5">Pago</th>
+                        <th className="px-5 py-3.5">Entrega / Estado</th>
+                        <th className="px-5 py-3.5">Total USD</th>
+                        <th className="px-5 py-3.5 text-center">Acciones</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-gray-100 text-xs text-gray-800 font-medium">
+                    <tbody className="divide-y divide-gray-100 text-xs text-[#2B2D42] font-medium">
                       {filteredPedidosFacturadosList.map((order) => {
                         const orderNum = String(order.order_number || order.id || '').padStart(6, '0');
                         const isEntregado = (order.status || '').toLowerCase() === 'entregado';
                         const isCancelado = (order.status || '').toLowerCase() === 'cancelado';
                         const isPaid = (order.payment_status || '').toLowerCase() === 'pagado';
                         return (
-                          <tr key={order.id} className="hover:bg-gray-50/60 transition">
+                          <tr key={order.id} className="hover:bg-[#F8F9FA] transition">
                             <td className="px-5 py-3.5">
                               <div>
-                                <span className="font-black text-gray-900">#{orderNum}</span>
-                                <p className="font-bold text-gray-800">{order.customer_name || 'Cliente'}</p>
+                                <span className="font-mono font-black text-[#1D3557]">#{orderNum}</span>
+                                <p className="font-montserrat font-bold text-[#2B2D42]">{order.customer_name || 'Cliente'}</p>
                                 <p className="text-[10px] text-gray-400">{order.phone_number || 'Sin teléfono'}</p>
                               </div>
                             </td>
@@ -7669,20 +7998,20 @@ export default function AdminPanel({
                               {order.created_at ? new Date(order.created_at).toLocaleDateString() : 'N/A'}
                             </td>
                             <td className="px-5 py-3.5 whitespace-nowrap">
-                              <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-black border ${
-                                isPaid ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-amber-50 border-amber-200 text-amber-700'
+                              <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-montserrat font-extrabold border ${
+                                isPaid ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-amber-50 border-amber-200 text-amber-800'
                               }`}>
                                 {isPaid ? 'Pagado' : 'Pendiente Pago'}
                               </span>
                             </td>
                             <td className="px-5 py-3.5 whitespace-nowrap">
-                              <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-black border ${
-                                isEntregado ? 'bg-blue-50 border-blue-200 text-blue-700' : isCancelado ? 'bg-rose-50 border-rose-200 text-rose-700' : 'bg-amber-50 border-amber-200 text-amber-700'
+                              <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-montserrat font-extrabold border ${
+                                isEntregado ? 'bg-[#40E0D0]/15 border-[#40E0D0]/30 text-[#1D3557]' : isCancelado ? 'bg-rose-50 border-rose-200 text-rose-700' : 'bg-amber-50 border-amber-200 text-amber-700'
                               }`}>
                                 {isEntregado ? 'Facturado / Entregado' : isCancelado ? 'Cancelado' : (order.status || 'Recibido')}
                               </span>
                             </td>
-                            <td className="px-5 py-3.5 font-mono font-black text-gray-900 whitespace-nowrap">
+                            <td className="px-5 py-3.5 font-mono font-black text-[#1D3557] whitespace-nowrap">
                               ${Number(order.total_price || 0).toFixed(2)}
                             </td>
                             <td className="px-5 py-3.5 text-center whitespace-nowrap">
@@ -7691,10 +8020,10 @@ export default function AdminPanel({
                                 <button
                                   type="button"
                                   onClick={() => setSelectedPedidoDigitalView(order)}
-                                  className="px-3 py-1.5 bg-[#005da9] hover:bg-[#004b87] text-white rounded-xl text-xs font-black transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
+                                  className="px-3.5 py-1.5 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-xs font-montserrat font-bold transition flex items-center gap-1.5 cursor-pointer shadow-2xs uppercase tracking-wider active:scale-95"
                                   title="Ver Vista Digital de Pedido"
                                 >
-                                  <FileText className="w-3.5 h-3.5" />
+                                  <FileText className="w-3.5 h-3.5 text-[#005da9]" />
                                   <span>Ver Detalle</span>
                                 </button>
                               </div>
@@ -7821,10 +8150,10 @@ export default function AdminPanel({
               <div className="bg-gray-50 rounded-xl p-2.5 mt-4 space-y-1 font-sans text-right shrink-0 border border-gray-100">
                 <span className="text-[8px] text-gray-400 font-black uppercase block tracking-wider">PAGO EN DIVISAS / BS. BCV</span>
                 <div className="text-xs font-black text-gray-800">
-                  Bs. {(Number(selectedPedidoDigitalView.total_price || 0) * (selectedPedidoBcvRate || currencyRates?.VES || 36.5)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  Bs. {(Number(selectedPedidoDigitalView.total_price || 0) * (selectedPedidoBcvRate || currencyRates?.VES || getCachedCurrencyRates().VES)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </div>
                 <div className="text-[9px] font-bold text-gray-500">
-                  Tasa Oficial BCV: 1 USD = Bs. {(selectedPedidoBcvRate || currencyRates?.VES || 36.5).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  Tasa Oficial BCV: 1 USD = Bs. {(selectedPedidoBcvRate || currencyRates?.VES || getCachedCurrencyRates().VES).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </div>
               </div>
 
@@ -7851,6 +8180,131 @@ export default function AdminPanel({
               >
                 <span>LISTO</span>
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Base de Datos / Gestión de Inventarios Modal */}
+      {showInventoryMgmtModal && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-fadeIn">
+          <div className="bg-white rounded-3xl border border-gray-100 shadow-2xl p-6 max-w-md w-full relative animate-scaleUp">
+            {/* Close button */}
+            <button
+              onClick={() => {
+                setShowInventoryMgmtModal(false);
+                setSelectedImportFile(null);
+              }}
+              className="absolute top-5 right-5 p-2 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-full transition cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            {/* Modal Header */}
+            <div className="flex items-center gap-3 mb-5">
+              <div className="w-10 h-10 rounded-2xl bg-indigo-50 border border-indigo-100 flex items-center justify-center shrink-0">
+                <Database className="w-5 h-5 text-indigo-600" />
+              </div>
+              <h3 className="text-base font-montserrat font-extrabold text-[#1D3557] tracking-tight">
+                Base de Datos
+              </h3>
+            </div>
+
+            {/* EXPORTAR INVENTARIO (EXCEL) SECTION */}
+            <div className="text-left mb-4">
+              <label className="block text-[10px] font-black uppercase text-gray-500 tracking-wider font-montserrat mb-2">
+                Exportar Inventario (Excel)
+              </label>
+              <div className="flex gap-2">
+                <select
+                  value={exportFilterOption}
+                  onChange={(e) => setExportFilterOption(e.target.value)}
+                  className="flex-1 bg-white border border-gray-200 rounded-xl px-3 py-2.5 text-xs font-bold text-[#1D3557] focus:ring-2 focus:ring-indigo-500 font-poppins outline-none cursor-pointer"
+                >
+                  <option value="all">Todo el inventario</option>
+                  <option value="in_stock">Solo productos con stock</option>
+                  <option value="out_of_stock">Solo productos sin stock / agotados</option>
+                  {categories.map(c => (
+                    <option key={c.id} value={`cat_${c.id}`}>Categoría: {c.name}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={handleExecuteExportModal}
+                  className="px-4 py-2 bg-gradient-to-r from-[#1D3557] to-[#005da9] hover:from-[#152741] hover:to-[#004b87] text-white rounded-full transition shadow-xs hover:shadow-md flex items-center justify-center cursor-pointer font-montserrat font-extrabold text-xs active:scale-95 shrink-0"
+                  title="Exportar archivo Excel"
+                >
+                  <Download className="w-4 h-4 text-[#40E0D0]" />
+                </button>
+              </div>
+            </div>
+
+            {/* Separator */}
+            <div className="my-5 border-t border-gray-100" />
+
+            {/* IMPORTAR INVENTARIO (EXCEL / CSV) SECTION */}
+            <div className="text-left">
+              <label className="block text-[10px] font-black uppercase text-gray-500 tracking-wider font-montserrat mb-2">
+                Importar Inventario (Excel / CSV)
+              </label>
+
+              <div className="flex items-center gap-3">
+                <input
+                  type="file"
+                  ref={modalFileInputRef}
+                  className="hidden"
+                  accept=".xlsx, .xls, .csv"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) setSelectedImportFile(file);
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => modalFileInputRef.current?.click()}
+                  className="px-4 py-2 bg-gradient-to-r from-[#1D3557] to-[#005da9] hover:from-[#152741] hover:to-[#004b87] text-white text-xs font-montserrat font-extrabold rounded-full transition shadow-xs hover:shadow-md cursor-pointer shrink-0 active:scale-95 flex items-center gap-2"
+                >
+                  <FileText className="w-4 h-4 text-[#40E0D0]" />
+                  <span>Seleccionar archivo</span>
+                </button>
+                <span className="text-xs text-gray-400 font-poppins truncate flex-1">
+                  {selectedImportFile ? selectedImportFile.name : 'Sin archivos seleccionados'}
+                </span>
+              </div>
+
+              <p className="text-[10px] text-gray-400 italic mt-2 font-poppins">
+                * Compatible con exportaciones de a2 Software (Listado de Artículos / Lista de Precios).
+              </p>
+
+              <label className="flex items-center gap-2 mt-4 cursor-pointer text-xs font-extrabold text-[#1D3557] font-poppins select-none">
+                <input
+                  type="checkbox"
+                  checked={convertBcvBsToUsd}
+                  onChange={(e) => setConvertBcvBsToUsd(e.target.checked)}
+                  className="rounded text-indigo-600 focus:ring-indigo-500 w-4 h-4 cursor-pointer"
+                />
+                <span>Convertir costos/precios de <strong>Bs a USD</strong> (Tasa BCV: Bs. {bcvRate || getCachedCurrencyRates().VES})</span>
+              </label>
+
+              {/* Action row */}
+              <div className="flex justify-between items-center mt-6 pt-2">
+                <button
+                  type="button"
+                  onClick={handleDownloadTemplate}
+                  className="text-xs font-bold text-indigo-600 hover:text-indigo-800 underline cursor-pointer font-poppins"
+                >
+                  Descargar plantilla Excel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleExecuteModalImport}
+                  disabled={!selectedImportFile || isSubmittingImport}
+                  className="px-6 py-2.5 bg-gradient-to-r from-[#1D3557] via-[#005da9] to-[#1D3557] hover:from-[#152741] hover:via-[#004b87] hover:to-[#152741] text-white font-montserrat font-extrabold text-xs uppercase tracking-wider rounded-full shadow-md hover:shadow-lg flex items-center justify-center gap-2 cursor-pointer transition active:scale-95 disabled:opacity-50"
+                >
+                  <Upload className="w-4 h-4 text-[#40E0D0]" />
+                  <span>{isSubmittingImport ? 'SUBIENDO...' : 'SUBIR'}</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>

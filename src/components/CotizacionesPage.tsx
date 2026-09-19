@@ -1,13 +1,13 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { 
   Search, SlidersHorizontal, Plus, Trash2, Eye, X, 
-  FileText, User, Smartphone, Mail, Sparkles, 
+  FileText, FilePlus, User, Smartphone, Mail, Sparkles, 
   Settings, Loader2, CheckCircle2, FileCheck, Share2, Printer, 
   Calendar, Tag, DollarSign, Clock, AlertTriangle, ShieldCheck,
-  Check, Edit3, PackageCheck, RotateCcw
+  Check, Edit3, PackageCheck, RotateCcw, Building2, CreditCard, ShoppingCart
 } from 'lucide-react';
 import { dbService } from '../lib/supabase';
-import { Product, Quote, QuoteItem, BusinessProfile } from '../types';
+import { Product, Quote, QuoteItem, BusinessProfile, BankAccount, AccountReceivable, PurchaseInstallment } from '../types';
 
 const DEFAULT_QUOTE_NOTES = `1. Precios expresados en USD. Pago en Bolívares a la tasa oficial BCV del día.
 2. Presupuesto válido según el tiempo de expiración seleccionado.
@@ -15,55 +15,48 @@ const DEFAULT_QUOTE_NOTES = `1. Precios expresados en USD. Pago en Bolívares a 
 4. Los tiempos de entrega comienzan a contarse a partir de la confirmación del diseño y del pago del anticipo.`;
 
 const unifyClients = (dbClientsList: any[], invoicesList: any[], quotesList: any[]) => {
-  const map = new Map<string, any>();
+  const result: any[] = [];
 
-  // 1. DB / Local clients
-  (dbClientsList || []).forEach(c => {
-    const name = c.name || c.nombre || c.customer_name;
-    if (!name) return;
-    const key = (c.id || c.document || c.rif || name).toString().trim().toLowerCase();
-    map.set(key, {
-      id: c.id || key,
-      name: name.trim(),
-      phone: c.phone || c.telefono || c.phone_number || '',
-      email: c.email || c.correo || c.customer_email || '',
-      document: c.document || c.rif || c.doc_number || c.customer_document || ''
+  const normDoc = (d?: string) => (d || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+  const normName = (n?: string) => (n || '').trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+  const findExisting = (doc?: string, name?: string, id?: string) => {
+    const dKey = normDoc(doc);
+    const nKey = normName(name);
+    return result.find(c => {
+      if (id && c.id && String(c.id).trim() === String(id).trim()) return true;
+      if (dKey && normDoc(c.document) && dKey === normDoc(c.document)) return true;
+      if (nKey && normName(c.name) && nKey === normName(c.name)) return true;
+      return false;
     });
-  });
+  };
 
-  // 2. Invoices clients
-  (invoicesList || []).forEach(inv => {
-    const name = inv.customer_name;
+  // 1. DB / Local clients (Highest priority)
+  (dbClientsList || []).forEach(c => {
+    const name = (c.name || c.nombre || c.customer_name || '').trim();
     if (!name || name.toLowerCase() === 'consumidor final') return;
-    const key = (inv.customer_id || inv.customer_document || inv.rif || name).toString().trim().toLowerCase();
-    if (!map.has(key)) {
-      map.set(key, {
-        id: inv.customer_id || key,
-        name: name.trim(),
-        phone: inv.phone_number || inv.phone || '',
-        email: inv.customer_email || inv.email || '',
-        document: inv.customer_document || inv.rif || ''
+    const doc = (c.document || c.rif || c.doc_number || c.customer_document || '').trim();
+    const phone = (c.phone || c.telefono || c.phone_number || '').trim();
+    const email = (c.email || c.correo || c.customer_email || '').trim();
+
+    const existing = findExisting(doc, name, c.id);
+    if (existing) {
+      if (c.id) existing.id = c.id;
+      if (!existing.document && doc) existing.document = doc;
+      if (!existing.phone && phone) existing.phone = phone;
+      if (!existing.email && email) existing.email = email;
+    } else {
+      result.push({
+        id: c.id || `cli-${result.length + 1}`,
+        name,
+        phone,
+        email,
+        document: doc
       });
     }
   });
 
-  // 3. Quotes clients
-  (quotesList || []).forEach(q => {
-    const name = q.client_name;
-    if (!name || name.toLowerCase() === 'consumidor final') return;
-    const key = (q.client_id || name).toString().trim().toLowerCase();
-    if (!map.has(key)) {
-      map.set(key, {
-        id: q.client_id || key,
-        name: name.trim(),
-        phone: q.client_phone || '',
-        email: q.client_email || '',
-        document: ''
-      });
-    }
-  });
-
-  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+  return result.sort((a, b) => a.name.localeCompare(b.name));
 };
 
 interface CotizacionesPageProps {
@@ -95,11 +88,35 @@ export default function CotizacionesPage({
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showDetailModal, setShowDetailModal] = useState(false);
   const [selectedQuote, setSelectedQuote] = useState<Quote | null>(null);
+  const [showNewClientModal, setShowNewClientModal] = useState(false);
+  const [newClientName, setNewClientName] = useState('');
+  const [newClientType, setNewClientType] = useState('Natural (V / E)');
+  const [newClientDocument, setNewClientDocument] = useState('');
+  const [newClientPhone, setNewClientPhone] = useState('');
+  const [newClientCredit, setNewClientCredit] = useState('0');
+  const [newClientEmail, setNewClientEmail] = useState('');
+  const [newClientAddress, setNewClientAddress] = useState('');
+  const [isSavingClient, setIsSavingClient] = useState(false);
   
+  // Bank Accounts State
+  const [bankAccounts, setBankAccounts] = useState<BankAccount[]>([]);
+
   // Billing/Conversion to Sale Modal State
   const [showBillingModal, setShowBillingModal] = useState(false);
-  const [billingPaymentMethod, setBillingPaymentMethod] = useState('Pago Móvil');
+  const [convertDocType, setConvertDocType] = useState<'factura' | 'nota_entrega'>('factura');
   const [billingPaymentStatus, setBillingPaymentStatus] = useState<'pagado' | 'credito'>('pagado');
+  const [selectedBankAccountId, setSelectedBankAccountId] = useState<string>('');
+  const [billingPaymentReference, setBillingPaymentReference] = useState('');
+  
+  // Credit details (CxC)
+  const [creditIssueDate, setCreditIssueDate] = useState<string>(() => new Date().toISOString().split('T')[0]);
+  const [creditDueDate, setCreditDueDate] = useState<string>(() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 15);
+    return d.toISOString().split('T')[0];
+  });
+  const [creditInstallmentsCount, setCreditInstallmentsCount] = useState<number>(1);
+  const [creditFrequency, setCreditFrequency] = useState<'semanal' | 'quincenal' | 'mensual'>('quincenal');
   const [isBilling, setIsBilling] = useState(false);
 
   // Create Form State
@@ -170,6 +187,59 @@ export default function CotizacionesPage({
     }
   }, [searchProdQuery, filteredProductsForSelect]);
 
+  // Correlative previews for Factura and Nota de Entrega
+  const nextControlNumberFactura = useMemo(() => {
+    try {
+      return dbService.getNextInvoiceControlNumber('factura');
+    } catch {
+      return 'FAC-1001';
+    }
+  }, [showBillingModal, quotes]);
+
+  const nextControlNumberNota = useMemo(() => {
+    try {
+      return dbService.getNextInvoiceControlNumber('nota_entrega');
+    } catch {
+      return 'NE-1001';
+    }
+  }, [showBillingModal, quotes]);
+
+  // Real-time installments preview generator for credit sales
+  const generatedInstallments = useMemo(() => {
+    if (!selectedQuote || billingPaymentStatus !== 'credito') return [];
+    const total = Number(selectedQuote.total_price) || 0;
+    const count = Math.max(1, creditInstallmentsCount);
+    const baseAmount = Number((total / count).toFixed(2));
+    let accumulated = 0;
+    const installments: Array<{ number: number; due_date: string; amount: number; amount_bs: number }> = [];
+
+    const baseDate = creditIssueDate ? new Date(creditIssueDate + 'T12:00:00') : new Date();
+
+    for (let i = 1; i <= count; i++) {
+      const isLast = i === count;
+      const amount = isLast ? Number((total - accumulated).toFixed(2)) : baseAmount;
+      accumulated += amount;
+
+      const instDate = new Date(baseDate);
+      if (creditFrequency === 'semanal') {
+        instDate.setDate(instDate.getDate() + 7 * i);
+      } else if (creditFrequency === 'quincenal') {
+        instDate.setDate(instDate.getDate() + 15 * i);
+      } else if (creditFrequency === 'mensual') {
+        instDate.setMonth(instDate.getMonth() + i);
+      }
+
+      installments.push({
+        number: i,
+        due_date: instDate.toISOString().split('T')[0],
+        amount,
+        amount_bs: Number((amount * (bcvRate || 1)).toFixed(2))
+      });
+    }
+
+    return installments;
+  }, [selectedQuote, billingPaymentStatus, creditInstallmentsCount, creditFrequency, creditIssueDate, bcvRate]);
+
   // Optional Financial Breakdown
   const [formDiscountAmount, setFormDiscountAmount] = useState<string>('0');
   const [formTaxPercent, setFormTaxPercent] = useState<string>('0');
@@ -181,11 +251,12 @@ export default function CotizacionesPage({
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [quotesData, dbClientsList, invoicesList, profileData] = await Promise.all([
+      const [quotesData, dbClientsList, invoicesList, profileData, bankAccountsData] = await Promise.all([
         dbService.getQuotes(),
         dbService.getClients(),
         dbService.getInvoices(),
-        dbService.getBusinessProfile()
+        dbService.getBusinessProfile(),
+        dbService.getBankAccounts().catch(() => [])
       ]);
       setQuotes(quotesData);
 
@@ -193,8 +264,14 @@ export default function CotizacionesPage({
       setClients(combinedClients);
 
       if (profileData) setBusinessProfile(profileData);
+
+      const activeBankAccounts = (bankAccountsData || []).filter((a: any) => a.is_active !== false);
+      setBankAccounts(activeBankAccounts);
+      if (activeBankAccounts.length > 0 && !selectedBankAccountId) {
+        setSelectedBankAccountId(activeBankAccounts[0].id);
+      }
     } catch (error) {
-      console.error('Error fetching quotes/clients/profile:', error);
+      console.error('Error fetching quotes/clients/profile/accounts:', error);
     } finally {
       setLoading(false);
     }
@@ -204,11 +281,102 @@ export default function CotizacionesPage({
     fetchData();
     window.addEventListener('bellavista_business_profile_updated', fetchData);
     window.addEventListener('bellavista_settings_updated', fetchData);
+    window.addEventListener('bellavista_bank_accounts_updated', fetchData);
+    window.addEventListener('bellavista_invoices_updated', fetchData);
+    window.addEventListener('bellavista_cxc_updated', fetchData);
     return () => {
       window.removeEventListener('bellavista_business_profile_updated', fetchData);
       window.removeEventListener('bellavista_settings_updated', fetchData);
+      window.removeEventListener('bellavista_bank_accounts_updated', fetchData);
+      window.removeEventListener('bellavista_invoices_updated', fetchData);
+      window.removeEventListener('bellavista_cxc_updated', fetchData);
     };
   }, []);
+
+  const handleSaveNewClient = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!newClientName.trim()) {
+      alert('Por favor, ingresa el nombre completo o razón social.');
+      return;
+    }
+    if (!newClientDocument.trim()) {
+      alert('Por favor, ingresa la cédula o RIF.');
+      return;
+    }
+
+    setIsSavingClient(true);
+    try {
+      const docTypeMap: Record<string, string> = {
+        'Natural (V / E)': 'V',
+        'Jurídico (J)': 'J',
+        'Gubernamental (G)': 'G',
+        'Pasaporte (P)': 'P'
+      };
+      const dbTypeMap: Record<string, string> = {
+        'Natural (V / E)': 'Natural',
+        'Jurídico (J)': 'Jurídico',
+        'Gubernamental (G)': 'Jurídico',
+        'Pasaporte (P)': 'Natural'
+      };
+
+      const docType = docTypeMap[newClientType] || 'V';
+      const cleanDoc = newClientDocument.trim();
+      let documentStr = cleanDoc;
+      if (cleanDoc && !/^[A-Z]-/i.test(cleanDoc)) {
+        documentStr = `${docType}-${cleanDoc}`;
+      }
+
+      const clientPayload = {
+        name: newClientName.trim(),
+        document: documentStr,
+        doc_type: docType,
+        type: dbTypeMap[newClientType] || 'Natural',
+        phone: newClientPhone.trim(),
+        email: newClientEmail.trim(),
+        address: newClientAddress.trim(),
+        direccion: newClientAddress.trim(),
+        credit_usd: parseFloat(newClientCredit) || 0
+      };
+
+      const created = await dbService.createClient(clientPayload);
+      if (created) {
+        // Refresh client data
+        const [quotesData, dbClientsList, invoicesList] = await Promise.all([
+          dbService.getQuotes(),
+          dbService.getClients(),
+          dbService.getInvoices()
+        ]);
+        const combinedClients = unifyClients(dbClientsList, invoicesList, quotesData);
+        setClients(combinedClients);
+
+        // Select the newly created client
+        setFormClientId(String(created.id));
+        setFormClientName(created.name);
+        setFormClientPhone(created.phone || '');
+        setFormClientEmail(created.email || '');
+        setFormClientType('existing');
+
+        // Reset fields
+        setNewClientName('');
+        setNewClientDocument('');
+        setNewClientType('Natural (V / E)');
+        setNewClientPhone('');
+        setNewClientCredit('0');
+        setNewClientEmail('');
+        setNewClientAddress('');
+        
+        setShowNewClientModal(false);
+        alert('¡Cliente registrado y seleccionado exitosamente!');
+      } else {
+        alert('No se pudo registrar el cliente en la base de datos.');
+      }
+    } catch (err: any) {
+      console.error('Error saving new client:', err);
+      alert(`Error al registrar cliente: ${err.message || 'Error desconocido'}`);
+    } finally {
+      setIsSavingClient(false);
+    }
+  };
 
   // Open Create Modal Handler
   const handleOpenCreateModal = async () => {
@@ -283,9 +451,12 @@ export default function CotizacionesPage({
 
       // Filter by Status
       if (selectedStatus !== 'todos') {
-        if (selectedStatus === 'creada' && q.status !== 'creada' && q.status !== 'pendiente') return false;
-        if (selectedStatus === 'expirada' && q.status !== 'expirada') return false;
-        if (selectedStatus === 'vendida' && q.status !== 'vendida' && q.status !== 'facturada' && q.status !== 'aprobada') return false;
+        const isQuoteExpired = q.status === 'expirada' || Boolean(q.expiration_date && new Date(q.expiration_date).getTime() < Date.now());
+        const isQuoteSold = q.status === 'vendida' || q.status === 'facturada' || q.status === 'aprobada';
+
+        if (selectedStatus === 'creada' && (isQuoteSold || isQuoteExpired || q.status === 'rechazada')) return false;
+        if (selectedStatus === 'expirada' && (!isQuoteExpired || isQuoteSold)) return false;
+        if (selectedStatus === 'vendida' && !isQuoteSold) return false;
         if (selectedStatus === 'rechazada' && q.status !== 'rechazada') return false;
       }
 
@@ -503,45 +674,154 @@ export default function CotizacionesPage({
     }
   };
 
-  // Convert Quote into Sale ("Vendida" / "Facturada")
+  // Open Convert to Sale Modal with clean defaults
+  const handleOpenBillingModal = (quote: Quote) => {
+    setSelectedQuote(quote);
+    setConvertDocType('factura');
+    setBillingPaymentStatus('pagado');
+    if (bankAccounts.length > 0) {
+      setSelectedBankAccountId(bankAccounts[0].id);
+    }
+    setBillingPaymentReference('');
+    const today = new Date().toISOString().split('T')[0];
+    setCreditIssueDate(today);
+    const d = new Date();
+    d.setDate(d.getDate() + 15);
+    setCreditDueDate(d.toISOString().split('T')[0]);
+    setCreditInstallmentsCount(1);
+    setCreditFrequency('quincenal');
+    setShowBillingModal(true);
+  };
+
+  // Convert Quote into Sale ("Factura" o "Nota de Entrega" - Tiempo Real, sin pedido online)
   const handleConvertToSale = async () => {
     if (!selectedQuote) return;
     setIsBilling(true);
 
     try {
-      // 1. Update quote status to 'vendida'
-      const updatedQuote: Quote = {
-        ...selectedQuote,
-        status: 'vendida',
-        updated_at: new Date().toISOString()
-      };
-      await dbService.saveQuote(updatedQuote);
+      const isCredit = billingPaymentStatus === 'credito';
+      const targetControlNumber = dbService.getNextInvoiceControlNumber(convertDocType);
 
-      // 2. Register formal Order / Sale in system
-      const newOrderPayload = {
+      // Find client details
+      const matchedClient = clients.find(c =>
+        (selectedQuote.client_name && (c.name || '').trim().toLowerCase() === selectedQuote.client_name.trim().toLowerCase()) ||
+        (selectedQuote.client_phone && (c.phone || '').trim() === selectedQuote.client_phone.trim())
+      );
+      const clientDoc = matchedClient?.document || '';
+
+      // Determine Payment Method label and Bank Account
+      const selectedBank = bankAccounts.find(a => a.id === selectedBankAccountId);
+      const paymentMethodLabel = isCredit
+        ? 'Crédito (Cuentas por Cobrar)'
+        : (selectedBank ? `${selectedBank.name} (${selectedBank.bank_name || selectedBank.currency})` : 'Efectivo');
+
+      // 1. Create official Sale Document (Factura o Nota de Entrega) in real time
+      // 🛑 STRICT REQUIREMENT: DO NOT register as online order (NO createOrder)
+      const invoicePayload = {
+        document_type: convertDocType,
+        control_number: targetControlNumber,
         customer_name: selectedQuote.client_name,
-        phone_number: selectedQuote.client_phone || '0000000000',
-        customer_email: selectedQuote.client_email || null,
-        delivery_method: 'retiro' as const,
-        address_text: `Venta generada desde Cotización N° ${selectedQuote.quote_number}`,
-        items: selectedQuote.items.map(item => ({
-          product_id: item.product_id || '',
-          name: item.name,
-          sku: item.sku || '',
-          quantity: item.quantity,
-          price: item.price
+        customer_phone: selectedQuote.client_phone || '',
+        customer_email: selectedQuote.client_email || '',
+        customer_document: clientDoc,
+        payment_method: paymentMethodLabel,
+        bank_account_id: isCredit ? undefined : (selectedBank?.id || undefined),
+        subtotal: Number(selectedQuote.total_price),
+        total: Number(selectedQuote.total_price),
+        bcv_rate: bcvRate,
+        currency_code: 'USD',
+        notes: `Convertido desde Cotización N° ${selectedQuote.quote_number}${billingPaymentReference ? ` - Ref: ${billingPaymentReference}` : ''}`,
+        items: selectedQuote.items.map(it => ({
+          product_id: it.product_id || '',
+          name: it.name,
+          sku: it.sku || '',
+          quantity: Number(it.quantity || 1),
+          price: Number(it.price || 0),
+          total: Number((it.quantity || 1) * (it.price || 0))
         })),
-        total_price: selectedQuote.total_price,
-        status: 'completado',
-        comments: `Cotización: ${selectedQuote.quote_number} | Vendedor: ${selectedQuote.seller_name || 'N/A'}. ${selectedQuote.notes || ''}`,
-        payment_method: billingPaymentMethod,
-        payment_status: billingPaymentStatus === 'pagado' ? 'pagado' : 'pendiente',
-        payment_amount_with: selectedQuote.total_price
+        created_at: new Date().toISOString()
       };
 
-      const createdOrder = await dbService.createOrder(newOrderPayload);
+      const createdInvoice = await dbService.createInvoice(invoicePayload);
 
-      // 3. Deduct stock for catalog items
+      // 2. If CREDIT: Register in Accounts Receivable (Cuentas por Cobrar) with dates & installments
+      if (isCredit) {
+        const installmentsList: PurchaseInstallment[] = generatedInstallments.map(inst => ({
+          id: `inst-${inst.number}-${Date.now()}`,
+          number: inst.number,
+          due_date: inst.due_date,
+          amount: inst.amount,
+          status: 'pendiente',
+          paid_amount: 0,
+          notes: `Cuota ${inst.number} de ${creditInstallmentsCount} (${creditFrequency})`
+        }));
+
+        const cxcRecord: AccountReceivable = {
+          id: `cxc-${createdInvoice.id || Date.now()}`,
+          invoice_id: createdInvoice.id,
+          invoice_number: createdInvoice.control_number || targetControlNumber,
+          quote_id: selectedQuote.id,
+          subject: `Crédito Cotización N° ${selectedQuote.quote_number} - ${convertDocType === 'nota_entrega' ? 'Nota' : 'Factura'} #${createdInvoice.control_number || targetControlNumber}`,
+          entity_name: selectedQuote.client_name,
+          client_name: selectedQuote.client_name,
+          customer_name: selectedQuote.client_name,
+          customer_phone: selectedQuote.client_phone || '',
+          customer_document: clientDoc,
+          description: `Venta a crédito desde Cotización N° ${selectedQuote.quote_number} (${creditInstallmentsCount} cuotas, vencimiento ${creditDueDate})`,
+          total_amount: Number(selectedQuote.total_price),
+          paid_amount: 0,
+          remaining_amount: Number(selectedQuote.total_price),
+          currency: 'USD',
+          bcv_rate: bcvRate,
+          status: 'pendiente',
+          issue_date: creditIssueDate ? new Date(creditIssueDate).toISOString() : new Date().toISOString(),
+          due_date: creditDueDate ? new Date(creditDueDate).toISOString() : new Date(Date.now() + 15 * 86400000).toISOString(),
+          installments_count: creditInstallmentsCount,
+          installments: installmentsList,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        };
+
+        await dbService.saveAccountReceivable(cxcRecord);
+
+        // Update Client's debt in real time
+        try {
+          const matchedCl = clients.find(c =>
+            (c.id && c.id === selectedQuote.client_id) ||
+            (selectedQuote.client_name && (c.name || '').trim().toLowerCase() === selectedQuote.client_name.trim().toLowerCase())
+          );
+          if (matchedCl && matchedCl.id) {
+            const currentDebt = Number(matchedCl.credit_usd || 0);
+            await dbService.updateClient(matchedCl.id, {
+              credit_usd: Number((currentDebt + selectedQuote.total_price).toFixed(2))
+            });
+          }
+        } catch (cErr) {
+          console.warn("Could not update client credit debt:", cErr);
+        }
+      } else {
+        // 3. If PAID: Register income into registered Bank Account and Cash Movement
+        if (selectedBank) {
+          await dbService.recordSaleIncomeToBankAccounts({
+            invoice: createdInvoice,
+            singlePaymentMethod: selectedBank.name,
+            bankAccountId: selectedBank.id,
+            totalUsd: selectedQuote.total_price,
+            totalVes: selectedQuote.total_price * bcvRate,
+            bcvRate: bcvRate,
+            createdBy: selectedQuote.seller_name || 'Vendedor'
+          });
+        }
+        await dbService.addCashOp({
+          type: 'ingreso',
+          concept: `Cobro Venta Cotización N° ${selectedQuote.quote_number} - ${convertDocType === 'nota_entrega' ? 'Nota' : 'Factura'} #${createdInvoice.control_number || targetControlNumber} (${paymentMethodLabel})`,
+          amount: selectedQuote.total_price,
+          amount_bs: selectedQuote.total_price * bcvRate,
+          payment_method: paymentMethodLabel
+        });
+      }
+
+      // 4. Deduct inventory stock for catalog items
       for (const item of selectedQuote.items) {
         if (item.product_id && !item.is_custom) {
           const catalogProd = products.find(p => p.id === item.product_id);
@@ -556,26 +836,33 @@ export default function CotizacionesPage({
         }
       }
 
-      // 4. Register Cash Operation if paid immediately
-      if (billingPaymentStatus === 'pagado') {
-        const bsAmount = selectedQuote.total_price * bcvRate;
-        await dbService.addCashOp({
-          type: 'ingreso',
-          concept: `Venta por Cotización N° ${selectedQuote.quote_number} - Cliente: ${selectedQuote.client_name}`,
-          amount: selectedQuote.total_price,
-          amount_bs: bsAmount,
-          payment_method: billingPaymentMethod
-        });
+      // 5. Update Quote status to 'vendida'
+      const updatedQuote: Quote = {
+        ...selectedQuote,
+        status: 'vendida',
+        updated_at: new Date().toISOString()
+      };
+      await dbService.saveQuote(updatedQuote);
+
+      // 6. Dispatch real-time events
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('bellavista_invoices_updated'));
+        window.dispatchEvent(new CustomEvent('bellavista_cxc_updated'));
+        window.dispatchEvent(new CustomEvent('bellavista_bank_accounts_updated'));
+        window.dispatchEvent(new CustomEvent('bellavista_cash_updated'));
+        window.dispatchEvent(new CustomEvent('bellavista_inventory_updated'));
+        window.dispatchEvent(new CustomEvent('bellavista_quotes_updated'));
+        window.dispatchEvent(new CustomEvent('bellavista_clients_updated'));
       }
 
-      // Close modals & refresh state
       setShowBillingModal(false);
       setShowDetailModal(false);
       setSelectedQuote(null);
       fetchData();
       onRefreshData();
 
-      alert(`¡Cotización convertida en VENTA exitosamente! Se descontó el inventario y se registró el pedido #${createdOrder.order_number || ''}.`);
+      const docName = convertDocType === 'nota_entrega' ? 'Nota de Entrega' : 'Factura';
+      alert(`¡Cotización convertida en Venta exitosamente en tiempo real!\nSe emitió la ${docName} #${createdInvoice.control_number || targetControlNumber}${isCredit ? ` y se registró en Cuentas por Cobrar (${creditInstallmentsCount} cuotas)` : ' y se acreditó en la cuenta bancaria seleccionada'}. El inventario se actualizó de inmediato.`);
     } catch (err: any) {
       console.error(err);
       alert(`Error al procesar la venta: ${err.message || 'Error desconocido'}`);
@@ -650,7 +937,7 @@ ${quote.client_phone ? `📱 *Teléfono:* ${quote.client_phone}\n` : ''}${quote.
 ${itemsText}
 ----------------------------------
 ${quote.subtotal_price ? `*Subtotal:* $${quote.subtotal_price.toFixed(2)}\n` : ''}${quote.discount_amount ? `*Descuento:* -$${quote.discount_amount.toFixed(2)}\n` : ''}${quote.tax_amount ? `*IVA:* +$${quote.tax_amount.toFixed(2)}\n` : ''}💰 *TOTAL FINAL USD:* *$${quote.total_price.toFixed(2)} USD*
-🇻🇪 *TOTAL FINAL VES:* *Bs. ${(quote.total_price * bcvRate).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}* (Tasa: ${bcvRate} Bs/USD)
+🇻🇪 *TOTAL FINAL VES:* *Bs. {((Number(quote.total_price) || 0) * (bcvRate || 1)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}* (Tasa: ${bcvRate} Bs/USD)
 
 ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos atentos a sus comentarios. ¡Gracias por preferirnos!`;
 
@@ -674,55 +961,28 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
     <div id="cotizaciones-panel" className="bg-[#fcfdfd] min-h-screen p-6 text-gray-900">
       
       {/* HEADER BAR */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-gray-150 pb-5 mb-6">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-gray-200 pb-5 mb-6">
         <div>
-          <h1 className="text-2xl font-black text-[#131921] uppercase tracking-tight flex items-center gap-2">
-            <FileCheck className="w-6 h-6 text-[#005da9] fill-[#005da9]/10" />
-            <span>Cotizaciones y Presupuestos</span>
+          <h1 className="text-2xl font-montserrat font-extrabold text-[#1D3557] uppercase tracking-tight flex items-center gap-2">
+            <FileCheck className="w-6 h-6 text-[#00BFFF] fill-[#00BFFF]/10" />
+            <span>Presupuestos</span>
           </h1>
-          <p className="text-xs text-gray-500 font-bold mt-0.5">
-            Gestión completa de presupuestos para clientes, cotizaciones de catálogo o libres, y conversión directa a venta.
-          </p>
         </div>
 
         <div>
           <button 
             type="button"
             onClick={handleOpenCreateModal}
-            className="px-4 py-2.5 bg-[#005da9] hover:bg-[#004a87] text-white text-xs font-black rounded-xl transition flex items-center gap-2 cursor-pointer shadow-md"
+            className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition flex items-center gap-2 cursor-pointer shadow-2xs font-montserrat font-bold text-xs active:scale-98"
           >
-            <Plus className="w-4 h-4 shrink-0 text-[#ffb700]" />
-            <span>Crear Cotización</span>
+            <FileText className="w-4 h-4 text-[#005da9] shrink-0" />
+            <span>+ Crear Cotización</span>
           </button>
         </div>
       </div>
 
-      {/* HIGHLIGHT BANNER */}
-      {showPremiumBanner && (
-        <div className="bg-[#005da9] text-white p-4 rounded-2xl mb-6 relative flex items-start gap-4 shadow-md transition-all">
-          <div className="p-2 bg-white/10 rounded-xl mt-0.5 shrink-0">
-            <Sparkles className="w-5 h-5 text-[#ffb700]" />
-          </div>
-          <div className="flex-1 text-left">
-            <h4 className="font-black text-sm tracking-tight text-white mb-0.5">
-              Módulo de Cotizaciones Profesional Activo
-            </h4>
-            <p className="text-xs text-blue-100 font-bold leading-relaxed max-w-4xl">
-              Crea cotizaciones con productos de inventario o ítems libres, imprime comprobantes PDF, comparte por WhatsApp y convierte presupuestos directamente en ventas
-            </p>
-          </div>
-          <button 
-            type="button" 
-            onClick={() => setShowPremiumBanner(false)}
-            className="absolute top-3 right-3 text-white/70 hover:text-white p-1 rounded-lg hover:bg-white/10 transition cursor-pointer"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-      )}
-
       {/* FILTER PANEL */}
-      <div className="bg-white border border-gray-150 p-4 rounded-2xl shadow-xs space-y-3 mb-6">
+      <div className="bg-[#F8F9FA] border border-gray-200 p-4 rounded-2xl shadow-xs space-y-3 mb-6">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
           
           <div className="flex items-center gap-2 flex-wrap text-left">
@@ -730,26 +990,22 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
             <button
               type="button"
               onClick={() => setShowAdvanced(!showAdvanced)}
-              className={`px-3 py-2 border rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
-                showAdvanced 
-                  ? 'bg-gray-100 border-gray-300 text-gray-900' 
-                  : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
-              }`}
+              className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-xs font-montserrat font-bold transition flex items-center gap-1.5 cursor-pointer shadow-2xs active:scale-98"
             >
-              <SlidersHorizontal className="w-3.5 h-3.5" />
+              <SlidersHorizontal className="w-3.5 h-3.5 text-[#005da9]" />
               <span>Filtros</span>
             </button>
 
             {/* Client Dropdown */}
             <div className="flex items-center gap-1.5">
-              <span className="flex items-center gap-1 text-[10px] font-black uppercase text-[#005da9] bg-[#005da9]/5 px-2 py-1 rounded-lg border border-[#005da9]/10">
-                <User className="w-3 h-3 text-[#005da9]" />
+              <span className="flex items-center gap-1 text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] bg-[#1D3557]/10 px-2.5 py-1 rounded-lg border border-[#1D3557]/20">
+                <User className="w-3 h-3 text-[#00BFFF]" />
                 Cliente
               </span>
               <select
                 value={selectedClient}
                 onChange={(e) => setSelectedClient(e.target.value)}
-                className="px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-700 focus:outline-none focus:ring-2 focus:ring-[#005da9] cursor-pointer"
+                className="px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] cursor-pointer"
               >
                 <option value="todos">Todos los clientes</option>
                 {uniqueClientNames.map(name => (
@@ -762,7 +1018,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
             <select
               value={selectedStatus}
               onChange={(e) => setSelectedStatus(e.target.value)}
-              className="px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-700 focus:outline-none focus:ring-2 focus:ring-[#005da9] cursor-pointer"
+              className="px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] cursor-pointer"
             >
               <option value="todos">Todos los estados</option>
               <option value="creada">Creadas / Pendientes</option>
@@ -776,14 +1032,14 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
             {/* Search Input */}
             <div className="relative w-full lg:max-w-xs">
               <span className="absolute left-3 top-1/2 -translate-y-1/2">
-                <Search className="w-4 h-4 text-gray-400" />
+                <Search className="w-4 h-4 text-[#00BFFF]" />
               </span>
               <input
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Buscar cliente, N° o concepto..."
-                className="w-full pl-9 pr-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:bg-white transition"
+                className="w-full pl-9 pr-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#00BFFF] transition"
               />
             </div>
           </div>
@@ -791,8 +1047,8 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
         </div>
 
         {showAdvanced && (
-          <div className="pt-3 border-t border-gray-100 flex items-center justify-between">
-            <span className="text-[10px] font-bold text-gray-400 uppercase">
+          <div className="pt-3 border-t border-gray-200 flex items-center justify-between">
+            <span className="text-[10px] font-montserrat font-bold text-gray-500 uppercase">
               Registros encontrados: {filteredQuotes.length}
             </span>
             <button
@@ -802,7 +1058,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                 setSelectedClient('todos');
                 setSelectedStatus('todos');
               }}
-              className="text-[10px] font-black text-[#005da9] hover:underline cursor-pointer uppercase"
+              className="text-[10px] font-montserrat font-extrabold text-[#00BFFF] hover:underline cursor-pointer uppercase"
             >
               Limpiar filtros
             </button>
@@ -811,17 +1067,17 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
       </div>
 
       {/* TABLE LIST */}
-      <div className="bg-white border border-gray-150 rounded-3xl overflow-hidden shadow-xs">
+      <div className="bg-white border border-gray-200 rounded-2xl overflow-hidden shadow-xs">
         {loading ? (
           <div className="p-16 text-center">
-            <Loader2 className="w-8 h-8 animate-spin text-[#005da9] mx-auto mb-2" />
-            <p className="text-xs font-bold text-gray-500">Cargando cotizaciones...</p>
+            <Loader2 className="w-8 h-8 animate-spin text-[#00BFFF] mx-auto mb-2" />
+            <p className="text-xs font-bold text-[#2B2D42]">Cargando cotizaciones...</p>
           </div>
         ) : filteredQuotes.length === 0 ? (
           <div className="p-16 text-center text-gray-400">
-            <FileText className="w-10 h-10 mx-auto mb-3 text-gray-300" />
-            <p className="text-sm font-black text-gray-600">No se encontraron cotizaciones</p>
-            <p className="text-xs font-bold text-gray-400 mt-1">
+            <FileText className="w-10 h-10 mx-auto mb-3 text-[#00BFFF]/50" />
+            <p className="text-sm font-montserrat font-extrabold text-[#2B2D42]">No se encontraron cotizaciones</p>
+            <p className="text-xs font-medium text-gray-500 mt-1">
               Modifica los filtros o presiona "Crear Cotización" para emitir un nuevo presupuesto.
             </p>
           </div>
@@ -829,19 +1085,17 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse">
               <thead>
-                <tr className="bg-gray-50 border-b border-gray-100 text-gray-400 text-[10px] uppercase font-black tracking-wider">
+                <tr className="bg-[#1D3557] text-white text-[10px] uppercase font-montserrat font-extrabold tracking-wider">
                   <th className="px-6 py-4">N° / Cliente</th>
                   <th className="px-6 py-4">Contacto</th>
                   <th className="px-6 py-4">Concepto / Vendedor</th>
-                  <th className="px-6 py-4">Modalidad</th>
-                  <th className="px-6 py-4">Estado</th>
                   <th className="px-6 py-4">Monto Total</th>
                   <th className="px-6 py-4 text-center">Acciones</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100 text-xs text-gray-800">
                 {filteredQuotes.map((q) => {
-                  const isExpired = q.status === 'expirada';
+                  const isExpired = q.status === 'expirada' || Boolean(q.expiration_date && new Date(q.expiration_date).getTime() < Date.now());
                   const isSold = q.status === 'vendida' || q.status === 'facturada' || q.status === 'aprobada';
 
                   return (
@@ -850,77 +1104,46 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                       {/* Name / Code */}
                       <td className="px-6 py-4">
                         <div>
-                          <p className="font-extrabold text-gray-900 leading-tight">{q.client_name}</p>
-                          <span className="inline-block text-[9px] bg-slate-100 text-slate-700 font-mono font-bold px-1.5 py-0.5 rounded-md mt-1">
-                            {q.quote_number}
+                          <p className="font-montserrat font-extrabold text-[#1D3557] leading-tight">{q.client_name}</p>
+                          <span className="inline-block text-[10px] bg-[#1D3557]/10 text-[#1D3557] font-mono font-bold px-2 py-0.5 rounded-md mt-1 border border-[#1D3557]/20">
+                            #{q.quote_number}
                           </span>
                         </div>
                       </td>
 
                       {/* Phone */}
-                      <td className="px-6 py-4 font-bold text-gray-600">
+                      <td className="px-6 py-4 font-bold text-[#2B2D42]">
                         {q.client_phone ? (
-                          <span className="flex items-center gap-1 text-slate-700">
-                            <Smartphone className="w-3.5 h-3.5 text-gray-400 shrink-0" />
+                          <span className="flex items-center gap-1 text-[#2B2D42]">
+                            <Smartphone className="w-3.5 h-3.5 text-[#00BFFF] shrink-0" />
                             {q.client_phone}
                           </span>
                         ) : (
-                          <span className="text-gray-300 italic">Sin teléfono</span>
+                          <span className="text-gray-400 italic">Sin teléfono</span>
                         )}
                       </td>
 
                       {/* Concept & Seller */}
                       <td className="px-6 py-4">
-                        <p className="font-bold text-gray-900 line-clamp-1 max-w-xs">{q.concept}</p>
-                        <span className="text-[10px] font-bold text-gray-400 block mt-0.5">
+                        <p className="font-bold text-[#2B2D42] line-clamp-1 max-w-xs">{q.concept}</p>
+                        <span className="text-[10px] font-medium text-gray-500 block mt-0.5">
                           Vendedor: {q.seller_name || 'Vendedor Principal'}
-                        </span>
-                      </td>
-
-                      {/* Creation Mode Badge */}
-                      <td className="px-6 py-4">
-                        <span className="inline-flex items-center gap-1 text-[9px] font-extrabold uppercase px-2 py-0.5 rounded-md bg-gray-100 text-gray-600 border border-gray-200">
-                          {q.creation_type === 'libre' ? '✏️ Libre' : q.creation_type === 'mixto' ? '🔄 Mixto' : '📦 Catálogo'}
-                        </span>
-                      </td>
-
-                      {/* Status */}
-                      <td className="px-6 py-4">
-                        <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[9px] font-black uppercase border ${
-                          isSold
-                            ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
-                            : isExpired
-                            ? 'bg-rose-50 border-rose-200 text-rose-700'
-                            : q.status === 'rechazada'
-                            ? 'bg-gray-100 border-gray-200 text-gray-600'
-                            : 'bg-amber-50 border-amber-200 text-amber-700'
-                        }`}>
-                          <span className={`w-1.5 h-1.5 rounded-full ${
-                            isSold ? 'bg-emerald-500' :
-                            isExpired ? 'bg-rose-500' :
-                            q.status === 'rechazada' ? 'bg-gray-400' : 'bg-amber-500'
-                          }`} />
-                          <span>{
-                            isSold ? 'Vendida' :
-                            isExpired ? 'Expirada' :
-                            q.status === 'rechazada' ? 'Rechazada' : 'Creada'
-                          }</span>
                         </span>
                       </td>
 
                       {/* Total */}
                       <td className="px-6 py-4 whitespace-nowrap">
-                        <p className="font-mono font-black text-gray-900 text-sm">
+                        <p className="font-mono font-black text-[#1D3557] text-sm">
                           ${q.total_price.toFixed(2)} USD
                         </p>
-                        <p className="text-[10px] text-gray-400 font-bold font-mono leading-none">
-                          Bs. {(q.total_price * bcvRate).toLocaleString('es-VE', { minimumFractionDigits: 2 })}
+                        <p className="text-[10px] text-gray-500 font-bold font-mono leading-none">
+                          Bs. {((Number(q.total_price) || 0) * (bcvRate || 1)).toLocaleString('es-VE', { minimumFractionDigits: 2 })}
                         </p>
                       </td>
 
                       {/* Actions */}
                       <td className="px-6 py-4 text-center">
-                        <div className="flex items-center justify-center gap-1.5">
+                        <div className="flex items-center justify-center gap-1.5 flex-wrap">
                           {/* View Detail */}
                           <button
                             type="button"
@@ -928,31 +1151,50 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                               setSelectedQuote(q);
                               setShowDetailModal(true);
                             }}
-                            className="p-1.5 bg-slate-50 hover:bg-slate-100 text-[#005da9] rounded-xl border border-gray-200 transition cursor-pointer"
+                            className="p-2 bg-white hover:bg-slate-50 text-[#1D3557] rounded-full border border-slate-300 transition shadow-2xs hover:shadow-xs cursor-pointer active:scale-98"
                             title="Ver detalle"
                           >
-                            <Eye className="w-4 h-4" />
+                            <Eye className="w-4 h-4 text-[#005da9]" />
                           </button>
 
                           {/* Print PDF */}
                           <button
                             type="button"
                             onClick={() => handlePrintPDF(q)}
-                            className="p-1.5 bg-slate-50 hover:bg-slate-100 text-slate-700 rounded-xl border border-gray-200 transition cursor-pointer"
+                            className="p-2 bg-white hover:bg-slate-50 text-[#1D3557] rounded-full border border-slate-300 transition shadow-2xs hover:shadow-xs cursor-pointer active:scale-98"
                             title="Imprimir / PDF"
                           >
-                            <Printer className="w-4 h-4" />
+                            <Printer className="w-4 h-4 text-[#005da9]" />
                           </button>
 
                           {/* Share WhatsApp */}
                           <button
                             type="button"
                             onClick={() => handleShareWhatsApp(q)}
-                            className="p-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-xl border border-emerald-200 transition cursor-pointer"
+                            className="p-2 bg-white hover:bg-slate-50 text-[#1D3557] rounded-full border border-slate-300 transition shadow-2xs hover:shadow-xs cursor-pointer active:scale-98"
                             title="Enviar por WhatsApp"
                           >
-                            <Share2 className="w-4 h-4" />
+                            <Share2 className="w-4 h-4 text-[#005da9]" />
                           </button>
+
+                          {/* Botón Convertir a Ventas con icono de carro de compras y sin texto */}
+                          {!isSold ? (
+                            <button
+                              type="button"
+                              onClick={() => handleOpenBillingModal(q)}
+                              className="p-2 bg-gradient-to-r from-[#1D3557] via-[#005da9] to-[#1D3557] hover:brightness-110 active:scale-95 text-white rounded-full border border-[#005da9]/50 shadow-xs hover:shadow-md transition-all duration-300 flex items-center justify-center cursor-pointer select-none"
+                              title={isExpired ? "Convertir a Ventas (Cotización Vencida)" : "Convertir a Ventas"}
+                            >
+                              <ShoppingCart className="w-4 h-4 text-[#40E0D0] stroke-[2.5]" />
+                            </button>
+                          ) : (
+                            <span
+                              className="p-2 text-emerald-700 bg-emerald-50 rounded-full border border-emerald-200 inline-flex items-center justify-center select-none"
+                              title="Cotización Vendida"
+                            >
+                              <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                            </span>
+                          )}
                         </div>
                       </td>
 
@@ -971,16 +1213,16 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
           <div className="bg-white rounded-3xl border border-gray-100 w-full max-w-3xl shadow-2xl overflow-hidden relative text-left flex flex-col max-h-[92vh]">
             
             {/* Modal Header */}
-            <div className="bg-slate-900 p-5 text-white flex items-center justify-between">
+            <div className="bg-[#1D3557] p-5 text-white flex items-center justify-between">
               <div className="flex items-center gap-3">
-                <div className="p-2 bg-white/10 rounded-xl">
-                  <FileCheck className="w-5 h-5 text-[#ffb700]" />
+                <div className="p-2 bg-[#40E0D0]/20 rounded-xl">
+                  <FileCheck className="w-5 h-5 text-[#40E0D0]" />
                 </div>
                 <div>
-                  <h3 className="font-extrabold text-sm tracking-tight text-white uppercase">
+                  <h3 className="font-montserrat font-extrabold text-sm tracking-tight text-white uppercase">
                     Crear Nueva Cotización
                   </h3>
-                  <p className="text-[10px] text-gray-300 font-medium">
+                  <p className="text-[10px] text-gray-200 font-medium">
                     Emisión de cotización con productos de catálogo o ítems libres.
                   </p>
                 </div>
@@ -988,7 +1230,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
               <button
                 type="button"
                 onClick={() => setShowCreateModal(false)}
-                className="text-gray-400 hover:text-white hover:bg-white/10 p-1.5 rounded-lg transition cursor-pointer"
+                className="text-gray-300 hover:text-white hover:bg-white/10 p-1.5 rounded-lg transition cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -1008,7 +1250,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                     value={formSellerName}
                     onChange={(e) => setFormSellerName(e.target.value)}
                     placeholder="Nombre del vendedor"
-                    className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                    className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                   />
                 </div>
 
@@ -1020,8 +1262,8 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                     <button
                       type="button"
                       onClick={() => setFormExpirationDays('7')}
-                      className={`py-1.5 text-[10px] font-black rounded-lg border transition ${
-                        formExpirationDays === '7' ? 'bg-[#005da9] text-white border-[#005da9]' : 'bg-gray-50 border-gray-200 text-gray-600'
+                      className={`py-1 text-[10px] font-montserrat font-bold rounded-full border transition cursor-pointer ${
+                        formExpirationDays === '7' ? 'bg-[#1D3557] text-white border-[#1D3557]' : 'bg-white hover:bg-slate-50 border-slate-300 text-[#1D3557]'
                       }`}
                     >
                       7 Días
@@ -1029,8 +1271,8 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                     <button
                       type="button"
                       onClick={() => setFormExpirationDays('15')}
-                      className={`py-1.5 text-[10px] font-black rounded-lg border transition ${
-                        formExpirationDays === '15' ? 'bg-[#005da9] text-white border-[#005da9]' : 'bg-gray-50 border-gray-200 text-gray-600'
+                      className={`py-1 text-[10px] font-montserrat font-bold rounded-full border transition cursor-pointer ${
+                        formExpirationDays === '15' ? 'bg-[#1D3557] text-white border-[#1D3557]' : 'bg-white hover:bg-slate-50 border-slate-300 text-[#1D3557]'
                       }`}
                     >
                       15 Días
@@ -1038,8 +1280,8 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                     <button
                       type="button"
                       onClick={() => setFormExpirationDays('30')}
-                      className={`py-1.5 text-[10px] font-black rounded-lg border transition ${
-                        formExpirationDays === '30' ? 'bg-[#005da9] text-white border-[#005da9]' : 'bg-gray-50 border-gray-200 text-gray-600'
+                      className={`py-1 text-[10px] font-montserrat font-bold rounded-full border transition cursor-pointer ${
+                        formExpirationDays === '30' ? 'bg-[#1D3557] text-white border-[#1D3557]' : 'bg-white hover:bg-slate-50 border-slate-300 text-[#1D3557]'
                       }`}
                     >
                       30 Días
@@ -1047,8 +1289,8 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                     <button
                       type="button"
                       onClick={() => setFormExpirationDays('none')}
-                      className={`py-1.5 text-[10px] font-black rounded-lg border transition ${
-                        formExpirationDays === 'none' ? 'bg-[#005da9] text-white border-[#005da9]' : 'bg-gray-50 border-gray-200 text-gray-600'
+                      className={`py-1 text-[10px] font-montserrat font-bold rounded-full border transition cursor-pointer ${
+                        formExpirationDays === 'none' ? 'bg-[#1D3557] text-white border-[#1D3557]' : 'bg-white hover:bg-slate-50 border-slate-300 text-[#1D3557]'
                       }`}
                     >
                       Sin Exp.
@@ -1058,32 +1300,15 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
               </div>
 
               {/* CLIENT SECTION */}
-              <div className="bg-slate-50 border border-gray-200 p-4 rounded-2xl space-y-3">
+              <div className="bg-[#F8F9FA] border border-gray-200 p-4 rounded-2xl space-y-3">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-black uppercase text-gray-500 tracking-wider">Información del Cliente</span>
-                  <div className="flex bg-gray-200 p-0.5 rounded-lg text-[10px] font-black">
-                    <button
-                      type="button"
-                      onClick={() => setFormClientType('existing')}
-                      className={`px-2.5 py-1 rounded-md transition ${formClientType === 'existing' ? 'bg-white text-slate-800 shadow-3xs' : 'text-gray-500'}`}
-                    >
-                      Cliente Existente
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setFormClientType('new')}
-                      className={`px-2.5 py-1 rounded-md transition ${formClientType === 'new' ? 'bg-white text-slate-800 shadow-3xs' : 'text-gray-500'}`}
-                    >
-                      Cliente Nuevo
-                    </button>
-                  </div>
+                  <span className="text-xs font-montserrat font-extrabold uppercase text-[#1D3557] tracking-wider">Información del Cliente</span>
                 </div>
 
-                {formClientType === 'existing' ? (
-                  <div className="space-y-2">
+                <div className="space-y-2">
+                  <div className="w-full">
                     <select
                       value={formClientId}
-                      required={formClientType === 'existing'}
                       onChange={(e) => {
                         const selectedVal = e.target.value;
                         setFormClientId(selectedVal);
@@ -1094,7 +1319,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                           setFormClientEmail(selectedObj.email || '');
                         }
                       }}
-                      className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                      className="w-full px-3 py-2.5 bg-white border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                     >
                       <option value="">-- Selecciona Cliente ({clients.length} disponibles) --</option>
                       {clients.map(c => (
@@ -1103,71 +1328,38 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                         </option>
                       ))}
                     </select>
+                  </div>
 
-                    {formClientId && (
-                      <div className="p-3 bg-blue-50/70 border border-blue-200 rounded-xl text-xs flex flex-wrap items-center justify-between gap-2">
-                        <div className="space-y-0.5">
-                          <span className="font-extrabold text-blue-900 block">Cliente: {formClientName || formClientId}</span>
-                          <div className="text-[11px] text-blue-700 flex items-center gap-3">
-                            {formClientPhone && <span>📱 {formClientPhone}</span>}
-                            {formClientEmail && <span>✉️ {formClientEmail}</span>}
-                          </div>
+                  {formClientId && (
+                    <div className="p-3 bg-[#1D3557]/10 border border-[#1D3557]/20 rounded-xl text-xs flex flex-wrap items-center justify-between gap-2">
+                      <div className="space-y-0.5">
+                        <span className="font-montserrat font-extrabold text-[#1D3557] block">Cliente: {formClientName || formClientId}</span>
+                        <div className="text-[11px] text-[#2B2D42] flex items-center gap-3">
+                          {formClientPhone && <span>📱 {formClientPhone}</span>}
+                          {formClientEmail && <span>✉️ {formClientEmail}</span>}
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setFormClientId('');
-                            setFormClientName('');
-                            setFormClientPhone('');
-                            setFormClientEmail('');
-                          }}
-                          className="text-[10px] font-bold text-rose-600 hover:underline cursor-pointer"
-                        >
-                          Cambiar / Limpiar
-                        </button>
                       </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                    <div>
-                      <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Nombre Completo *</label>
-                      <input
-                        type="text"
-                        required={formClientType === 'new'}
-                        value={formClientName}
-                        onChange={(e) => setFormClientName(e.target.value)}
-                        placeholder="Ej: Pedro Pérez"
-                        className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
-                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setFormClientId('');
+                          setFormClientName('');
+                          setFormClientPhone('');
+                          setFormClientEmail('');
+                        }}
+                        className="px-3 py-1 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-[10px] font-bold shadow-2xs transition cursor-pointer active:scale-98 flex items-center gap-1"
+                      >
+                        <X className="w-3 h-3 text-[#005da9]" />
+                        <span>Cambiar / Limpiar</span>
+                      </button>
                     </div>
-                    <div>
-                      <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Teléfono / WhatsApp *</label>
-                      <input
-                        type="text"
-                        value={formClientPhone}
-                        onChange={(e) => setFormClientPhone(e.target.value)}
-                        placeholder="Ej: 04141234567"
-                        className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[10px] font-black uppercase text-gray-400 mb-1">Correo Electrónico</label>
-                      <input
-                        type="email"
-                        value={formClientEmail}
-                        onChange={(e) => setFormClientEmail(e.target.value)}
-                        placeholder="Ej: cliente@gmail.com"
-                        className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
-                      />
-                    </div>
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
 
               {/* CONCEPT FIELD */}
               <div>
-                <label className="block text-xs font-black text-gray-700 uppercase tracking-wider mb-1">
+                <label className="block text-xs font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
                   Concepto / Referencia General *
                 </label>
                 <input
@@ -1176,35 +1368,35 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                   value={formConcept}
                   onChange={(e) => setFormConcept(e.target.value)}
                   placeholder="Ej: Presupuesto de impresiones de tesis y planos digitales"
-                  className="w-full px-3.5 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:bg-white transition"
+                  className="w-full px-3.5 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
                 />
               </div>
 
               {/* ITEM PICKER TABS: CATALOG VS LIBRE */}
               <div className="border border-gray-200 rounded-2xl p-4 space-y-4 bg-white">
                 <div className="flex items-center justify-between border-b border-gray-100 pb-2.5">
-                  <span className="text-xs font-black uppercase text-gray-700 tracking-wider">
+                  <span className="text-xs font-montserrat font-extrabold uppercase text-[#1D3557] tracking-wider">
                     Agregar Ítems a la Cotización
                   </span>
-                  <div className="flex bg-gray-100 p-1 rounded-xl text-xs font-bold">
+                  <div className="flex bg-gray-100 p-1 rounded-full text-xs font-montserrat font-bold">
                     <button
                       type="button"
                       onClick={() => setItemPickerTab('catalog')}
-                      className={`px-3 py-1 rounded-lg transition flex items-center gap-1 cursor-pointer ${
-                        itemPickerTab === 'catalog' ? 'bg-[#005da9] text-white shadow-3xs font-black' : 'text-gray-600 hover:text-gray-900'
+                      className={`px-3 py-1.5 rounded-full transition flex items-center gap-1.5 cursor-pointer ${
+                        itemPickerTab === 'catalog' ? 'bg-white text-[#1D3557] border border-slate-300 shadow-2xs font-bold' : 'text-[#2B2D42] hover:text-[#1D3557]'
                       }`}
                     >
-                      <PackageCheck className="w-3.5 h-3.5" />
+                      <PackageCheck className="w-3.5 h-3.5 text-[#005da9]" />
                       <span>Desde Catálogo</span>
                     </button>
                     <button
                       type="button"
                       onClick={() => setItemPickerTab('libre')}
-                      className={`px-3 py-1 rounded-lg transition flex items-center gap-1 cursor-pointer ${
-                        itemPickerTab === 'libre' ? 'bg-[#005da9] text-white shadow-3xs font-black' : 'text-gray-600 hover:text-gray-900'
+                      className={`px-3 py-1.5 rounded-full transition flex items-center gap-1.5 cursor-pointer ${
+                        itemPickerTab === 'libre' ? 'bg-white text-[#1D3557] border border-slate-300 shadow-2xs font-bold' : 'text-[#2B2D42] hover:text-[#1D3557]'
                       }`}
                     >
-                      <Edit3 className="w-3.5 h-3.5" />
+                      <Edit3 className="w-3.5 h-3.5 text-[#005da9]" />
                       <span>Ítem / Concepto Libre</span>
                     </button>
                   </div>
@@ -1225,7 +1417,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                             placeholder="🔍 Buscar producto por nombre o SKU..."
                             value={searchProdQuery}
                             onChange={(e) => setSearchProdQuery(e.target.value)}
-                            className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                           />
                           {searchProdQuery && (
                             <button
@@ -1250,7 +1442,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                             const prod = products.find(p => p.id === e.target.value);
                             if (prod) setCatalogCustomPrice(prod.price.toString());
                           }}
-                          className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                          className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                         >
                           <option value="">
                             {searchProdQuery.trim()
@@ -1279,7 +1471,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                     {selectedProductObj && (
                       <div className="border border-gray-200 rounded-2xl overflow-hidden bg-white shadow-2xs mt-2">
                         {/* HEADER DE LA TABLA (IMAGEN 1) */}
-                        <div className="bg-gray-50/90 border-b border-gray-200/80 px-4 py-2 grid grid-cols-12 gap-2 text-[10px] font-black uppercase text-gray-500 tracking-wider items-center">
+                        <div className="bg-[#1D3557] text-white px-4 py-2 grid grid-cols-12 gap-2 text-[10px] font-montserrat font-extrabold uppercase tracking-wider items-center">
                           <div className="col-span-5 sm:col-span-6">PRODUCTO</div>
                           <div className="col-span-3 sm:col-span-2 text-center">CANT</div>
                           <div className="col-span-3 sm:col-span-2 text-center">PRECIO ($)</div>
@@ -1289,10 +1481,10 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                         {/* FILA DEL PRODUCTO SELECCIONADO */}
                         <div className="p-3.5 grid grid-cols-12 gap-2 items-center">
                           <div className="col-span-5 sm:col-span-6">
-                            <span className="text-xs font-black text-gray-900 block leading-tight">
+                            <span className="text-xs font-bold text-[#2B2D42] block leading-tight">
                               {selectedProductObj.name}
                             </span>
-                            <span className="inline-block mt-1 bg-blue-50 text-blue-700 border border-blue-200/70 font-extrabold text-[10px] px-2 py-0.5 rounded-md">
+                            <span className="inline-block mt-1 bg-[#1D3557]/10 text-[#1D3557] border border-[#1D3557]/20 font-extrabold text-[10px] px-2 py-0.5 rounded-md">
                               Exento (0%)
                             </span>
                           </div>
@@ -1301,7 +1493,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                             <button
                               type="button"
                               onClick={() => setCatalogQty(Math.max(1, catalogQty - 1))}
-                              className="w-6 h-6 rounded-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold transition flex items-center justify-center cursor-pointer select-none"
+                              className="w-6 h-6 rounded-full bg-gray-100 hover:bg-gray-200 text-[#2B2D42] text-xs font-bold transition flex items-center justify-center cursor-pointer select-none"
                             >
                               -
                             </button>
@@ -1310,19 +1502,19 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                               min="1"
                               value={catalogQty}
                               onChange={(e) => setCatalogQty(Math.max(1, parseInt(e.target.value) || 1))}
-                              className="w-11 py-1 text-center bg-gray-50 border border-gray-200 rounded-xl text-xs font-black text-gray-800 focus:outline-none focus:ring-1 focus:ring-[#005da9]"
+                              className="w-11 py-1 text-center bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-black text-[#2B2D42] focus:outline-none focus:ring-1 focus:ring-[#00BFFF]"
                             />
                             <button
                               type="button"
                               onClick={() => setCatalogQty(catalogQty + 1)}
-                              className="w-6 h-6 rounded-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold transition flex items-center justify-center cursor-pointer select-none"
+                              className="w-6 h-6 rounded-full bg-gray-100 hover:bg-gray-200 text-[#2B2D42] text-xs font-bold transition flex items-center justify-center cursor-pointer select-none"
                             >
                               +
                             </button>
                           </div>
 
                           <div className="col-span-3 sm:col-span-2 flex items-center justify-center">
-                            <div className="inline-flex items-center gap-1 bg-white border border-gray-200 px-2.5 py-1 rounded-full text-xs font-black text-gray-800 focus-within:ring-1 focus-within:ring-[#005da9]">
+                            <div className="inline-flex items-center gap-1 bg-white border border-gray-200 px-2.5 py-1 rounded-full text-xs font-black text-[#2B2D42] focus-within:ring-1 focus-within:ring-[#00BFFF]">
                               <span className="text-gray-400 font-bold">$</span>
                               <input
                                 type="number"
@@ -1338,10 +1530,10 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                             <button
                               type="button"
                               onClick={handleAddCatalogItem}
-                              className="px-3 py-1.5 bg-[#005da9] hover:bg-blue-700 text-white text-xs font-bold rounded-xl transition flex items-center gap-1 shadow-3xs cursor-pointer"
+                              className="px-3.5 py-1.5 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 text-xs font-montserrat font-bold rounded-full transition flex items-center gap-1 shadow-2xs hover:shadow-xs cursor-pointer active:scale-98"
                               title="Agregar a la cotización"
                             >
-                              <Plus className="w-4 h-4" />
+                              <Plus className="w-4 h-4 text-[#005da9]" />
                               <span className="hidden sm:inline">Agregar</span>
                             </button>
                           </div>
@@ -1361,13 +1553,13 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                         value={freeConceptName}
                         onChange={(e) => setFreeConceptName(e.target.value)}
                         placeholder="Ej: Carnet en Lamina PVC Sublimado Colores"
-                        className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                        className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
                       />
                     </div>
 
                     {/* CARD CON LA FORMA DE LA IMAGEN 1 PARA CONCEPTO LIBRE */}
                     <div className="border border-gray-200 rounded-2xl overflow-hidden bg-white shadow-2xs mt-2">
-                      <div className="bg-gray-50/90 border-b border-gray-200/80 px-4 py-2 grid grid-cols-12 gap-2 text-[10px] font-black uppercase text-gray-500 tracking-wider items-center">
+                      <div className="bg-[#1D3557] text-white px-4 py-2 grid grid-cols-12 gap-2 text-[10px] font-montserrat font-extrabold uppercase tracking-wider items-center">
                         <div className="col-span-5 sm:col-span-6">CONCEPTO</div>
                         <div className="col-span-3 sm:col-span-2 text-center">CANT</div>
                         <div className="col-span-3 sm:col-span-2 text-center">PRECIO ($)</div>
@@ -1376,10 +1568,10 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
 
                       <div className="p-3.5 grid grid-cols-12 gap-2 items-center">
                         <div className="col-span-5 sm:col-span-6">
-                          <span className="text-xs font-black text-gray-900 block leading-tight">
+                          <span className="text-xs font-bold text-[#2B2D42] block leading-tight">
                             {freeConceptName || 'Concepto Libre'}
                           </span>
-                          <span className="inline-block mt-1 bg-blue-50 text-blue-700 border border-blue-200/70 font-extrabold text-[10px] px-2 py-0.5 rounded-md">
+                          <span className="inline-block mt-1 bg-[#1D3557]/10 text-[#1D3557] border border-[#1D3557]/20 font-extrabold text-[10px] px-2 py-0.5 rounded-md">
                             Exento (0%)
                           </span>
                         </div>
@@ -1388,7 +1580,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                           <button
                             type="button"
                             onClick={() => setFreeQty(Math.max(1, freeQty - 1))}
-                            className="w-6 h-6 rounded-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold transition flex items-center justify-center cursor-pointer select-none"
+                            className="w-6 h-6 rounded-full bg-gray-100 hover:bg-gray-200 text-[#2B2D42] text-xs font-bold transition flex items-center justify-center cursor-pointer select-none"
                           >
                             -
                           </button>
@@ -1397,19 +1589,19 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                             min="1"
                             value={freeQty}
                             onChange={(e) => setFreeQty(Math.max(1, parseInt(e.target.value) || 1))}
-                            className="w-11 py-1 text-center bg-gray-50 border border-gray-200 rounded-xl text-xs font-black text-gray-800 focus:outline-none focus:ring-1 focus:ring-[#005da9]"
+                            className="w-11 py-1 text-center bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-black text-[#2B2D42] focus:outline-none focus:ring-1 focus:ring-[#00BFFF]"
                           />
                           <button
                             type="button"
                             onClick={() => setFreeQty(freeQty + 1)}
-                            className="w-6 h-6 rounded-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold transition flex items-center justify-center cursor-pointer select-none"
+                            className="w-6 h-6 rounded-full bg-gray-100 hover:bg-gray-200 text-[#2B2D42] text-xs font-bold transition flex items-center justify-center cursor-pointer select-none"
                           >
                             +
                           </button>
                         </div>
 
                         <div className="col-span-3 sm:col-span-2 flex items-center justify-center">
-                          <div className="inline-flex items-center gap-1 bg-white border border-gray-200 px-2.5 py-1 rounded-full text-xs font-black text-gray-800 focus-within:ring-1 focus-within:ring-[#005da9]">
+                          <div className="inline-flex items-center gap-1 bg-white border border-gray-200 px-2.5 py-1 rounded-full text-xs font-black text-[#2B2D42] focus-within:ring-1 focus-within:ring-[#00BFFF]">
                             <span className="text-gray-400 font-bold">$</span>
                             <input
                               type="number"
@@ -1426,10 +1618,10 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                           <button
                             type="button"
                             onClick={handleAddFreeItem}
-                            className="px-3 py-1.5 bg-[#005da9] hover:bg-blue-700 text-white text-xs font-bold rounded-xl transition flex items-center gap-1 shadow-3xs cursor-pointer"
+                            className="px-3.5 py-1.5 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 text-xs font-montserrat font-bold rounded-full transition flex items-center gap-1 shadow-2xs hover:shadow-xs cursor-pointer active:scale-98"
                             title="Agregar a la cotización"
                           >
-                            <Plus className="w-4 h-4" />
+                            <Plus className="w-4 h-4 text-[#005da9]" />
                             <span className="hidden sm:inline">Agregar</span>
                           </button>
                         </div>
@@ -1440,14 +1632,14 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
 
                 {/* TABLA DE ÍTEMS AGREGADOS CON LA FORMA DE LA IMAGEN 1 */}
                 <div className="pt-2">
-                  <span className="block text-[10px] font-black uppercase text-gray-500 mb-2 tracking-wider">
+                  <span className="block text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] mb-2 tracking-wider">
                     Ítems en la Cotización ({formItems.length})
                   </span>
 
                   {formItems.length > 0 ? (
                     <div className="border border-gray-200 rounded-2xl overflow-hidden bg-white shadow-2xs">
                       {/* HEADER DE LA TABLA (IMAGEN 1) */}
-                      <div className="bg-gray-50/90 border-b border-gray-200/80 px-4 py-2 grid grid-cols-12 gap-2 text-[10px] font-black uppercase text-gray-500 tracking-wider items-center">
+                      <div className="bg-[#1D3557] text-white px-4 py-2 grid grid-cols-12 gap-2 text-[10px] font-montserrat font-extrabold uppercase tracking-wider items-center">
                         <div className="col-span-5 sm:col-span-6">PRODUCTO</div>
                         <div className="col-span-3 sm:col-span-2 text-center">CANT</div>
                         <div className="col-span-3 sm:col-span-2 text-center">PRECIO ($)</div>
@@ -1457,12 +1649,12 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                       {/* FILAS DE ÍTEMS AGREGADOS (ESTILO EXACTO IMAGEN 1) */}
                       <div className="divide-y divide-gray-100">
                         {formItems.map((item, index) => (
-                          <div key={index} className="p-3.5 grid grid-cols-12 gap-2 items-center hover:bg-slate-50/50 transition">
+                          <div key={index} className="p-3.5 grid grid-cols-12 gap-2 items-center hover:bg-[#F8F9FA] transition">
                             <div className="col-span-5 sm:col-span-6">
-                              <span className="text-xs font-black text-gray-900 block leading-tight">
+                              <span className="text-xs font-bold text-[#2B2D42] block leading-tight">
                                 {item.name}
                               </span>
-                              <span className="inline-block mt-1 bg-blue-50 text-blue-700 border border-blue-200/70 font-extrabold text-[10px] px-2 py-0.5 rounded-md">
+                              <span className="inline-block mt-1 bg-[#1D3557]/10 text-[#1D3557] border border-[#1D3557]/20 font-extrabold text-[10px] px-2 py-0.5 rounded-md">
                                 Exento (0%)
                               </span>
                             </div>
@@ -1471,7 +1663,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                               <button
                                 type="button"
                                 onClick={() => handleUpdateItemQty(index, -1)}
-                                className="w-6 h-6 rounded-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold transition flex items-center justify-center cursor-pointer select-none"
+                                className="w-6 h-6 rounded-full bg-gray-100 hover:bg-gray-200 text-[#2B2D42] text-xs font-bold transition flex items-center justify-center cursor-pointer select-none"
                               >
                                 -
                               </button>
@@ -1480,19 +1672,19 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                                 min="1"
                                 value={item.quantity}
                                 onChange={(e) => handleSetItemQty(index, e.target.value)}
-                                className="w-11 py-1 text-center bg-gray-50 border border-gray-200 rounded-xl text-xs font-black text-gray-800 focus:outline-none focus:ring-1 focus:ring-[#005da9]"
+                                className="w-11 py-1 text-center bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-black text-[#2B2D42] focus:outline-none focus:ring-1 focus:ring-[#00BFFF]"
                               />
                               <button
                                 type="button"
                                 onClick={() => handleUpdateItemQty(index, 1)}
-                                className="w-6 h-6 rounded-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold transition flex items-center justify-center cursor-pointer select-none"
+                                className="w-6 h-6 rounded-full bg-gray-100 hover:bg-gray-200 text-[#2B2D42] text-xs font-bold transition flex items-center justify-center cursor-pointer select-none"
                               >
                                 +
                               </button>
                             </div>
 
                             <div className="col-span-3 sm:col-span-2 flex items-center justify-center">
-                              <div className="inline-flex items-center gap-1 bg-white border border-gray-200 px-2.5 py-1 rounded-full text-xs font-black text-gray-800 focus-within:ring-1 focus-within:ring-[#005da9]">
+                              <div className="inline-flex items-center gap-1 bg-white border border-gray-200 px-2.5 py-1 rounded-full text-xs font-black text-[#2B2D42] focus-within:ring-1 focus-within:ring-[#00BFFF]">
                                 <span className="text-gray-400 font-bold">$</span>
                                 <input
                                   type="number"
@@ -1508,10 +1700,10 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                               <button
                                 type="button"
                                 onClick={() => handleRemoveItem(index)}
-                                className="text-gray-400 hover:text-rose-600 p-1.5 rounded-lg transition cursor-pointer"
+                                className="p-1.5 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs cursor-pointer active:scale-98"
                                 title="Eliminar ítem"
                               >
-                                <Trash2 className="w-4 h-4" />
+                                <Trash2 className="w-4 h-4 text-[#005da9]" />
                               </button>
                             </div>
                           </div>
@@ -1519,7 +1711,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                       </div>
                     </div>
                   ) : (
-                    <p className="text-[11px] text-gray-400 font-bold italic text-center py-4 bg-gray-50/50 rounded-2xl border border-dashed border-gray-200">
+                    <p className="text-[11px] text-gray-400 font-bold italic text-center py-4 bg-[#F8F9FA] rounded-2xl border border-dashed border-gray-200">
                       No se han agregado ítems a la cotización.
                     </p>
                   )}
@@ -1527,7 +1719,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
               </div>
 
               {/* OPTIONAL DISCOUNTS & TAXES BREAKDOWN */}
-              <div className="bg-slate-50 border border-gray-200 p-4 rounded-2xl grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="bg-[#F8F9FA] border border-gray-200 p-4 rounded-2xl grid grid-cols-1 md:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-[10px] font-black uppercase text-gray-500 mb-1">
                     Descuento Aplicado ($)
@@ -1538,7 +1730,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                     min="0"
                     value={formDiscountAmount}
                     onChange={(e) => setFormDiscountAmount(e.target.value)}
-                    className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none"
+                    className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none"
                   />
                 </div>
 
@@ -1553,7 +1745,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                     max="100"
                     value={formTaxPercent}
                     onChange={(e) => setFormTaxPercent(e.target.value)}
-                    className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none"
+                    className="w-full px-3 py-2 bg-white border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none"
                   />
                 </div>
               </div>
@@ -1561,16 +1753,16 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
               {/* OBSERVATIONS NOTES */}
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <label className="block text-xs font-black text-gray-700 uppercase tracking-wider">
+                  <label className="block text-xs font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider">
                     Notas / Condiciones del Presupuesto
                   </label>
                   <button
                     type="button"
                     onClick={() => setFormNotes(DEFAULT_QUOTE_NOTES)}
-                    className="text-[10px] font-bold text-[#005da9] hover:underline cursor-pointer flex items-center gap-1"
+                    className="px-3 py-1 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full text-[10px] font-bold shadow-2xs transition cursor-pointer active:scale-98 flex items-center gap-1"
                     title="Restablecer texto predeterminado"
                   >
-                    <RotateCcw className="w-3 h-3" />
+                    <RotateCcw className="w-3 h-3 text-[#005da9]" />
                     <span>Restablecer Nota Predeterminada</span>
                   </button>
                 </div>
@@ -1579,13 +1771,13 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                   onChange={(e) => setFormNotes(e.target.value)}
                   placeholder="Ej: Requiere el 50% de anticipo. Tiempo de entrega: 48 horas hábiles..."
                   rows={4}
-                  className="w-full px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:bg-white transition leading-relaxed"
+                  className="w-full px-3 py-2.5 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition leading-relaxed"
                 />
               </div>
 
               {/* FOOTER TOTAL CALCULATOR */}
-              <div className="bg-[#005da9]/5 border border-[#005da9]/15 p-4 rounded-2xl space-y-2">
-                <div className="flex justify-between text-xs text-gray-600 font-bold">
+              <div className="bg-[#1D3557]/5 border border-[#1D3557]/20 p-4 rounded-2xl space-y-2">
+                <div className="flex justify-between text-xs text-[#2B2D42] font-bold">
                   <span>Subtotal:</span>
                   <span className="font-mono">${formSubtotal.toFixed(2)}</span>
                 </div>
@@ -1596,21 +1788,21 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                   </div>
                 )}
                 {formTax > 0 && (
-                  <div className="flex justify-between text-xs text-slate-700 font-bold">
+                  <div className="flex justify-between text-xs text-[#2B2D42] font-bold">
                     <span>IVA ({formTaxPercent}%):</span>
                     <span className="font-mono">+${formTax.toFixed(2)}</span>
                   </div>
                 )}
-                <div className="border-t border-[#005da9]/20 pt-2 flex justify-between items-center">
+                <div className="border-t border-[#1D3557]/20 pt-2 flex justify-between items-center">
                   <div>
-                    <span className="text-xs font-black uppercase text-slate-800 block">TOTAL ESTIMADO FINAL</span>
-                    <span className="text-xs text-slate-600 font-bold">
-                      Bs. {(formTotalPrice * bcvRate).toLocaleString('es-VE', { minimumFractionDigits: 2 })} (Tasa {bcvRate})
+                    <span className="text-xs font-montserrat font-extrabold uppercase text-[#1D3557] block">TOTAL ESTIMADO FINAL</span>
+                    <span className="text-xs text-[#2B2D42]/70 font-bold">
+                      Bs. {((Number(formTotalPrice) || 0) * (bcvRate || 1)).toLocaleString('es-VE', { minimumFractionDigits: 2 })} (Tasa {bcvRate})
                     </span>
                   </div>
                   <div className="text-right">
-                    <span className="text-2xl font-black text-[#005da9]">${formTotalPrice.toFixed(2)}</span>
-                    <span className="text-xs font-black text-slate-800 ml-1">USD</span>
+                    <span className="text-2xl font-montserrat font-extrabold text-[#1D3557]">${formTotalPrice.toFixed(2)}</span>
+                    <span className="text-xs font-montserrat font-extrabold text-[#1D3557] ml-1">USD</span>
                   </div>
                 </div>
               </div>
@@ -1620,15 +1812,16 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                 <button
                   type="button"
                   onClick={() => setShowCreateModal(false)}
-                  className="px-4 py-2 border border-gray-200 text-gray-600 font-bold text-xs rounded-xl hover:bg-gray-50 transition cursor-pointer"
+                  className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full font-bold text-xs shadow-2xs transition cursor-pointer active:scale-98 flex items-center gap-1.5"
                 >
-                  Cancelar
+                  <X className="w-4 h-4 text-[#005da9]" />
+                  <span>Cancelar</span>
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2.5 bg-[#005da9] hover:bg-[#004a87] text-white font-black text-xs rounded-xl shadow-md transition flex items-center gap-1.5 cursor-pointer"
+                  className="px-5 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-montserrat font-bold text-xs rounded-full shadow-2xs hover:shadow-xs transition flex items-center gap-1.5 cursor-pointer uppercase tracking-wider active:scale-98"
                 >
-                  <Check className="w-4 h-4 text-[#ffb700]" />
+                  <Check className="w-4 h-4 text-[#005da9] stroke-[2.5]" />
                   <span>Guardar Cotización</span>
                 </button>
               </div>
@@ -1643,14 +1836,14 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
           <div className="printable-area bg-white rounded-3xl border border-gray-100 w-full max-w-xl shadow-2xl overflow-hidden relative text-left">
             
-            <div className="bg-slate-900 p-5 text-white flex items-center justify-between">
+            <div className="bg-[#1D3557] p-5 text-white flex items-center justify-between">
               <div className="flex items-center gap-2.5">
-                <FileText className="w-5 h-5 text-[#ffb700]" />
+                <FileText className="w-5 h-5 text-[#40E0D0]" />
                 <div>
-                  <h3 className="font-extrabold text-sm tracking-tight text-white uppercase">
+                  <h3 className="font-montserrat font-extrabold text-sm tracking-tight text-white uppercase">
                     Detalle de Cotización #{selectedQuote.quote_number}
                   </h3>
-                  <p className="text-[10px] text-gray-300">
+                  <p className="text-[10px] text-gray-200">
                     Vendedor: {selectedQuote.seller_name || 'Vendedor Principal'}
                   </p>
                 </div>
@@ -1658,7 +1851,7 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
               <button
                 type="button"
                 onClick={() => setShowDetailModal(false)}
-                className="text-gray-400 hover:text-white hover:bg-white/10 p-1.5 rounded-lg transition cursor-pointer"
+                className="text-gray-300 hover:text-white hover:bg-white/10 p-1.5 rounded-lg transition cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -1667,14 +1860,14 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
             <div className="p-6 space-y-5 max-h-[75vh] overflow-y-auto">
               
               {/* PRINT & PREVIEW BUSINESS HEADER */}
-              <div className="text-center pb-3 border-b border-gray-150 space-y-0.5">
-                <h2 className="text-base font-black uppercase text-[#005da9] tracking-tight">
+              <div className="text-center pb-3 border-b border-gray-200 space-y-0.5">
+                <h2 className="text-base font-montserrat font-extrabold uppercase text-[#1D3557] tracking-tight">
                   {businessProfile?.name || 'Copias Bella Vista'}
                 </h2>
                 {businessProfile?.slogan && (
-                  <p className="text-[10px] text-gray-500 font-bold italic">{businessProfile.slogan}</p>
+                  <p className="text-[10px] text-[#2B2D42]/70 font-bold italic">{businessProfile.slogan}</p>
                 )}
-                <div className="flex flex-wrap items-center justify-center gap-3 text-[10px] text-gray-600 font-mono pt-0.5">
+                <div className="flex flex-wrap items-center justify-center gap-3 text-[10px] text-[#2B2D42] font-mono pt-0.5">
                   {businessProfile?.rif && <span>RIF: {businessProfile.rif}</span>}
                   {businessProfile?.phone && <span>Telf: {businessProfile.phone}</span>}
                   {businessProfile?.address && <span>{businessProfile.address}</span>}
@@ -1685,14 +1878,14 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
               <div className="flex items-center justify-between border-b border-gray-100 pb-4">
                 <div>
                   <span className="text-[10px] font-black uppercase text-gray-400 block leading-none">Fecha Emisión</span>
-                  <span className="text-xs font-bold text-gray-800 block mt-1">
+                  <span className="text-xs font-bold text-[#2B2D42] block mt-1">
                     {new Date(selectedQuote.created_at).toLocaleDateString('es-VE', { day: '2-digit', month: 'short', year: 'numeric' })}
                   </span>
                 </div>
 
                 <div>
                   <span className="text-[10px] font-black uppercase text-gray-400 block leading-none">Validez Hasta</span>
-                  <span className="text-xs font-bold text-gray-800 block mt-1">
+                  <span className="text-xs font-bold text-[#2B2D42] block mt-1">
                     {selectedQuote.expiration_date 
                       ? new Date(selectedQuote.expiration_date).toLocaleDateString('es-VE', { day: '2-digit', month: 'short', year: 'numeric' })
                       : 'Sin Expiración'}
@@ -1701,9 +1894,9 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
 
                 <div className="text-right">
                   <span className="text-[10px] font-black uppercase text-gray-400 block leading-none">Estado</span>
-                  <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[9px] font-black uppercase border mt-1 ${
+                  <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[9px] font-montserrat font-extrabold uppercase border mt-1 ${
                     selectedQuote.status === 'vendida' || selectedQuote.status === 'facturada'
-                      ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                      ? 'bg-[#40E0D0]/15 border-[#40E0D0]/30 text-[#1D3557]'
                       : selectedQuote.status === 'expirada'
                       ? 'bg-rose-50 border-rose-200 text-rose-700'
                       : 'bg-amber-50 border-amber-200 text-amber-700'
@@ -1718,22 +1911,22 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
 
               {/* CLIENT DETAILS */}
               <div className="space-y-1.5">
-                <span className="text-[10px] font-black uppercase text-gray-400 block tracking-wider">Información del Cliente</span>
-                <div className="bg-slate-50 border border-gray-150 rounded-2xl p-4 space-y-1.5">
+                <span className="text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] block tracking-wider">Información del Cliente</span>
+                <div className="bg-[#F8F9FA] border border-gray-200 rounded-2xl p-4 space-y-1.5">
                   <div className="flex items-center gap-2">
-                    <User className="w-4 h-4 text-[#005da9]" />
-                    <span className="text-xs font-extrabold text-slate-900">{selectedQuote.client_name}</span>
+                    <User className="w-4 h-4 text-[#00BFFF]" />
+                    <span className="text-xs font-montserrat font-extrabold text-[#1D3557]">{selectedQuote.client_name}</span>
                   </div>
                   {selectedQuote.client_phone && (
                     <div className="flex items-center gap-2">
-                      <Smartphone className="w-4 h-4 text-gray-400" />
-                      <span className="text-xs font-bold text-gray-600">{selectedQuote.client_phone}</span>
+                      <Smartphone className="w-4 h-4 text-[#00BFFF]" />
+                      <span className="text-xs font-bold text-[#2B2D42]">{selectedQuote.client_phone}</span>
                     </div>
                   )}
                   {selectedQuote.client_email && (
                     <div className="flex items-center gap-2">
                       <Mail className="w-4 h-4 text-gray-400" />
-                      <span className="text-xs font-bold text-gray-600">{selectedQuote.client_email}</span>
+                      <span className="text-xs font-bold text-[#2B2D42]">{selectedQuote.client_email}</span>
                     </div>
                   )}
                 </div>
@@ -1741,35 +1934,35 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
 
               {/* CONCEPT */}
               <div className="space-y-1">
-                <span className="text-[10px] font-black uppercase text-gray-400 block tracking-wider">Concepto de Operación</span>
-                <p className="text-xs font-extrabold text-slate-900 bg-amber-50/50 border border-amber-100 p-3 rounded-xl">
+                <span className="text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] block tracking-wider">Concepto de Operación</span>
+                <p className="text-xs font-extrabold text-[#1D3557] bg-[#1D3557]/5 border border-[#1D3557]/15 p-3 rounded-xl">
                   {selectedQuote.concept}
                 </p>
               </div>
 
               {/* PRODUCT ITEMS LIST */}
               <div className="space-y-1.5">
-                <span className="text-[10px] font-black uppercase text-gray-400 block tracking-wider">Detalle de Ítems</span>
-                <div className="border border-gray-150 rounded-2xl overflow-hidden">
+                <span className="text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] block tracking-wider">Detalle de Ítems</span>
+                <div className="border border-gray-200 rounded-2xl overflow-hidden">
                   <table className="w-full text-left text-xs">
                     <thead>
-                      <tr className="bg-gray-50 border-b border-gray-100 text-gray-400 font-bold">
+                      <tr className="bg-[#1D3557] text-white font-montserrat font-extrabold text-[10px] uppercase">
                         <th className="px-4 py-2">Detalle</th>
                         <th className="px-4 py-2 text-center">Tipo</th>
                         <th className="px-4 py-2 text-center">Cant</th>
                         <th className="px-4 py-2 text-right">Precio</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-gray-100 text-slate-700">
+                    <tbody className="divide-y divide-gray-100 text-[#2B2D42]">
                       {selectedQuote.items.map((item, idx) => (
-                        <tr key={idx}>
+                        <tr key={idx} className="hover:bg-[#F8F9FA]">
                           <td className="px-4 py-2.5 font-bold">{item.name}</td>
                           <td className="px-4 py-2.5 text-center">
-                            <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-gray-100 text-gray-600">
+                            <span className="text-[9px] font-extrabold uppercase px-1.5 py-0.5 rounded bg-gray-100 text-[#2B2D42]">
                               {item.is_custom ? 'Libre' : 'Catálogo'}
                             </span>
                           </td>
-                          <td className="px-4 py-2.5 text-center font-black text-slate-900">{item.quantity}</td>
+                          <td className="px-4 py-2.5 text-center font-black text-[#1D3557]">{item.quantity}</td>
                           <td className="px-4 py-2.5 text-right font-mono font-extrabold">${item.price.toFixed(2)}</td>
                         </tr>
                       ))}
@@ -1781,17 +1974,17 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
               {/* NOTES */}
               {selectedQuote.notes && (
                 <div className="space-y-1">
-                  <span className="text-[10px] font-black uppercase text-gray-400 block tracking-wider">Notas del Presupuesto</span>
-                  <p className="text-xs text-gray-600 font-bold bg-slate-50 border border-gray-150 p-3 rounded-xl italic">
+                  <span className="text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] block tracking-wider">Notas del Presupuesto</span>
+                  <p className="text-xs text-[#2B2D42] font-medium bg-[#F8F9FA] border border-gray-200 p-3 rounded-xl italic">
                     "{selectedQuote.notes}"
                   </p>
                 </div>
               )}
 
               {/* CALCULATED PRICING BLOCK */}
-              <div className="bg-[#005da9]/5 border border-[#005da9]/10 p-4 rounded-2xl space-y-1.5">
+              <div className="bg-[#1D3557]/5 border border-[#1D3557]/15 p-4 rounded-2xl space-y-1.5">
                 {selectedQuote.subtotal_price !== undefined && (
-                  <div className="flex justify-between text-xs font-bold text-gray-600">
+                  <div className="flex justify-between text-xs font-bold text-[#2B2D42]">
                     <span>Subtotal:</span>
                     <span className="font-mono">${selectedQuote.subtotal_price.toFixed(2)}</span>
                   </div>
@@ -1803,21 +1996,21 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                   </div>
                 )}
                 {selectedQuote.tax_amount !== undefined && selectedQuote.tax_amount > 0 && (
-                  <div className="flex justify-between text-xs font-bold text-slate-700">
+                  <div className="flex justify-between text-xs font-bold text-[#2B2D42]">
                     <span>IVA:</span>
                     <span className="font-mono">+${selectedQuote.tax_amount.toFixed(2)}</span>
                   </div>
                 )}
-                <div className="border-t border-[#005da9]/15 pt-2 flex justify-between items-center">
+                <div className="border-t border-[#1D3557]/15 pt-2 flex justify-between items-center">
                   <div>
-                    <span className="text-[10px] font-black uppercase text-gray-500 block">Total Cotización</span>
-                    <span className="text-[11px] font-bold text-gray-500 block">
-                      Bs. {(selectedQuote.total_price * bcvRate).toLocaleString('es-VE', { minimumFractionDigits: 2 })}
+                    <span className="text-[10px] font-montserrat font-extrabold uppercase text-[#1D3557] block">Total Cotización</span>
+                    <span className="text-[11px] font-bold text-[#2B2D42]/70 block">
+                      Bs. {((Number(selectedQuote?.total_price) || 0) * (bcvRate || 1)).toLocaleString('es-VE', { minimumFractionDigits: 2 })}
                     </span>
                   </div>
                   <div className="text-right">
-                    <span className="text-xl font-black text-slate-900">${selectedQuote.total_price.toFixed(2)}</span>
-                    <span className="text-xs font-black text-slate-800 ml-1">USD</span>
+                    <span className="text-xl font-montserrat font-extrabold text-[#1D3557]">${selectedQuote.total_price.toFixed(2)}</span>
+                    <span className="text-xs font-montserrat font-extrabold text-[#1D3557] ml-1">USD</span>
                   </div>
                 </div>
               </div>
@@ -1825,33 +2018,33 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
             </div>
 
             {/* BUTTON BAR ACTIONS */}
-            <div className="bg-slate-50 border-t border-gray-150 p-4 flex flex-col md:flex-row gap-2 justify-between print:hidden">
+            <div className="bg-[#F8F9FA] border-t border-gray-200 p-4 flex flex-col md:flex-row gap-2 justify-between print:hidden">
               
               <div className="flex gap-2">
                 <button
                   type="button"
                   onClick={() => handleDeleteQuote(selectedQuote.id)}
-                  className="p-2 bg-white hover:bg-rose-50 border border-gray-200 hover:border-rose-200 text-rose-500 rounded-xl transition cursor-pointer"
+                  className="p-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 rounded-full transition shadow-2xs hover:shadow-xs cursor-pointer active:scale-98"
                   title="Eliminar permanentemente"
                 >
-                  <Trash2 className="w-4 h-4" />
+                  <Trash2 className="w-4 h-4 text-[#005da9]" />
                 </button>
 
                 <button
                   type="button"
                   onClick={() => handlePrintPDF(selectedQuote)}
-                  className="px-3 py-2 bg-white hover:bg-gray-100 border border-gray-200 text-slate-700 font-bold text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer"
+                  className="px-4 py-2 bg-white hover:bg-slate-50 border border-slate-300 text-[#1D3557] font-bold text-xs rounded-full transition flex items-center gap-1.5 cursor-pointer shadow-2xs active:scale-98"
                 >
-                  <Printer className="w-3.5 h-3.5" />
+                  <Printer className="w-3.5 h-3.5 text-[#005da9]" />
                   <span>Imprimir PDF</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => handleShareWhatsApp(selectedQuote)}
-                  className="px-3 py-2 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 font-bold text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer"
+                  className="px-4 py-2 bg-white hover:bg-slate-50 border border-slate-300 text-[#1D3557] font-bold text-xs rounded-full transition flex items-center gap-1.5 cursor-pointer shadow-2xs active:scale-98"
                 >
-                  <Share2 className="w-3.5 h-3.5 text-emerald-600" />
+                  <Share2 className="w-3.5 h-3.5 text-[#005da9]" />
                   <span>WhatsApp</span>
                 </button>
               </div>
@@ -1860,20 +2053,28 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
                 <button
                   type="button"
                   onClick={() => setShowDetailModal(false)}
-                  className="px-4 py-2 bg-white hover:bg-gray-100 border border-gray-200 text-slate-700 font-bold text-xs rounded-xl transition cursor-pointer"
+                  className="px-4 py-2 bg-white hover:bg-slate-50 border border-slate-300 text-[#1D3557] font-bold text-xs rounded-full transition cursor-pointer shadow-2xs active:scale-98 flex items-center gap-1.5"
                 >
-                  Cerrar
+                  <X className="w-4 h-4 text-[#005da9]" />
+                  <span>Cerrar</span>
                 </button>
 
-                {/* CONVERT TO SALE OPTION */}
+                {/* CONVERT TO SALE OPTION (Habilitado incluso si venció) */}
                 {selectedQuote.status !== 'vendida' && selectedQuote.status !== 'facturada' && (
                   <button
                     type="button"
-                    onClick={() => setShowBillingModal(true)}
-                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs rounded-xl shadow-md transition flex items-center gap-1.5 cursor-pointer"
+                    onClick={() => {
+                      setShowDetailModal(false);
+                      handleOpenBillingModal(selectedQuote);
+                    }}
+                    className="p-2.5 bg-gradient-to-r from-[#1D3557] via-[#005da9] to-[#1D3557] hover:brightness-110 active:scale-98 text-white border border-[#005da9]/50 rounded-full shadow-2xs hover:shadow-xs transition-all duration-300 flex items-center justify-center cursor-pointer select-none"
+                    title={
+                      (selectedQuote.status === 'expirada' || Boolean(selectedQuote.expiration_date && new Date(selectedQuote.expiration_date).getTime() < Date.now()))
+                        ? "Convertir a Ventas (Cotización Vencida)"
+                        : "Convertir a Ventas"
+                    }
                   >
-                    <CheckCircle2 className="w-4 h-4 shrink-0" />
-                    <span>Convertir en Venta</span>
+                    <ShoppingCart className="w-4 h-4 shrink-0 text-[#40E0D0] stroke-[2.5]" />
                   </button>
                 )}
               </div>
@@ -1884,111 +2085,540 @@ ${quote.notes ? `📌 *Notas/Condiciones:* ${quote.notes}\n\n` : ''}Quedamos ate
         </div>
       )}
 
-      {/* 💵 CONVERT TO SALE / BILLING MODAL */}
+      {/* 💵 CONVERTIR COTIZACIÓN EN VENTA MODAL (FACTURA / NOTA, CUENTAS BANCARIAS, CRÉDITO Y CUOTAS EN TIEMPO REAL) */}
       {showBillingModal && selectedQuote && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
-          <div className="bg-white rounded-3xl border border-gray-100 w-full max-w-sm shadow-2xl overflow-hidden text-left">
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/65 backdrop-blur-xs p-3 sm:p-4 overflow-y-auto animate-fade-in">
+          <div className="bg-white rounded-3xl border border-gray-100 w-full max-w-xl shadow-2xl overflow-hidden text-left flex flex-col my-auto max-h-[92vh] animate-scale-up">
             
-            <div className="bg-emerald-600 p-5 text-white flex items-center gap-3">
-              <CheckCircle2 className="w-6 h-6 text-white" />
-              <div>
-                <h3 className="font-extrabold text-sm tracking-tight text-white">
-                  Convertir Cotización en Venta
-                </h3>
-                <p className="text-[10px] text-emerald-100 font-bold">
-                  Cotización N° {selectedQuote.quote_number}
-                </p>
+            {/* Modal Header */}
+            <div className="bg-[#1D3557] px-6 py-4 text-white flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-[#40E0D0]/20 flex items-center justify-center border border-[#40E0D0]/30">
+                  <CheckCircle2 className="w-5 h-5 text-[#40E0D0]" />
+                </div>
+                <div>
+                  <h3 className="font-montserrat font-black text-sm tracking-tight text-white uppercase">
+                    Convertir Cotización en Venta
+                  </h3>
+                  <p className="text-[11px] text-[#40E0D0] font-semibold">
+                    Cotización N° {selectedQuote.quote_number} · Cliente: {selectedQuote.client_name}
+                  </p>
+                </div>
               </div>
+              <button
+                type="button"
+                onClick={() => setShowBillingModal(false)}
+                disabled={isBilling}
+                className="text-white/70 hover:text-white transition p-1.5 rounded-full hover:bg-white/10 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
             </div>
 
-            <div className="p-5 space-y-4">
-              <p className="text-xs text-gray-600 font-bold leading-relaxed">
-                Al confirmar la venta, la cotización cambiará a estado **Vendida**, se registrará el pedido en ventas y se descontará automáticamente el inventario de los productos de catálogo.
-              </p>
+            {/* Modal Body */}
+            <div className="p-5 sm:p-6 space-y-5 overflow-y-auto flex-1">
 
-              <div className="bg-emerald-50 border border-emerald-100 p-3.5 rounded-2xl text-center">
-                <p className="text-2xl font-black text-emerald-800">${selectedQuote.total_price.toFixed(2)} USD</p>
-                <p className="text-xs text-emerald-700 font-bold">Bs. {(selectedQuote.total_price * bcvRate).toLocaleString('es-VE', { minimumFractionDigits: 2 })}</p>
+              {/* Notificación si la cotización está vencida */}
+              {(selectedQuote.status === 'expirada' || Boolean(selectedQuote.expiration_date && new Date(selectedQuote.expiration_date).getTime() < Date.now())) && (
+                <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-2xl flex items-start gap-2.5 text-amber-900 shadow-2xs">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div className="space-y-0.5">
+                    <span className="text-xs font-montserrat font-black uppercase tracking-wider block text-amber-900">
+                      Cotización Vencida / Expirada
+                    </span>
+                    <p className="text-[11px] text-amber-800 leading-snug">
+                      Esta cotización superó su fecha límite de validez, pero está habilitada para ser convertida a venta directamente. Al confirmar, se emitirá el documento oficial y se actualizará el inventario.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Total Card */}
+              <div className="bg-linear-to-r from-[#1D3557]/10 via-[#00BFFF]/10 to-[#40E0D0]/15 border border-[#40E0D0]/30 p-4 rounded-2xl flex items-center justify-between">
+                <div>
+                  <span className="text-[10px] font-montserrat font-black uppercase text-[#1D3557] tracking-wider block">
+                    Monto Total de la Venta
+                  </span>
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-2xl sm:text-3xl font-montserrat font-black text-[#1D3557]">
+                      ${selectedQuote.total_price.toFixed(2)}
+                    </span>
+                    <span className="text-xs font-bold text-gray-500">USD</span>
+                  </div>
+                  <p className="text-xs font-bold text-emerald-700 mt-0.5">
+                    Bs. {((Number(selectedQuote.total_price) || 0) * (bcvRate || 1)).toLocaleString('es-VE', { minimumFractionDigits: 2 })}
+                    <span className="text-[10px] text-gray-500 font-normal ml-1">(Tasa BCV: Bs. {bcvRate.toFixed(2)})</span>
+                  </p>
+                </div>
+                <div className="text-right">
+                  <span className="inline-block px-2.5 py-1 bg-white border border-gray-200 rounded-lg text-[10px] font-montserrat font-extrabold text-[#1D3557]">
+                    {selectedQuote.items?.length || 0} {(selectedQuote.items?.length || 0) === 1 ? 'Ítem' : 'Ítems'}
+                  </span>
+                </div>
               </div>
 
-              {/* PAYMENT METHOD SELECT */}
-              <div>
-                <label className="block text-[10px] font-black uppercase text-gray-400 mb-1.5">
-                  Método de Pago
+              {/* 1. DOCUMENT TYPE SELECTOR: FACTURA VS NOTA DE ENTREGA */}
+              <div className="space-y-2">
+                <label className="block text-[11px] font-montserrat font-black uppercase text-[#1D3557] tracking-wider">
+                  1. Tipo de Documento a Emitir
                 </label>
-                <select
-                  value={billingPaymentMethod}
-                  onChange={(e) => setBillingPaymentMethod(e.target.value)}
-                  className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none"
-                >
-                  <option value="Efectivo USD">💵 Efectivo Dólares (USD)</option>
-                  <option value="Efectivo VES">💵 Efectivo Bolívares (VES)</option>
-                  <option value="Pago Móvil">📱 Pago Móvil</option>
-                  <option value="Punto de Venta">💳 Punto de Venta</option>
-                  <option value="Transferencia Bancaria">🏢 Transferencia VES</option>
-                  <option value="Zelle">🇺🇸 Transferencia USD (Zelle)</option>
-                </select>
-              </div>
-
-              {/* PAYMENT STATUS */}
-              <div>
-                <label className="block text-[10px] font-black uppercase text-gray-400 mb-1.5">
-                  Estado del Pago
-                </label>
-                <div className="grid grid-cols-2 gap-2 bg-gray-50 p-1 rounded-xl border border-gray-150">
+                <div className="grid grid-cols-2 gap-3">
                   <button
                     type="button"
-                    onClick={() => setBillingPaymentStatus('pagado')}
-                    className={`py-1.5 text-center text-xs font-black rounded-lg transition cursor-pointer ${
-                      billingPaymentStatus === 'pagado'
-                        ? 'bg-emerald-600 text-white shadow-3xs'
-                        : 'text-gray-500 hover:text-gray-800'
+                    onClick={() => setConvertDocType('factura')}
+                    className={`p-3.5 rounded-2xl border text-left transition cursor-pointer flex flex-col justify-between ${
+                      convertDocType === 'factura'
+                        ? 'bg-[#1D3557] border-[#1D3557] text-white shadow-md'
+                        : 'bg-[#F8F9FA] border-gray-200 text-[#2B2D42] hover:border-[#1D3557]/40'
                     }`}
                   >
-                    Pagado
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <FileText className={`w-4 h-4 ${convertDocType === 'factura' ? 'text-[#40E0D0]' : 'text-[#00BFFF]'}`} />
+                        <span className="font-montserrat font-black text-xs uppercase tracking-tight">Factura</span>
+                      </div>
+                      {convertDocType === 'factura' && (
+                        <Check className="w-4 h-4 text-[#40E0D0]" />
+                      )}
+                    </div>
+                    <div className="text-[10px] opacity-85">
+                      Próximo N°: <span className="font-bold underline">#{nextControlNumberFactura}</span>
+                    </div>
                   </button>
+
                   <button
                     type="button"
-                    onClick={() => setBillingPaymentStatus('credito')}
-                    className={`py-1.5 text-center text-xs font-black rounded-lg transition cursor-pointer ${
-                      billingPaymentStatus === 'credito'
-                        ? 'bg-amber-600 text-white shadow-3xs'
-                        : 'text-gray-500 hover:text-gray-800'
+                    onClick={() => setConvertDocType('nota_entrega')}
+                    className={`p-3.5 rounded-2xl border text-left transition cursor-pointer flex flex-col justify-between ${
+                      convertDocType === 'nota_entrega'
+                        ? 'bg-[#1D3557] border-[#1D3557] text-white shadow-md'
+                        : 'bg-[#F8F9FA] border-gray-200 text-[#2B2D42] hover:border-[#1D3557]/40'
                     }`}
                   >
-                    A Crédito
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <FileCheck className={`w-4 h-4 ${convertDocType === 'nota_entrega' ? 'text-[#40E0D0]' : 'text-emerald-600]'}`} />
+                        <span className="font-montserrat font-black text-xs uppercase tracking-tight">Nota de Entrega</span>
+                      </div>
+                      {convertDocType === 'nota_entrega' && (
+                        <Check className="w-4 h-4 text-[#40E0D0]" />
+                      )}
+                    </div>
+                    <div className="text-[10px] opacity-85">
+                      Próximo N°: <span className="font-bold underline">#{nextControlNumberNota}</span>
+                    </div>
                   </button>
                 </div>
               </div>
 
-              {/* MODAL ACTIONS */}
-              <div className="flex items-center justify-end gap-2 pt-3 border-t border-gray-100">
+              {/* 2. PAYMENT CONDITION: CONTADO (PAGADO) VS CRÉDITO */}
+              <div className="space-y-2">
+                <label className="block text-[11px] font-montserrat font-black uppercase text-[#1D3557] tracking-wider">
+                  2. Condición de Pago
+                </label>
+                <div className="grid grid-cols-2 gap-3 bg-[#F8F9FA] p-1.5 rounded-full border border-gray-200">
+                  <button
+                    type="button"
+                    onClick={() => setBillingPaymentStatus('pagado')}
+                    className={`py-2 px-4 rounded-full font-montserrat font-bold text-xs uppercase transition cursor-pointer flex items-center justify-center gap-2 ${
+                      billingPaymentStatus === 'pagado'
+                        ? 'bg-white text-[#1D3557] border border-slate-300 shadow-2xs font-bold'
+                        : 'text-gray-600 hover:text-[#1D3557]'
+                    }`}
+                  >
+                    <DollarSign className="w-4 h-4 text-[#005da9]" />
+                    <span>De Contado (Pagado)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setBillingPaymentStatus('credito')}
+                    className={`py-2 px-4 rounded-full font-montserrat font-bold text-xs uppercase transition cursor-pointer flex items-center justify-center gap-2 ${
+                      billingPaymentStatus === 'credito'
+                        ? 'bg-white text-[#1D3557] border border-slate-300 shadow-2xs font-bold'
+                        : 'text-gray-600 hover:text-[#1D3557]'
+                    }`}
+                  >
+                    <Clock className="w-4 h-4 text-[#005da9]" />
+                    <span>A Crédito (CxC)</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* 3A. IF CONTADO: SELECT REGISTERED BANK ACCOUNT */}
+              {billingPaymentStatus === 'pagado' && (
+                <div className="space-y-3 bg-slate-50 border border-slate-200 p-4 rounded-2xl">
+                  <div className="flex items-center gap-2">
+                    <Building2 className="w-4 h-4 text-[#00BFFF]" />
+                    <label className="text-[11px] font-montserrat font-black uppercase text-[#1D3557] tracking-wider">
+                      Cuenta Bancaria Registrada (Destino del Cobro)
+                    </label>
+                  </div>
+
+                  {bankAccounts.length === 0 ? (
+                    <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800">
+                      No hay cuentas bancarias activas registradas en el sistema. Puedes configurarlas en el módulo de Cuentas Bancarias.
+                    </div>
+                  ) : (
+                    <div>
+                      <select
+                        value={selectedBankAccountId}
+                        onChange={(e) => setSelectedBankAccountId(e.target.value)}
+                        className="w-full px-3.5 py-2.5 bg-white border border-gray-300 rounded-xl text-xs font-bold text-[#1D3557] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
+                      >
+                        {bankAccounts.map((acc) => (
+                          <option key={acc.id} value={acc.id}>
+                            {acc.name} · {acc.bank_name || 'Banco'} ({acc.currency}) — Saldo: {acc.currency === 'USD' ? '$' : 'Bs.'}{Number(acc.balance || 0).toLocaleString('es-VE', { minimumFractionDigits: 2 })}
+                          </option>
+                        ))}
+                      </select>
+
+                      {/* Selected account details badge */}
+                      {(() => {
+                        const selAcc = bankAccounts.find(a => a.id === selectedBankAccountId);
+                        if (!selAcc) return null;
+                        const isUsdAcc = selAcc.currency === 'USD';
+                        const amountToCredit = isUsdAcc 
+                          ? `$${selectedQuote.total_price.toFixed(2)} USD`
+                          : `Bs. ${((Number(selectedQuote.total_price) || 0) * (bcvRate || 1)).toLocaleString('es-VE', { minimumFractionDigits: 2 })}`;
+                        return (
+                          <div className="mt-2 text-[11px] font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 px-3 py-2 rounded-xl flex items-center justify-between">
+                            <span>Ingreso acreditado a cuenta:</span>
+                            <span className="font-extrabold">{amountToCredit}</span>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="block text-[10px] font-montserrat font-bold uppercase text-gray-500 mb-1">
+                      N° de Referencia / Comprobante (Opcional)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="Ej: Ref 948271 o Zelle confirmación"
+                      value={billingPaymentReference}
+                      onChange={(e) => setBillingPaymentReference(e.target.value)}
+                      className="w-full px-3 py-2 bg-white border border-gray-300 rounded-xl text-xs font-medium text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* 3B. IF CREDITO: DATES, INSTALLMENTS AND REAL-TIME SCHEDULE */}
+              {billingPaymentStatus === 'credito' && (
+                <div className="space-y-4 bg-amber-50/50 border border-amber-200 p-4 rounded-2xl">
+                  <div className="flex items-center gap-2">
+                    <CreditCard className="w-4 h-4 text-amber-600" />
+                    <label className="text-[11px] font-montserrat font-black uppercase text-amber-900 tracking-wider">
+                      Cuentas por Cobrar · Configuración de Crédito y Cuotas
+                    </label>
+                  </div>
+
+                  <div className="text-xs text-amber-800 bg-amber-100/60 p-2.5 rounded-xl border border-amber-200/80 leading-relaxed">
+                    Esta venta se registrará en <strong>Cuentas por Cobrar (CxC)</strong> en tiempo real. Se creará el plan de cuotas y se actualizará el saldo deudor del cliente.
+                  </div>
+
+                  {/* Dates: Emisión y Vencimiento */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[10px] font-montserrat font-bold uppercase text-gray-600 mb-1">
+                        Fecha de Emisión
+                      </label>
+                      <input
+                        type="date"
+                        value={creditIssueDate}
+                        onChange={(e) => setCreditIssueDate(e.target.value)}
+                        className="w-full px-3 py-2 bg-white border border-gray-300 rounded-xl text-xs font-bold text-[#1D3557] focus:outline-none focus:ring-2 focus:ring-amber-500"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[10px] font-montserrat font-bold uppercase text-gray-600 mb-1">
+                        Fecha de Vencimiento Final
+                      </label>
+                      <input
+                        type="date"
+                        value={creditDueDate}
+                        onChange={(e) => setCreditDueDate(e.target.value)}
+                        className="w-full px-3 py-2 bg-white border border-gray-300 rounded-xl text-xs font-bold text-amber-900 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Cuotas y Frecuencia */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[10px] font-montserrat font-bold uppercase text-gray-600 mb-1">
+                        Número de Cuotas
+                      </label>
+                      <select
+                        value={creditInstallmentsCount}
+                        onChange={(e) => setCreditInstallmentsCount(Number(e.target.value))}
+                        className="w-full px-3 py-2 bg-white border border-gray-300 rounded-xl text-xs font-bold text-[#1D3557] focus:outline-none focus:ring-2 focus:ring-amber-500"
+                      >
+                        <option value={1}>1 Cuota (Pago Único)</option>
+                        <option value={2}>2 Cuotas</option>
+                        <option value={3}>3 Cuotas</option>
+                        <option value={4}>4 Cuotas</option>
+                        <option value={5}>5 Cuotas</option>
+                        <option value={6}>6 Cuotas</option>
+                        <option value={8}>8 Cuotas</option>
+                        <option value={10}>10 Cuotas</option>
+                        <option value={12}>12 Cuotas</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-[10px] font-montserrat font-bold uppercase text-gray-600 mb-1">
+                        Frecuencia de Pagos
+                      </label>
+                      <select
+                        value={creditFrequency}
+                        onChange={(e) => setCreditFrequency(e.target.value as any)}
+                        className="w-full px-3 py-2 bg-white border border-gray-300 rounded-xl text-xs font-bold text-[#1D3557] focus:outline-none focus:ring-2 focus:ring-amber-500"
+                      >
+                        <option value="semanal">Semanal (Cada 7 días)</option>
+                        <option value="quincenal">Quincenal (Cada 15 días)</option>
+                        <option value="mensual">Mensual (Cada 30 días)</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Cuotas Breakdown Table in Real Time */}
+                  <div className="space-y-1.5 pt-1">
+                    <span className="text-[10px] font-montserrat font-black uppercase text-amber-900 tracking-wider block">
+                      Cronograma de Cuotas (Tiempo Real)
+                    </span>
+                    <div className="bg-white border border-amber-200 rounded-xl overflow-hidden shadow-2xs max-h-36 overflow-y-auto">
+                      <table className="w-full text-left text-[11px]">
+                        <thead className="bg-amber-100/70 text-amber-950 font-bold border-b border-amber-200 text-[10px] uppercase">
+                          <tr>
+                            <th className="px-3 py-1.5">Cuota</th>
+                            <th className="px-3 py-1.5">Vencimiento</th>
+                            <th className="px-3 py-1.5 text-right">Monto (USD)</th>
+                            <th className="px-3 py-1.5 text-right">Monto (Bs.)</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-amber-100 font-medium text-gray-700">
+                          {generatedInstallments.map((inst) => (
+                            <tr key={inst.number} className="hover:bg-amber-50/50">
+                              <td className="px-3 py-1.5 font-bold text-[#1D3557]">Cuota #{inst.number}</td>
+                              <td className="px-3 py-1.5 text-gray-600">{inst.due_date}</td>
+                              <td className="px-3 py-1.5 text-right font-extrabold text-amber-900">${inst.amount.toFixed(2)}</td>
+                              <td className="px-3 py-1.5 text-right text-emerald-700 font-semibold">Bs. {inst.amount_bs.toLocaleString('es-VE', { minimumFractionDigits: 2 })}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <p className="text-[11px] text-gray-500 italic leading-relaxed">
+                Nota: La cotización cambiará automáticamente a estado <strong>"Vendida"</strong>, se descontará el inventario en tiempo real y NO se generará como pedido online.
+              </p>
+
+            </div>
+
+            {/* Modal Footer */}
+            <div className="bg-[#F8F9FA] px-6 py-4 border-t border-gray-200 flex items-center justify-end gap-3 shrink-0">
+              <button
+                type="button"
+                onClick={() => setShowBillingModal(false)}
+                disabled={isBilling}
+                className="px-4 py-2 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-bold text-xs rounded-full shadow-2xs transition cursor-pointer active:scale-98 flex items-center gap-1.5"
+              >
+                <X className="w-4 h-4 text-[#005da9]" />
+                <span>Cancelar</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleConvertToSale}
+                disabled={isBilling}
+                className="px-6 py-2.5 bg-gradient-to-r from-[#1D3557] via-[#005da9] to-[#1D3557] hover:brightness-110 active:brightness-95 text-white border border-[#005da9]/50 font-montserrat font-black text-xs rounded-full shadow-xs hover:shadow-md transition-all duration-300 flex items-center gap-2 cursor-pointer uppercase tracking-wider select-none disabled:opacity-50"
+              >
+                {isBilling ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin text-[#40E0D0]" />
+                    <span>Emitiendo Venta...</span>
+                  </>
+                ) : (
+                  <>
+                    <CheckCircle2 className="w-4 h-4 text-[#40E0D0] stroke-[2.5]" />
+                    <span>Confirmar y Emitir {convertDocType === 'nota_entrega' ? 'Nota de Entrega' : 'Factura'}</span>
+                  </>
+                )}
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* NUEVO CLIENTE MODAL (IMAGEN 1 MATCH) */}
+      {showNewClientModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 z-[999] animate-fade-in">
+          <div className="bg-white rounded-[24px] shadow-2xl max-w-lg w-full overflow-hidden border border-gray-100 animate-scale-up">
+            
+            {/* Header */}
+            <div className="bg-[#1D3557] px-6 py-4 flex items-center justify-between text-white">
+              <div className="flex items-center gap-2.5">
+                <User className="w-5 h-5 text-[#00BFFF]" />
+                <span className="font-montserrat font-black uppercase text-sm tracking-wider">Nuevo Cliente</span>
+              </div>
+              <button 
+                type="button"
+                onClick={() => setShowNewClientModal(false)}
+                className="text-white/85 hover:text-white transition cursor-pointer p-1 rounded-full hover:bg-white/10"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Form */}
+            <form onSubmit={handleSaveNewClient} className="p-6 space-y-4">
+              
+              {/* Nombre Completo / Razón Social */}
+              <div className="space-y-1">
+                <label className="block text-[11px] font-montserrat font-black text-[#1D3557] uppercase tracking-wider">
+                  Nombre Completo / Razón Social *
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={newClientName}
+                  onChange={(e) => setNewClientName(e.target.value)}
+                  placeholder="Ej: Inversiones Pérez C.A., María Gómez"
+                  className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-[14px] text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
+                />
+              </div>
+
+              {/* Tipo de Identificación & Cédula o RIF */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="space-y-1">
+                  <label className="block text-[11px] font-montserrat font-black text-[#1D3557] uppercase tracking-wider">
+                    Tipo Identificación *
+                  </label>
+                  <select
+                    value={newClientType}
+                    onChange={(e) => setNewClientType(e.target.value)}
+                    className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-[14px] text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
+                  >
+                    <option value="Natural (V / E)">Natural (V / E)</option>
+                    <option value="Jurídico (J)">Jurídico (J)</option>
+                    <option value="Gubernamental (G)">Gubernamental (G)</option>
+                    <option value="Pasaporte (P)">Pasaporte (P)</option>
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[11px] font-montserrat font-black text-[#1D3557] uppercase tracking-wider">
+                    Cédula o RIF *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={newClientDocument}
+                    onChange={(e) => setNewClientDocument(e.target.value)}
+                    placeholder="Ej: V-12345678 o J-31456987"
+                    className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-[14px] text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
+                  />
+                </div>
+              </div>
+
+              {/* Teléfono / WhatsApp & Límite de Crédito */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="space-y-1">
+                  <label className="block text-[11px] font-montserrat font-black text-[#1D3557] uppercase tracking-wider">
+                    Teléfono / WhatsApp
+                  </label>
+                  <input
+                    type="text"
+                    value={newClientPhone}
+                    onChange={(e) => setNewClientPhone(e.target.value)}
+                    placeholder="Ej: 0412-5551234"
+                    className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-[14px] text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-[11px] font-montserrat font-black text-[#1D3557] uppercase tracking-wider">
+                    Límite de Crédito (USD)
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={newClientCredit}
+                    onChange={(e) => setNewClientCredit(e.target.value)}
+                    placeholder="0"
+                    className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-[14px] text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
+                  />
+                </div>
+              </div>
+
+              {/* Correo Electrónico */}
+              <div className="space-y-1">
+                <label className="block text-[11px] font-montserrat font-black text-[#1D3557] uppercase tracking-wider">
+                  Correo Electrónico
+                </label>
+                <input
+                  type="email"
+                  value={newClientEmail}
+                  onChange={(e) => setNewClientEmail(e.target.value)}
+                  placeholder="Ej: cliente@ejemplo.com"
+                  className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-[14px] text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
+                />
+              </div>
+
+              {/* Dirección */}
+              <div className="space-y-1">
+                <label className="block text-[11px] font-montserrat font-black text-[#1D3557] uppercase tracking-wider">
+                  Dirección
+                </label>
+                <textarea
+                  value={newClientAddress}
+                  onChange={(e) => setNewClientAddress(e.target.value)}
+                  placeholder="Ej: Av. Bella Vista, Calle 72, Sector Tierra Negra"
+                  rows={2}
+                  className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-[14px] text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition resize-none"
+                />
+              </div>
+
+              {/* Actions Footer */}
+              <div className="flex items-center gap-3 pt-4 border-t border-gray-100 grid grid-cols-2">
                 <button
                   type="button"
-                  onClick={() => setShowBillingModal(false)}
-                  disabled={isBilling}
-                  className="px-4 py-2 border border-gray-200 text-gray-600 font-bold text-xs rounded-xl hover:bg-gray-50 transition cursor-pointer"
+                  onClick={() => setShowNewClientModal(false)}
+                  disabled={isSavingClient}
+                  className="w-full py-2.5 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-montserrat font-bold text-xs uppercase tracking-wider rounded-full shadow-2xs transition cursor-pointer active:scale-98 flex items-center justify-center gap-1.5"
                 >
-                  Cancelar
+                  <X className="w-4 h-4 text-[#005da9]" />
+                  <span>Cancelar</span>
                 </button>
                 <button
-                  type="button"
-                  onClick={handleConvertToSale}
-                  disabled={isBilling}
-                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs rounded-xl shadow-md transition flex items-center gap-1 cursor-pointer"
+                  type="submit"
+                  disabled={isSavingClient}
+                  className="w-full py-2.5 bg-white hover:bg-slate-50 text-[#1D3557] border border-slate-300 font-montserrat font-bold text-xs uppercase tracking-wider rounded-full shadow-2xs hover:shadow-xs transition flex items-center justify-center gap-1.5 cursor-pointer active:scale-98"
                 >
-                  {isBilling ? (
+                  {isSavingClient ? (
                     <>
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      <span>Procesando...</span>
+                      <Loader2 className="w-4 h-4 animate-spin text-[#005da9]" />
+                      <span>Guardando...</span>
                     </>
                   ) : (
-                    <span>Confirmar y Vender</span>
+                    <>
+                      <Check className="w-4 h-4 text-[#005da9]" />
+                      <span>Guardar Cliente</span>
+                    </>
                   )}
                 </button>
               </div>
 
-            </div>
+            </form>
 
           </div>
         </div>

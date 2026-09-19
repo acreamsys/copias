@@ -1,22 +1,24 @@
 import { printInvoiceDocument } from '../lib/printInvoice';
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
-  ShoppingCart, Trash2, Search, Pause, Play, CheckCircle, 
+  ShoppingCart, Trash2, Search, Pause, Play, CheckCircle, PauseCircle,
   AlertCircle, FileText, FileCheck, X, Printer, Loader2, Plus, Minus, Eye, RefreshCw,
   User, Users, UserPlus, Tag, Pencil, PlusCircle, Save, Package, PackagePlus, ShoppingBag,
   Scan, CreditCard, Banknote, Building2, Landmark, QrCode, Coins, Smartphone, Zap,
-  ChevronRight, ChevronLeft, Download, Check, DollarSign, SlidersHorizontal, Layers,
-  Grid, ArrowRight, ArrowLeft, Barcode, Calendar, Lock, Unlock, Wallet, Flame, TrendingUp
+  ChevronRight, ChevronLeft, ChevronDown, ChevronUp, Clock, Download, Check, DollarSign, SlidersHorizontal, Layers,
+  Grid, ArrowRight, ArrowLeft, Barcode, Calendar, Lock, Unlock, Wallet, Flame, TrendingUp, Percent
 } from 'lucide-react';
-import { Product, Category, Brand, ProductImage, Tax, StoreUser, PaymentMethodConfig } from '../types';
-import { CurrencyCode, formatCurrency } from '../lib/currency';
+import { Product, Category, Brand, ProductImage, Tax, StoreUser, PaymentMethodConfig, AccountReceivablePayment } from '../types';
+import { CurrencyCode, formatCurrency, getCachedCurrencyRates } from '../lib/currency';
 import { dbService } from '../lib/supabase';
 import { sortProductsByPriority } from '../lib/searchUtils';
+import { sanitizeImageUrl, handleImageError, DEFAULT_PRODUCT_FALLBACK } from '../lib/imageUtils';
 import { GASTO_CATEGORIES } from './GastoAssistant';
 import ClosureTicketModal from './ClosureTicketModal';
 import OpenCashSessionModal from './OpenCashSessionModal';
 import BarcodeScannerModal from './BarcodeScannerModal';
 import { playCashRegisterSound, playLowStockBeep } from '../lib/soundEffects';
+import { motion, AnimatePresence } from 'motion/react';
 
 interface POSModuleProps {
   products: Product[];
@@ -103,7 +105,9 @@ export default function POSModule({
   const [showPosScanner, setShowPosScanner] = useState(false);
   const [selectedClient, setSelectedClient] = useState('Consumidor final');
   const [documentType, setDocumentType] = useState<'factura' | 'nota_entrega'>('factura');
-  const [paymentMethod, setPaymentMethod] = useState('Efectivo VES');
+  const [paymentMethod, setPaymentMethod] = useState('Efectivo Dólares (USD)');
+  const [bankAccounts, setBankAccounts] = useState<any[]>([]);
+  const [selectedBankId, setSelectedBankId] = useState<string>('');
   const [categories, setCategories] = useState<Category[]>([]);
   const [brands, setBrands] = useState<Brand[]>([]);
   const [loadedImages, setLoadedImages] = useState<ProductImage[]>(productImages || []);
@@ -163,10 +167,21 @@ export default function POSModule({
     }
   }, [productImages, products]);
 
-  const getProductImageUrl = (productId: string): string | null => {
+  const getProductImageUrl = (productId: string, productObj?: Product): string | null => {
     const imagesToSearch = (productImages && productImages.length > 0) ? productImages : loadedImages;
     const match = imagesToSearch.find(img => img.product_id === productId);
-    return match ? match.image_url : null;
+    if (match && match.image_url) return sanitizeImageUrl(match.image_url, DEFAULT_PRODUCT_FALLBACK);
+    
+    if (productObj) {
+      if ((productObj as any).technical_sheet_url) return sanitizeImageUrl((productObj as any).technical_sheet_url, DEFAULT_PRODUCT_FALLBACK);
+      if ((productObj as any).image_url) return sanitizeImageUrl((productObj as any).image_url, DEFAULT_PRODUCT_FALLBACK);
+    }
+    const foundProd = products.find(p => p.id === productId);
+    if (foundProd) {
+      if ((foundProd as any).technical_sheet_url) return sanitizeImageUrl((foundProd as any).technical_sheet_url, DEFAULT_PRODUCT_FALLBACK);
+      if ((foundProd as any).image_url) return sanitizeImageUrl((foundProd as any).image_url, DEFAULT_PRODUCT_FALLBACK);
+    }
+    return null;
   };
 
   // 🏷️ Categoría & Filtro State
@@ -174,6 +189,59 @@ export default function POSModule({
 
   // 💵 Tasa BCV Local Editable
   const [customBcvRate, setCustomBcvRate] = useState<number>(bcvRate || 36.5);
+  
+  const loadBankAccounts = async () => {
+    const accounts = await dbService.getBankAccounts();
+    setBankAccounts(accounts);
+    if (accounts.length > 0) {
+      // Find 'Efectivo Dólares (USD)' or USD cash account as default
+      const defaultUsdAcc = accounts.find(a => 
+        a.id !== 'cxc-virtual' && (
+          (a.name?.toLowerCase().includes('efectivo') && (a.currency === 'USD' || a.name?.toLowerCase().includes('usd') || a.name?.toLowerCase().includes('dolar') || a.name?.toLowerCase().includes('dólar')))
+          || a.currency === 'USD'
+        )
+      ) || accounts.find(a => a.id !== 'cxc-virtual') || accounts[0];
+
+      if (!selectedBankId) {
+        setSelectedBankId(defaultUsdAcc.id);
+        setPaymentMethod(defaultUsdAcc.name);
+      }
+      setSplitPayments(prev => {
+        const current = prev[0];
+        const targetAcc = accounts.find(a => a.id === (current?.bankAccountId || selectedBankId || defaultUsdAcc.id)) || defaultUsdAcc;
+        const rate = customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES);
+        const isVES = targetAcc.currency === 'VES';
+        const initialAmt = isVES ? parseFloat((total * rate).toFixed(2)) : parseFloat(total.toFixed(2));
+        
+        if (!current || !current.bankAccountId || current.amount === 0) {
+          return [{
+            method: targetAcc.name,
+            amount: initialAmt,
+            bankAccountId: targetAcc.id,
+            currency: targetAcc.currency
+          }];
+        }
+        return prev.map(p => {
+          const found = accounts.find(a => a.id === p.bankAccountId) || defaultUsdAcc;
+          return {
+            ...p,
+            bankAccountId: found.id,
+            method: p.method || found.name,
+            currency: p.currency || found.currency
+          };
+        });
+      });
+    }
+  };
+
+  useEffect(() => {
+    loadBankAccounts();
+    window.addEventListener('bellavista_bank_accounts_updated', loadBankAccounts);
+    return () => {
+      window.removeEventListener('bellavista_bank_accounts_updated', loadBankAccounts);
+    };
+  }, []);
+
   useEffect(() => {
     if (bcvRate && bcvRate > 0) {
       setCustomBcvRate(bcvRate);
@@ -211,22 +279,45 @@ export default function POSModule({
   const [extraChargeName, setExtraChargeName] = useState<string>('Delivery / Envío');
   const [extraChargeAmount, setExtraChargeAmount] = useState<string>('');
   const [discountCode, setDiscountCode] = useState<string>('');
+  const [showDiscountSection, setShowDiscountSection] = useState<boolean>(false);
   const [isResumenOpen, setIsResumenOpen] = useState<boolean>(false);
   const [activePrintFormat, setActivePrintFormat] = useState<'carta' | '58mm' | '80mm'>('carta');
 
   const [saleCondition, setSaleCondition] = useState<'pagada' | 'credito'>('pagada');
+  const [cxcSubject, setCxcSubject] = useState<string>('crédito por venta POS');
+  const [cxcDescription, setCxcDescription] = useState<string>('Crédito registrado vía POS');
+  const [cxcInitialPayment, setCxcInitialPayment] = useState<number>(0);
+  const [cxcInitialBankId, setCxcInitialBankId] = useState<string>('');
+  const [cxcDueDate, setCxcDueDate] = useState<string>(new Date(Date.now() + 15 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]);
+  const [cxcIssueDate, setCxcIssueDate] = useState<string>(new Date().toISOString().substring(0, 16)); // YYYY-MM-DDTHH:mm
   const [useMultiCurrency, setUseMultiCurrency] = useState<boolean>(true);
   const [saleDate, setSaleDate] = useState<string>(new Date().toISOString().split('T')[0]);
   const [numberOfPayments, setNumberOfPayments] = useState<number>(1);
   const [paymentCount, setPaymentCount] = useState<number>(1);
-  const [splitPayments, setSplitPayments] = useState<{ method: string; amount: number }[]>([
-    { method: 'Efectivo VES', amount: 0 }
+  const [splitPayments, setSplitPayments] = useState<{
+    method: string;
+    amount: number;
+    bankAccountId?: string;
+    currency?: string;
+  }[]>([
+    { method: 'Cuenta Bancaria', amount: 0 }
   ]);
   const [selectedSeller, setSelectedSeller] = useState<string>('Cajero Principal');
 
+  // 🧙‍♂️ Wizard Checkout States
+  const [showCheckoutWizard, setShowCheckoutWizard] = useState<boolean>(false);
+  const [wizardStep, setWizardStep] = useState<1 | 2 | 3>(1);
+  const [wizardInvoiceNumber, setWizardInvoiceNumber] = useState<string>('');
+  const [wizardClientSearchQuery, setWizardClientSearchQuery] = useState<string>('');
+  const [showWizardSuggestions, setShowWizardSuggestions] = useState<boolean>(false);
+  const [wizardSelectedClientObj, setWizardSelectedClientObj] = useState<any | null>(null);
+  const [wizardIsNewClient, setWizardIsNewClient] = useState<boolean>(false);
+  const [showObservationsText, setShowObservationsText] = useState<boolean>(false);
+
   // 🏷️ Descuentos
-  const [discountPercent, setDiscountPercent] = useState<string>('0');
-  const [discountAmount, setDiscountAmount] = useState<string>('0');
+  const [discountPercent, setDiscountPercent] = useState<string>('');
+  const [discountAmount, setDiscountAmount] = useState<string>('');
+  const [discountType, setDiscountType] = useState<'percent' | 'amount' | 'none'>('none');
 
   // 📝 Concepto y Notas
   const [saleConcept, setSaleConcept] = useState<string>('');
@@ -451,6 +542,19 @@ export default function POSModule({
 
     // 2. Fallback de coincidencia de texto más exhaustivo y tolerante
     if (
+      cleanMethod.includes('cxc-virtual') ||
+      cleanMethod.includes('crédito') ||
+      cleanMethod.includes('credito') ||
+      cleanMethod.includes('cuentas por cobrar')
+    ) {
+      return 'USD';
+    }
+
+    if (cleanMethod.includes('usdt') || cleanMethod.includes('binance') || cleanMethod.includes('tether')) {
+      return 'USDT';
+    }
+
+    if (
       cleanMethod.includes('ves') ||
       cleanMethod.includes('bolivar') ||
       cleanMethod.includes('bolívar') ||
@@ -459,7 +563,6 @@ export default function POSModule({
       cleanMethod.includes('punto') ||
       cleanMethod.includes('biopago') ||
       cleanMethod.includes('transferencia') ||
-      cleanMethod.includes('cxc') ||
       cleanMethod.includes('caja') ||
       (cleanMethod.includes('bs') && !cleanMethod.includes('usd'))
     ) return 'VES';
@@ -469,37 +572,135 @@ export default function POSModule({
     return 'USD';
   };
 
-  const methodAmountToUsd = (amount: number, method: string): number => {
-    const curr = getMethodCurrency(method);
-    if (curr === 'USD') return amount || 0;
+  const getPaymentCurrency = (item?: { method?: string; bankAccountId?: string; currency?: string } | string): CurrencyCode => {
+    if (!item) {
+      if (bankAccounts.length > 0) {
+        const defaultBank = bankAccounts.find(a => a.id !== 'cxc-virtual') || bankAccounts[0];
+        if (defaultBank && defaultBank.currency) return defaultBank.currency as CurrencyCode;
+      }
+      return 'USD';
+    }
+    if (typeof item === 'object') {
+      if (item.bankAccountId) {
+        if (item.bankAccountId === 'cxc-virtual') return 'USD';
+        const bank = bankAccounts.find(a => a.id === item.bankAccountId);
+        if (bank && bank.currency) return bank.currency as CurrencyCode;
+      }
+      if (item.currency) return item.currency as CurrencyCode;
+      if (item.method) {
+        const methLower = item.method.toLowerCase();
+        if (methLower.includes('usdt') || methLower.includes('binance') || methLower.includes('tether')) {
+          return 'USDT';
+        }
+        if (
+          methLower.includes('ves') ||
+          methLower.includes('bolivar') ||
+          methLower.includes('bolívar') ||
+          methLower.includes('pago móvil') ||
+          methLower.includes('pago movil') ||
+          methLower.includes('punto de venta') ||
+          methLower.includes('biopago')
+        ) {
+          return 'VES';
+        }
+        if (
+          methLower.includes('usd') ||
+          methLower.includes('dolar') ||
+          methLower.includes('dólar') ||
+          methLower.includes('zelle') ||
+          methLower.includes('paypal') ||
+          methLower.includes('zinli')
+        ) {
+          return 'USD';
+        }
+      }
+      if (bankAccounts.length > 0) {
+        const defaultBank = bankAccounts.find(a => a.id !== 'cxc-virtual') || bankAccounts[0];
+        if (defaultBank && defaultBank.currency) return defaultBank.currency as CurrencyCode;
+      }
+      return getMethodCurrency(item.method || '');
+    }
+    return getMethodCurrency(typeof item === 'string' ? item : '');
+  };
+
+  const methodAmountToUsd = (amount: number, item: { method?: string; bankAccountId?: string; currency?: string } | string): number => {
+    const curr = getPaymentCurrency(item);
+    if (curr === 'USD' || curr === 'USDT') return amount || 0;
     const rate = curr === 'VES'
-      ? (customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || 45.5))
+      ? (customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES))
       : (currencyRates[curr] || 1);
     return rate > 0 ? (amount || 0) / rate : 0;
   };
 
-  const usdToMethodAmount = (usdAmount: number, method: string): number => {
-    const curr = getMethodCurrency(method);
-    if (curr === 'USD') return usdAmount || 0;
+  const usdToMethodAmount = (usdAmount: number, item: { method?: string; bankAccountId?: string; currency?: string } | string): number => {
+    const curr = getPaymentCurrency(item);
+    if (curr === 'USD' || curr === 'USDT') return usdAmount || 0;
     const rate = curr === 'VES'
-      ? (customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || 45.5))
+      ? (customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES))
       : (currencyRates[curr] || 1);
     return (usdAmount || 0) * rate;
   };
 
+  const handleBankChange = (idx: number, newBankId: string) => {
+    const selectedAcc = bankAccounts.find(a => a.id === newBankId);
+    if (!selectedAcc) return;
+    
+    const rate = customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES);
+    setSplitPayments(prev => {
+      const updated = [...prev];
+      const prevItem = updated[idx];
+      const prevCurr = prevItem ? getPaymentCurrency(prevItem) : 'USD';
+      const newCurr = selectedAcc.currency;
+      let newAmount = prevItem?.amount || 0;
+
+      if (prevCurr === 'VES' && newCurr !== 'VES') {
+        newAmount = parseFloat((newAmount / (rate || 1)).toFixed(2));
+      } else if (prevCurr !== 'VES' && newCurr === 'VES') {
+        newAmount = parseFloat((newAmount * rate).toFixed(2));
+      }
+
+      if (prev.length === 1 && (newAmount <= 0 || isNaN(newAmount))) {
+        newAmount = newCurr === 'VES' ? parseFloat((total * rate).toFixed(2)) : parseFloat(total.toFixed(2));
+      }
+
+      updated[idx] = {
+        ...prevItem,
+        bankAccountId: selectedAcc.id,
+        method: selectedAcc.name,
+        currency: selectedAcc.currency,
+        amount: newAmount
+      };
+      return updated;
+    });
+
+    if (idx === 0) {
+      setSelectedBankId(selectedAcc.id);
+      setPaymentMethod(selectedAcc.name);
+    }
+  };
+
   const handleAddSplitMethod = () => {
-    const active = getActiveMethods();
-    const currentMethods = splitPayments.map(p => p.method);
-    const nextAvailable = active.find(m => !currentMethods.includes(m.id))?.id || active[0]?.id || 'Efectivo USD';
+    const currentBankIds = splitPayments.map(p => p.bankAccountId);
+    const nextAcc = bankAccounts.find(a => !currentBankIds.includes(a.id)) || bankAccounts[0];
+    const rate = customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES);
 
     let sumOtherUsd = 0;
     splitPayments.forEach(p => {
-      sumOtherUsd += methodAmountToUsd(p.amount || 0, p.method);
+      sumOtherUsd += methodAmountToUsd(p.amount || 0, p);
     });
     const remainingUsd = Math.max(0, total - sumOtherUsd);
-    const convertedAmount = parseFloat(usdToMethodAmount(remainingUsd, nextAvailable).toFixed(2));
+    const isVES = nextAcc ? nextAcc.currency === 'VES' : false;
+    const convertedAmount = isVES ? parseFloat((remainingUsd * rate).toFixed(2)) : parseFloat(remainingUsd.toFixed(2));
 
-    const updated = [...splitPayments, { method: nextAvailable, amount: convertedAmount }];
+    const updated = [
+      ...splitPayments,
+      {
+        method: nextAcc ? nextAcc.name : 'Cuenta Bancaria',
+        amount: convertedAmount,
+        bankAccountId: nextAcc?.id,
+        currency: nextAcc?.currency || (isVES ? 'VES' : 'USD')
+      }
+    ];
     setSplitPayments(updated);
     setPaymentCount(updated.length);
   };
@@ -511,59 +712,202 @@ export default function POSModule({
     setPaymentCount(updated.length);
   };
 
+  const handleRemoveDiscount = () => {
+    setDiscountPercent('');
+    setDiscountAmount('');
+    setDiscountType('none');
+    setDiscountCode('');
+    showToast('success', 'Descuento eliminado.');
+  };
+
+  const handlePercentChange = (rawVal: string) => {
+    const clean = rawVal.replace(',', '.');
+    if (!clean || clean === '0') {
+      setDiscountPercent('');
+      setDiscountAmount('');
+      setDiscountType('none');
+      setDiscountCode('');
+      return;
+    }
+    const num = parseFloat(clean);
+    if (isNaN(num) || num <= 0) {
+      setDiscountPercent(clean);
+      setDiscountAmount('');
+      setDiscountType('percent');
+      setDiscountCode('');
+      return;
+    }
+    setDiscountPercent(clean);
+    setDiscountType('percent');
+    const amt = subtotal > 0 ? (subtotal * (num / 100)) : 0;
+    const formattedAmt = amt > 0 ? parseFloat(amt.toFixed(2)).toString() : '0';
+    setDiscountAmount(formattedAmt);
+    setDiscountCode(`${clean}%`);
+  };
+
+  const handleAmountChange = (rawVal: string) => {
+    const clean = rawVal.replace(',', '.');
+    if (!clean || clean === '0') {
+      setDiscountPercent('');
+      setDiscountAmount('');
+      setDiscountType('none');
+      setDiscountCode('');
+      return;
+    }
+    const num = parseFloat(clean);
+    if (isNaN(num) || num <= 0) {
+      setDiscountAmount(clean);
+      setDiscountPercent('');
+      setDiscountType('amount');
+      setDiscountCode('');
+      return;
+    }
+    setDiscountAmount(clean);
+    setDiscountType('amount');
+    const pct = subtotal > 0 ? ((num / subtotal) * 100) : 0;
+    const formattedPct = pct > 0 ? parseFloat(pct.toFixed(2)).toString() : '0';
+    setDiscountPercent(formattedPct);
+    setDiscountCode(`$${clean}`);
+  };
+
   const handleApplyDiscountCode = (code: string) => {
-    const cleanCode = code.trim().toUpperCase();
-    if (!cleanCode) return;
-    if (cleanCode.includes('10')) {
-      setDiscountPercent('10');
-      showToast('success', 'Cupón del 10% de descuento aplicado.');
-    } else if (cleanCode.includes('20')) {
-      setDiscountPercent('20');
-      showToast('success', 'Cupón del 20% de descuento aplicado.');
-    } else if (cleanCode.includes('5')) {
-      setDiscountPercent('5');
-      showToast('success', 'Cupón del 5% de descuento aplicado.');
+    const raw = (code || '').trim();
+    if (!raw) {
+      handleRemoveDiscount();
+      return;
+    }
+
+    const cleanCode = raw.toUpperCase();
+    
+    // Check for 0 or explicit clear keywords
+    const isZero = cleanCode === '0' || cleanCode === '0%' || cleanCode === '$0' || cleanCode === '0.0' || cleanCode === '0.00' || cleanCode === '0$' || cleanCode === 'SIN DESCUENTO' || cleanCode === 'NINGUNO' || cleanCode === 'QUITAR' || cleanCode === 'CANCELAR';
+    
+    if (isZero) {
+      handleRemoveDiscount();
+      return;
+    }
+
+    // Percentage format: e.g. "15%" or "15 %"
+    if (raw.endsWith('%') || cleanCode.endsWith('%')) {
+      const num = parseFloat(raw.replace('%', '').replace(',', '.'));
+      if (!isNaN(num)) {
+        if (num <= 0) {
+          handleRemoveDiscount();
+        } else {
+          handlePercentChange(num.toString());
+          setDiscountCode(`${num}%`);
+          showToast('success', `Descuento del ${num}% aplicado.`);
+        }
+        return;
+      }
+    }
+
+    // Dollar format: e.g. "$10" or "10$" or "10usd"
+    if (raw.includes('$') || cleanCode.includes('USD')) {
+      const num = parseFloat(raw.replace(/[\$\sUSDusd]/g, '').replace(',', '.'));
+      if (!isNaN(num)) {
+        if (num <= 0) {
+          handleRemoveDiscount();
+        } else {
+          handleAmountChange(num.toString());
+          setDiscountCode(`$${num}`);
+          showToast('success', `Descuento de $${num.toFixed(2)} USD aplicado.`);
+        }
+        return;
+      }
+    }
+
+    // Direct numeric input e.g. "0", "15", "5.5"
+    const parsedNum = parseFloat(raw.replace(',', '.'));
+    if (!isNaN(parsedNum)) {
+      if (parsedNum <= 0) {
+        handleRemoveDiscount();
+      } else if (parsedNum <= 100) {
+        handlePercentChange(parsedNum.toString());
+        setDiscountCode(`${parsedNum}%`);
+        showToast('success', `Descuento del ${parsedNum}% aplicado.`);
+      } else {
+        handleAmountChange(parsedNum.toString());
+        setDiscountCode(`$${parsedNum}`);
+        showToast('success', `Descuento de $${parsedNum.toFixed(2)} USD aplicado.`);
+      }
+      return;
+    }
+
+    // String code with embedded numbers e.g. "PROMO15", "DESCUENTO20"
+    const digitMatch = cleanCode.match(/(\d+(\.\d+)?)/);
+    if (digitMatch) {
+      const num = parseFloat(digitMatch[1]);
+      if (num <= 0) {
+        handleRemoveDiscount();
+      } else if (num <= 100) {
+        handlePercentChange(num.toString());
+        setDiscountCode(cleanCode);
+        showToast('success', `Cupón del ${num}% aplicado.`);
+      } else {
+        handleAmountChange(num.toString());
+        setDiscountCode(cleanCode);
+        showToast('success', `Cupón de $${num.toFixed(2)} USD aplicado.`);
+      }
     } else {
-      setDiscountPercent('10');
-      showToast('success', `Cupón "${cleanCode}" aplicado con éxito.`);
+      handlePercentChange('10');
+      setDiscountCode(cleanCode);
+      showToast('success', `Cupón "${cleanCode}" (10%) aplicado con éxito.`);
     }
   };
 
-    const handlePaymentCountChange = (count: number) => {
+  const handlePaymentCountChange = (count: number) => {
     setPaymentCount(count);
-    const active = getActiveMethods();
-    const defaultMethod = active[0]?.id || 'Efectivo USD';
+    const activeAccounts = bankAccounts.length > 0 ? bankAccounts : [];
+    const defaultAcc = activeAccounts[0];
+    const rate = customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES);
 
     if (count === 1) {
-      setPaymentMethod(splitPayments[0]?.method || defaultMethod);
+      const targetAcc = activeAccounts.find(a => a.id === (splitPayments[0]?.bankAccountId || selectedBankId)) || defaultAcc;
+      const isVES = targetAcc ? targetAcc.currency === 'VES' : true;
+      const newAmt = isVES ? parseFloat((total * rate).toFixed(2)) : parseFloat(total.toFixed(2));
+      
+      setSplitPayments([{
+        method: targetAcc ? targetAcc.name : 'Cuenta Bancaria',
+        amount: newAmt,
+        bankAccountId: targetAcc?.id,
+        currency: targetAcc?.currency || (isVES ? 'VES' : 'USD')
+      }]);
       return;
     }
 
     const equalShareUsd = count > 0 ? total / count : total;
     let accumulatedUsd = 0;
-    const newSplits: { method: string; amount: number }[] = [];
+    const newSplits: { method: string; amount: number; bankAccountId?: string; currency?: string }[] = [];
     for (let i = 0; i < count; i++) {
       const shareUsd = i === count - 1 ? Math.max(0, total - accumulatedUsd) : equalShareUsd;
       accumulatedUsd += shareUsd;
-      const slotMethod = splitPayments[i]?.method || active[i % active.length]?.id || defaultMethod;
-      const convertedAmt = parseFloat(usdToMethodAmount(shareUsd, slotMethod).toFixed(2));
+      const slotAcc = activeAccounts[i % activeAccounts.length] || defaultAcc;
+      const isVES = slotAcc ? slotAcc.currency === 'VES' : false;
+      const convertedAmt = isVES ? parseFloat((shareUsd * rate).toFixed(2)) : parseFloat(shareUsd.toFixed(2));
       newSplits.push({
-        method: slotMethod,
-        amount: convertedAmt
+        method: slotAcc ? slotAcc.name : `Pago ${i + 1}`,
+        amount: convertedAmt,
+        bankAccountId: slotAcc?.id,
+        currency: slotAcc?.currency || (isVES ? 'VES' : 'USD')
       });
     }
     setSplitPayments(newSplits);
   };
 
   const handleUpdateSplitMethod = (index: number, newMethodId: string) => {
+    if (index === 0) {
+      setPaymentMethod(newMethodId);
+    }
     setSplitPayments(prev => {
       const copy = [...prev];
       if (copy[index]) {
         const oldMethod = copy[index].method;
         const currentAmount = copy[index].amount || 0;
-        const inUsd = methodAmountToUsd(currentAmount, oldMethod);
+        const inUsd = methodAmountToUsd(currentAmount, copy[index]);
         const inNewMethod = parseFloat(usdToMethodAmount(inUsd, newMethodId).toFixed(2));
         copy[index] = {
+          ...copy[index],
           method: newMethodId,
           amount: inNewMethod
         };
@@ -586,19 +930,22 @@ export default function POSModule({
   };
 
   const handleFillRemaining = (index: number) => {
+    const rate = customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES);
     setSplitPayments(prev => {
       const copy = [...prev];
       let sumOtherUsd = 0;
       copy.forEach((item, idx) => {
         if (idx !== index) {
-          sumOtherUsd += methodAmountToUsd(item.amount || 0, item.method);
+          sumOtherUsd += methodAmountToUsd(item.amount || 0, item);
         }
       });
       const remainingUsd = Math.max(0, total - sumOtherUsd);
       if (copy[index]) {
+        const isVES = getPaymentCurrency(copy[index]) === 'VES';
+        const fillAmt = isVES ? parseFloat((remainingUsd * rate).toFixed(2)) : parseFloat(remainingUsd.toFixed(2));
         copy[index] = {
           ...copy[index],
-          amount: parseFloat(usdToMethodAmount(remainingUsd, copy[index].method).toFixed(2))
+          amount: fillAmt
         };
       }
       return copy;
@@ -853,14 +1200,22 @@ export default function POSModule({
     if (!val.trim()) {
       setFilteredClients([]);
       setShowClientSuggestions(false);
+      setWizardSelectedClientObj(null);
       return;
     }
+    const cleanVal = val.toLowerCase().trim();
     const filtered = clients.filter(c => 
-      (c.name || '').toLowerCase().includes(val.toLowerCase()) ||
-      (c.document || '').toLowerCase().includes(val.toLowerCase())
+      (c.name || '').toLowerCase().includes(cleanVal) ||
+      (c.document || '').toLowerCase().includes(cleanVal) ||
+      (c.phone || '').toLowerCase().includes(cleanVal)
     );
     setFilteredClients(filtered);
     setShowClientSuggestions(filtered.length > 0);
+
+    const exact = clients.find(c => (c.name || '').toLowerCase().trim() === cleanVal);
+    if (exact) {
+      setWizardSelectedClientObj(exact);
+    }
   };
 
   // Database lists
@@ -933,6 +1288,24 @@ export default function POSModule({
   const [showDraftModal, setShowDraftModal] = useState(false);
   const [showDraftsListModal, setShowDraftsListModal] = useState(false);
   const [draftReference, setDraftReference] = useState('');
+  const [draftSearchQuery, setDraftSearchQuery] = useState('');
+  const [expandedDraftId, setExpandedDraftId] = useState<string | null>(null);
+
+  // Filtrar facturas en espera por referencia, cliente, método o productos
+  const filteredDraftInvoices = useMemo(() => {
+    if (!draftSearchQuery.trim()) return draftInvoices;
+    const q = draftSearchQuery.toLowerCase().trim();
+    return draftInvoices.filter((draft) => {
+      const refMatch = (draft.reference || '').toLowerCase().includes(q);
+      const clientMatch = (draft.customer_name || '').toLowerCase().includes(q);
+      const methodMatch = (draft.payment_method || '').toLowerCase().includes(q);
+      const itemsMatch = draft.items?.some((i: any) => 
+        (i.name || '').toLowerCase().includes(q) || 
+        (i.sku || '').toLowerCase().includes(q)
+      );
+      return refMatch || clientMatch || methodMatch || itemsMatch;
+    });
+  }, [draftInvoices, draftSearchQuery]);
   
   const [showMergeModal, setShowMergeModal] = useState(false);
   const [pendingDraftToResume, setPendingDraftToResume] = useState<any>(null);
@@ -1001,6 +1374,8 @@ export default function POSModule({
         // Update client list
         setClients(prev => [created, ...prev]);
         setSelectedClient(created.name);
+        setWizardSelectedClientObj(created);
+        setWizardClientSearchQuery(created.name);
         // Reset states
         setNewClientName('');
         setNewClientDocument('');
@@ -1043,9 +1418,13 @@ export default function POSModule({
     loadInvoiceData();
     checkActiveSession();
 
+    let debounceTimer: any = null;
     const handleDataUpdate = () => {
-      loadInvoiceData();
-      checkActiveSession();
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        loadInvoiceData();
+        checkActiveSession();
+      }, 350);
     };
 
     window.addEventListener('bellavista_invoices_updated', handleDataUpdate);
@@ -1053,6 +1432,7 @@ export default function POSModule({
     window.addEventListener('bellavista_orders_updated', handleDataUpdate);
 
     return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
       window.removeEventListener('bellavista_invoices_updated', handleDataUpdate);
       window.removeEventListener('bellavista_cash_updated', handleDataUpdate);
       window.removeEventListener('bellavista_orders_updated', handleDataUpdate);
@@ -1073,9 +1453,40 @@ export default function POSModule({
   // Calculate discounts
   const discountPercentNum = parseFloat(discountPercent) || 0;
   const discountAmountNum = parseFloat(discountAmount) || 0;
-  const calculatedDiscountUsd = discountPercentNum > 0 
-    ? parseFloat((subtotal * (discountPercentNum / 100)).toFixed(2))
-    : discountAmountNum;
+  const calculatedDiscountUsd = (() => {
+    if (discountType === 'percent') {
+      return discountPercentNum > 0 && subtotal > 0 
+        ? parseFloat((subtotal * (discountPercentNum / 100)).toFixed(2))
+        : 0;
+    }
+    if (discountType === 'amount') {
+      return discountAmountNum > 0 ? Math.min(subtotal, discountAmountNum) : 0;
+    }
+    if (discountPercentNum > 0 && subtotal > 0) {
+      return parseFloat((subtotal * (discountPercentNum / 100)).toFixed(2));
+    }
+    if (discountAmountNum > 0) {
+      return Math.min(subtotal, discountAmountNum);
+    }
+    return 0;
+  })();
+
+  // Synchronize discountAmount and discountPercent when subtotal changes
+  useEffect(() => {
+    if (subtotal > 0) {
+      if (discountType === 'percent' && discountPercentNum > 0) {
+        const expectedAmt = parseFloat((subtotal * (discountPercentNum / 100)).toFixed(2)).toString();
+        if (discountAmount !== expectedAmt) {
+          setDiscountAmount(expectedAmt);
+        }
+      } else if (discountType === 'amount' && discountAmountNum > 0) {
+        const expectedPct = parseFloat(((discountAmountNum / subtotal) * 100).toFixed(2)).toString();
+        if (discountPercent !== expectedPct) {
+          setDiscountPercent(expectedPct);
+        }
+      }
+    }
+  }, [subtotal, discountType, discountPercentNum, discountAmountNum]);
 
   // Extra charges total
   const extraChargesTotal = extraCharges.reduce((acc, c) => acc + (Number(c.amount) || 0), 0);
@@ -1083,43 +1494,252 @@ export default function POSModule({
   // Base for taxes after discount and plus extra charges
   const baseForTaxes = Math.max(0, subtotal - calculatedDiscountUsd + extraChargesTotal);
 
-  // IVA & IGTF
-  const calculatedIvaUsd = applyIva ? parseFloat((baseForTaxes * 0.16).toFixed(2)) : 0;
-  const calculatedIgtfUsd = applyIgtf ? parseFloat((baseForTaxes * 0.03).toFixed(2)) : 0;
+  // Helper to obtain tax rate recorded on the product in DB
+  const getProductTaxRate = (prod: Product): number => {
+    if (prod.tax_rate !== undefined && prod.tax_rate !== null) {
+      return Number(prod.tax_rate);
+    }
+    if (prod.tax_id) {
+      if (prod.tax_id === 'exento' || prod.tax_id === '0') return 0;
+      const matchedTax = taxes.find(t => t.id === prod.tax_id);
+      if (matchedTax) return Number(matchedTax.rate);
+      if (prod.tax_id === 'default-iva') return 16;
+    }
+    const defaultTax = taxes.find(t => t.id === 'default-iva' || t.is_active !== false);
+    return defaultTax ? Number(defaultTax.rate) : 16;
+  };
+
+  // Helper to obtain tax name recorded on the product or tax table
+  const getProductTaxName = (prod: Product): string => {
+    if (prod.tax_id) {
+      if (prod.tax_id === 'exento' || prod.tax_id === '0') return 'Exento';
+      const matchedTax = taxes.find(t => t.id === prod.tax_id);
+      if (matchedTax && matchedTax.name) return matchedTax.name;
+      if (prod.tax_id === 'default-iva') return 'IVA';
+    }
+    const defaultTax = taxes.find(t => t.id === 'default-iva' || t.is_active !== false);
+    return defaultTax ? defaultTax.name : 'IVA';
+  };
+
+  // Proportional discount ratio applied to each line item
+  const discountRatio = subtotal > 0 ? (calculatedDiscountUsd / subtotal) : 0;
+
+  // IVA calculated from product tax rate in database when "Sujeto a impuesto" (applyIva) is active
+  const calculatedIvaUsd = applyIva ? parseFloat(cart.reduce((sum, item) => {
+    const itemRawTotal = item.product.price * item.qty;
+    const netItemBase = itemRawTotal * (1 - discountRatio);
+    const itemTaxRate = getProductTaxRate(item.product);
+    const itemTax = netItemBase * (itemTaxRate / 100);
+    return sum + itemTax;
+  }, (extraChargesTotal > 0 ? extraChargesTotal * 0.16 : 0)).toFixed(2)) : 0;
+
+  // Structured list of applied taxes indicating exact tax type for summary display
+  const taxItemsSummary = useMemo(() => {
+    const rateForVes = customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES);
+
+    if (cart.length === 0) {
+      return [{
+        label: 'IVA (16%):',
+        amountUsd: 0,
+        amountVes: 0
+      }];
+    }
+
+    if (!applyIva) {
+      const uniqueTaxes = new Set<string>();
+      cart.forEach(item => {
+        const rate = getProductTaxRate(item.product);
+        const name = getProductTaxName(item.product);
+        const formatted = name.includes(`${rate}%`) || name.includes(`${rate} %`) ? name : `${name} (${rate}%)`;
+        uniqueTaxes.add(formatted);
+      });
+      const label = (Array.from(uniqueTaxes).join(', ') || 'IVA (16%)') + ':';
+      return [{
+        label,
+        amountUsd: 0,
+        amountVes: 0
+      }];
+    }
+
+    const groups: { [key: string]: { label: string; rate: number; taxUsd: number } } = {};
+
+    cart.forEach(item => {
+      const rate = getProductTaxRate(item.product);
+      const name = getProductTaxName(item.product);
+      const key = `${name}_${rate}`;
+      const itemRawTotal = item.product.price * item.qty;
+      const netItemBase = itemRawTotal * (1 - discountRatio);
+      const itemTax = netItemBase * (rate / 100);
+
+      if (!groups[key]) {
+        const formatted = name.includes(`${rate}%`) || name.includes(`${rate} %`) ? name : `${name} (${rate}%)`;
+        groups[key] = {
+          label: `${formatted}:`,
+          rate,
+          taxUsd: 0
+        };
+      }
+      groups[key].taxUsd += itemTax;
+    });
+
+    if (extraChargesTotal > 0) {
+      const defaultTax = taxes.find(t => t.id === 'default-iva' || t.is_active !== false);
+      const defRate = defaultTax ? Number(defaultTax.rate) : 16;
+      const defName = defaultTax?.name || 'IVA';
+      const key = `${defName}_${defRate}`;
+      const extraTax = extraChargesTotal * (defRate / 100);
+      if (!groups[key]) {
+        const formatted = defName.includes(`${defRate}%`) || defName.includes(`${defRate} %`) ? defName : `${defName} (${defRate}%)`;
+        groups[key] = {
+          label: `${formatted}:`,
+          rate: defRate,
+          taxUsd: extraTax
+        };
+      } else {
+        groups[key].taxUsd += extraTax;
+      }
+    }
+
+    const result = Object.values(groups).map(g => ({
+      label: g.label,
+      amountUsd: parseFloat(g.taxUsd.toFixed(2)),
+      amountVes: parseFloat((g.taxUsd * rateForVes).toFixed(2))
+    }));
+
+    if (result.length === 0) {
+      return [{
+        label: 'IVA (16%):',
+        amountUsd: parseFloat(calculatedIvaUsd.toFixed(2)),
+        amountVes: parseFloat((calculatedIvaUsd * rateForVes).toFixed(2))
+      }];
+    }
+
+    return result;
+  }, [cart, taxes, applyIva, discountRatio, extraChargesTotal, calculatedIvaUsd, customBcvRate, currencyRates, bcvRate]);
+
+  // Has USD payment method selected
+  const hasUsdPayment = saleCondition === 'pagada'
+    ? splitPayments.some(p => getPaymentCurrency(p) === 'USD')
+    : false;
+
+  // Auto-activate or deactivate IGTF toggle when USD payment is selected or removed
+  const prevHasUsdRef = useRef<boolean>(hasUsdPayment);
+  useEffect(() => {
+    if (hasUsdPayment && !prevHasUsdRef.current) {
+      setApplyIgtf(true);
+    } else if (!hasUsdPayment && prevHasUsdRef.current) {
+      setApplyIgtf(false);
+    }
+    prevHasUsdRef.current = hasUsdPayment;
+  }, [hasUsdPayment]);
+
+  // Amount paid in foreign currency (USD) for IGTF calculation
+  const usdPaidAmount = splitPayments.reduce(
+    (sum, p) => getPaymentCurrency(p) === 'USD' ? sum + methodAmountToUsd(p.amount || 0, p) : sum,
+    0
+  );
+  const igtfBase = usdPaidAmount > 0 ? Math.min(baseForTaxes, usdPaidAmount) : baseForTaxes;
+  const calculatedIgtfUsd = (applyIgtf && hasUsdPayment) ? parseFloat((igtfBase * 0.03).toFixed(2)) : 0;
 
   // Final Total to Pay in USD
   const total = parseFloat((baseForTaxes + calculatedIvaUsd + calculatedIgtfUsd).toFixed(2));
   const iva = calculatedIvaUsd;
 
   const appliedTaxes = [
-    ...(applyIva ? [{ id: 'iva-16', name: 'IVA (16%)', rate: 16, amount: calculatedIvaUsd }] : []),
-    ...(applyIgtf ? [{ id: 'igtf-3', name: 'IGTF (3%)', rate: 3, amount: calculatedIgtfUsd }] : [])
+    ...(applyIva && calculatedIvaUsd > 0 ? taxItemsSummary.map((t, idx) => ({ 
+      id: `iva-${idx}`, 
+      name: t.label.replace(/:$/, ''), 
+      rate: cart.some(i => getProductTaxRate(i.product) > 0) ? getProductTaxRate(cart.find(i => getProductTaxRate(i.product) > 0)!.product) : 16, 
+      amount: t.amountUsd 
+    })) : []),
+    ...(applyIgtf && hasUsdPayment && calculatedIgtfUsd > 0 ? [{ 
+      id: 'igtf-3', 
+      name: 'IGTF (3%)', 
+      rate: 3, 
+      amount: calculatedIgtfUsd 
+    }] : [])
   ];
 
-    useEffect(() => {
-    if (paymentCount > 1) {
-      const active = getActiveMethods();
-      const defaultMethod = active[0]?.id || 'Efectivo USD';
-      
+  // 🔄 Auto-sync payments with cart total and selected bank accounts for cash sales
+  useEffect(() => {
+    if (bankAccounts.length === 0) return;
+    if (saleCondition === 'credito') return;
+
+    const rate = customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES);
+
+    if (paymentCount === 1) {
+      setSplitPayments(prev => {
+        const current = prev[0];
+        const targetBankId = current?.bankAccountId || selectedBankId || bankAccounts[0]?.id;
+        const targetBank = bankAccounts.find(a => a.id === targetBankId) || bankAccounts[0];
+        const isVES = targetBank?.currency === 'VES';
+        const newAmt = isVES ? parseFloat((total * rate).toFixed(2)) : parseFloat(total.toFixed(2));
+        
+        return [{
+          method: targetBank?.name || current?.method || 'Cuenta Bancaria',
+          amount: newAmt,
+          bankAccountId: targetBank?.id,
+          currency: targetBank?.currency || (isVES ? 'VES' : 'USD')
+        }];
+      });
+    } else {
       const equalShareUsd = paymentCount > 0 ? total / paymentCount : total;
       let accumulatedUsd = 0;
       setSplitPayments(prev => {
         const copy = [...prev];
-        const updated: { method: string; amount: number }[] = [];
+        const updated: { method: string; amount: number; bankAccountId?: string; currency?: string }[] = [];
         for (let i = 0; i < paymentCount; i++) {
           const shareUsd = i === paymentCount - 1 ? Math.max(0, total - accumulatedUsd) : equalShareUsd;
           accumulatedUsd += shareUsd;
-          const slotMethod = copy[i]?.method || active[i % active.length]?.id || defaultMethod;
-          const convertedAmt = parseFloat(usdToMethodAmount(shareUsd, slotMethod).toFixed(2));
+          const targetBank = bankAccounts.find(a => a.id === copy[i]?.bankAccountId) || bankAccounts[i % bankAccounts.length] || bankAccounts[0];
+          const isVES = targetBank ? targetBank.currency === 'VES' : false;
+          const convertedAmt = isVES ? parseFloat((shareUsd * rate).toFixed(2)) : parseFloat(shareUsd.toFixed(2));
           updated.push({
-            method: slotMethod,
-            amount: convertedAmt
+            method: targetBank ? targetBank.name : (copy[i]?.method || `Pago ${i + 1}`),
+            amount: convertedAmt,
+            bankAccountId: targetBank?.id,
+            currency: targetBank?.currency || (isVES ? 'VES' : 'USD')
           });
         }
         return updated;
       });
     }
-  }, [total, paymentCount]);
+  }, [total, paymentCount, customBcvRate, bcvRate, bankAccounts, saleCondition]);
+
+  // 🔄 Auto-sync credit (CxC) splits and initial abono when in 'credito' condition
+  useEffect(() => {
+    if (saleCondition !== 'credito') return;
+    const initialAmt = Math.min(total, Math.max(0, Number(cxcInitialPayment) || 0));
+    const remainingAmt = Math.max(0, total - initialAmt);
+    const nonCxcAccounts = bankAccounts.filter(a => a.id !== 'cxc-virtual');
+    const targetAcc = (cxcInitialBankId ? nonCxcAccounts.find(a => a.id === cxcInitialBankId) : null) || nonCxcAccounts[0] || bankAccounts[0];
+    const rate = customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES);
+    const isVES = targetAcc?.currency === 'VES';
+    const initialAmtInCurrency = isVES ? parseFloat((initialAmt * rate).toFixed(2)) : parseFloat(initialAmt.toFixed(2));
+
+    const newSplit: any[] = [
+      {
+        method: 'Cuentas por Cobrar (Crédito Cliente)',
+        amount: parseFloat(remainingAmt.toFixed(2)),
+        bankAccountId: 'cxc-virtual',
+        currency: 'USD'
+      }
+    ];
+
+    if (initialAmt > 0) {
+      newSplit.push({
+        method: targetAcc?.name || 'Efectivo',
+        amount: initialAmtInCurrency,
+        bankAccountId: targetAcc?.id,
+        currency: targetAcc?.currency || (isVES ? 'VES' : 'USD')
+      });
+      setSplitPayments(newSplit);
+      setPaymentCount(2);
+    } else {
+      setSplitPayments(newSplit);
+      setPaymentCount(1);
+    }
+  }, [saleCondition, cxcInitialPayment, cxcInitialBankId, total, customBcvRate, bcvRate, bankAccounts]);
 
   // 🛍️ Venta Libre (Código 99999) Handlers
   const openVentaLibreModal = (_preset?: Partial<Product>) => {
@@ -1471,7 +2091,7 @@ export default function POSModule({
   // ⏸️ POSPONE SALE / PUT ON HOLD (AUTOMATIC)
   const handlePostponeSale = async () => {
     if (cart.length === 0) {
-      showToast('error', 'Debe agregar al menos un producto al carrito para postergar la venta.');
+      showToast('error', 'Debe agregar al menos un producto al carrito para guardar en espera.');
       return;
     }
 
@@ -1493,10 +2113,11 @@ export default function POSModule({
 
       // Create draft details matching db structure
       const draftItems = cart.map(item => {
-        const itemTaxRate = item.product.tax_rate !== undefined && item.product.tax_rate !== null ? item.product.tax_rate : 0;
-        const itemTaxId = item.product.tax_id || (itemTaxRate > 0 ? 'default-iva' : 'exento');
+        const itemTaxRate = applyIva ? getProductTaxRate(item.product) : 0;
+        const itemTaxId = applyIva ? (itemTaxRate > 0 ? (item.product.tax_id || 'default-iva') : 'exento') : 'exento';
         const itemTotal = item.product.price * item.qty;
-        const itemTaxAmount = itemTotal * (itemTaxRate / 100);
+        const netBase = itemTotal * (1 - discountRatio);
+        const itemTaxAmount = parseFloat((netBase * (itemTaxRate / 100)).toFixed(2));
         return {
           product_id: item.product.id,
           name: item.product.name,
@@ -1526,9 +2147,9 @@ export default function POSModule({
         amount: t.amount
       }));
 
-      const savedDraft = await dbService.createDraftInvoice({
+      await dbService.createDraftInvoice({
         reference: calculatedDraftRef,
-        customer_name: selectedClient,
+        customer_name: selectedClient || 'Consumidor final',
         payment_method: finalPaymentMethod,
         subtotal: subtotal,
         iva: iva,
@@ -1537,20 +2158,150 @@ export default function POSModule({
         taxes_detail: taxesDetail
       });
 
-      // Reload lists
-      await loadInvoiceData();
+      // 🧹 LIMPIEZA INMEDIATA Y COMPLETA DEL CARRO DE PRODUCTOS EN LA VENTA
+      setCart([]);
+      resetVentaFlash();
 
-      // No limpiamos la pantalla por solicitud del usuario (se limpia al generar factura, nota de entrega o pedido)
-      if (savedDraft && savedDraft.id) {
-        setActiveDraftId(savedDraft.id);
-      }
+      // Recargar lista de facturas en espera y ventas
+      await loadInvoiceData();
       
-      showToast('success', `Venta postergada en espera con código: ${calculatedDraftRef}`);
+      showToast('success', `¡Factura guardada en espera exitosamente (${calculatedDraftRef})! El carro de productos de la venta ha sido limpiado.`);
     } catch (err: any) {
       console.error('Error postponing sale:', err);
-      showToast('error', `Error al postergar venta: ${err.message || 'Error desconocido'}`);
+      // Garantizar que ante cualquier error el carro de la venta se limpie para no bloquear al cajero
+      setCart([]);
+      resetVentaFlash();
+      showToast('error', `Error al guardar factura en espera: ${err.message || 'Error desconocido'}`);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  // 🧙‍♂️ WIZARD STEP 1: CLIENT CREATION OR SELECTION CONFIRMATION
+  const handleWizardNextStep1 = async () => {
+    if (!wizardSelectedClientObj) {
+      showToast('error', 'Por favor seleccione o registre un cliente para continuar.');
+      return;
+    }
+
+    const docRaw = (wizardSelectedClientObj.document || '').trim();
+    const nameRaw = (wizardSelectedClientObj.name || '').trim();
+    const isCF = !nameRaw || nameRaw.toLowerCase() === 'consumidor final' || wizardSelectedClientObj.id === 'cf';
+
+    if (isCF) {
+      const cf = {
+        id: 'cf',
+        name: 'Consumidor final',
+        document: 'V-99999999',
+        email: '',
+        phone: '',
+        address: 'Mostrador',
+        credit_usd: 0
+      };
+      setWizardSelectedClientObj(cf);
+      setSelectedClient('Consumidor final');
+      setWizardIsNewClient(false);
+      setWizardStep(2);
+      return;
+    }
+
+    // Check if client already exists in loaded clients list (by normalized doc or name)
+    const normDoc = docRaw.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+    const normName = nameRaw.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+    const existingMatch = clients.find(c => {
+      if (c.id === 'cf') return false;
+      const cDoc = (c.document || c.doc_number || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+      const cName = (c.name || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      if (normDoc && cDoc && normDoc === cDoc) return true;
+      if (normName && cName && normName === cName) return true;
+      return false;
+    });
+
+    if (existingMatch) {
+      // Client already exists in database: update information if modified without inserting a new duplicate
+      const cleanPhone = (wizardSelectedClientObj.phone || existingMatch.phone || '').trim();
+      const cleanEmail = (wizardSelectedClientObj.email || existingMatch.email || '').trim();
+      const cleanAddress = (wizardSelectedClientObj.address || existingMatch.address || '').trim();
+
+      if (existingMatch.id && !String(existingMatch.id).startsWith('cf')) {
+        try {
+          dbService.updateClient(existingMatch.id, {
+            name: nameRaw || existingMatch.name,
+            document: docRaw || existingMatch.document,
+            phone: cleanPhone,
+            email: cleanEmail,
+            address: cleanAddress
+          }).catch(e => console.warn('Non-blocking client update notice:', e));
+        } catch (e) {
+          console.warn('Error updating existing client:', e);
+        }
+      }
+
+      const merged = {
+        ...existingMatch,
+        name: nameRaw || existingMatch.name,
+        document: docRaw || existingMatch.document,
+        phone: cleanPhone,
+        email: cleanEmail,
+        address: cleanAddress
+      };
+
+      setClients(prev => prev.map(c => c.id === existingMatch.id ? merged : c));
+      setWizardSelectedClientObj(merged);
+      setSelectedClient(merged.name);
+      setWizardIsNewClient(false);
+      setWizardStep(2);
+      return;
+    }
+
+    if (wizardIsNewClient) {
+      if (!nameRaw) {
+        showToast('error', 'El nombre es obligatorio para registrar un nuevo cliente.');
+        return;
+      }
+      if (!docRaw) {
+        showToast('error', 'La cédula o RIF es obligatoria para registrar un nuevo cliente.');
+        return;
+      }
+
+      setIsLoading(true);
+      try {
+        const docUpper = docRaw.toUpperCase();
+        const clientPayload = {
+          name: nameRaw,
+          document: docRaw,
+          type: (docUpper.startsWith('J') || docUpper.startsWith('G')) ? 'Jurídico' as const : 'Natural' as const,
+          phone: wizardSelectedClientObj.phone?.trim() || '',
+          email: wizardSelectedClientObj.email?.trim() || '',
+          address: wizardSelectedClientObj.address?.trim() || '',
+          credit_usd: 0
+        };
+
+        const created = await dbService.createClient(clientPayload);
+        if (created) {
+          showToast('success', '¡Cliente nuevo registrado y seleccionado exitosamente!');
+          // Add to clients state ensuring no duplicates
+          setClients(prev => {
+            const filtered = prev.filter(c => c.id !== created.id && c.document !== created.document);
+            return [created, ...filtered];
+          });
+          setWizardSelectedClientObj(created);
+          setSelectedClient(created.name);
+          setWizardIsNewClient(false);
+          setWizardStep(2);
+        } else {
+          showToast('error', 'No se pudo crear el nuevo cliente.');
+        }
+      } catch (err: any) {
+        console.error('Error creating client in wizard:', err);
+        showToast('error', `Error al registrar cliente: ${err.message || 'Error desconocido'}`);
+      } finally {
+        setIsLoading(false);
+      }
+    } else {
+      setSelectedClient(nameRaw);
+      setWizardStep(2);
     }
   };
 
@@ -1567,6 +2318,11 @@ export default function POSModule({
   const executeResumeDraft = async (draft: any, mode: 'merge' | 'replace') => {
     try {
       setIsLoading(true);
+      
+      // If replace mode, clear current form state first
+      if (mode === 'replace') {
+        resetVentaFlash();
+      }
       
       // Fetch full products list to ensure up-to-date prices and stock
       const updatedCart: { product: Product; qty: number }[] = mode === 'merge' ? [...cart] : [];
@@ -1615,19 +2371,38 @@ export default function POSModule({
       }
 
       setCart(updatedCart);
-      setSelectedClient(draft.customer_name || 'Consumidor final');
+      const clientName = draft.customer_name || 'Consumidor final';
+      setSelectedClient(clientName);
+      
+      const foundClient = clients.find(c => (c.name || '').toLowerCase() === clientName.toLowerCase());
+      if (foundClient) {
+        setWizardSelectedClientObj(foundClient);
+      } else {
+        setWizardSelectedClientObj({
+          id: 'cf',
+          name: clientName,
+          document: 'V-99999999',
+          email: '',
+          phone: '',
+          address: 'Mostrador',
+          credit_usd: 0
+        });
+      }
+
       setPaymentMethod(draft.payment_method || 'Efectivo');
       
       // Keep draft in DB but mark as active draft being edited in POS
       setActiveDraftId(draft.id);
       
-      // Hide dialogs and reload
+      // Hide dialogs, close wizard and return cleanly to direct sale ('cart')
       setShowMergeModal(false);
       setShowDraftsListModal(false);
+      setShowCheckoutWizard(false);
+      setPosStep('cart');
       setPendingDraftToResume(null);
       await loadInvoiceData();
       
-      showToast('success', `Factura pospuesta de "${draft.reference}" cargada a la tabla de ventas.`);
+      showToast('success', `Factura en espera "${draft.reference}" cargada en venta directa.`);
     } catch (err: any) {
       console.error('Error resuming draft:', err);
       showToast('error', `No se pudo retomar la factura: ${err.message}`);
@@ -1670,28 +2445,63 @@ export default function POSModule({
     window.print();
   };
 
-  // ⚡ Reset Venta Flash State — limpia TODOS los campos del formulario
+  // ⚡ Reset Venta Flash State — limpia TODOS los campos del formulario y vuelve a la venta directa
   const resetVentaFlash = () => {
     setCart([]);
     setSelectedClient('Consumidor final');
-    setPaymentMethod('Efectivo VES');
+    setWizardSelectedClientObj(null);
+    setWizardClientSearchQuery('');
+    setShowWizardSuggestions(false);
+    setWizardIsNewClient(false);
+    setWizardStep(1);
+    setShowCheckoutWizard(false);
+    setPosStep('cart');
     setSaleConcept('');
     setSaleNote('');
-    setDiscountPercent('0');
-    setDiscountAmount('0');
+    setShowObservationsText(false);
+    setDiscountPercent('');
+    setDiscountAmount('');
+    setDiscountType('none');
     setDiscountCode('');
+    setShowDiscountSection(false);
     setExtraCharges([]);
     setExtraChargeName('Delivery / Envío');
     setExtraChargeAmount('');
-    // Resetear métodos de pago a un solo método vacío
-    const defaultMethod = getActiveMethods()[0]?.id || 'Efectivo USD';
-    setSplitPayments([{ method: defaultMethod, amount: 0 }]);
+    setSaleCondition('pagada');
+    setCxcSubject('');
+    setCxcDescription('');
+    setCxcInitialPayment(0);
+    setCxcDueDate('');
+    setCxcInitialBankId('');
+    setCustomBcvRate(0);
+    setSaleDate(new Date().toISOString().split('T')[0]);
+    setDocumentType('factura');
+
+    // Resetear métodos de pago a Efectivo Dólares (USD)
+    const defaultUsdAcc = bankAccounts.find(a => 
+      a.id !== 'cxc-virtual' && (
+        (a.name?.toLowerCase().includes('efectivo') && (a.currency === 'USD' || a.name?.toLowerCase().includes('usd') || a.name?.toLowerCase().includes('dolar') || a.name?.toLowerCase().includes('dólar')))
+        || a.currency === 'USD'
+      )
+    ) || bankAccounts.find(a => a.id !== 'cxc-virtual') || bankAccounts[0];
+
+    const defaultMethod = defaultUsdAcc?.name || 'Efectivo Dólares (USD)';
+    const defaultBankId = defaultUsdAcc?.id || '';
+    setPaymentMethod(defaultMethod);
+    setSelectedBankId(defaultBankId);
+    setSplitPayments([{ 
+      method: defaultMethod, 
+      amount: 0,
+      bankAccountId: defaultBankId,
+      currency: defaultUsdAcc?.currency || 'USD'
+    }]);
     setPaymentCount(1);
-    setPosStep('cart');
     setShowSuccessModal(false);
     setShowChangeModal(false);
     setCompletedInvoice(null);
     setActiveDraftId(null);
+    setShowMergeModal(false);
+    setShowDraftsListModal(false);
   };
 
   // 💸 + REGISTRAR NUEVO GASTO EN CAJA
@@ -1836,42 +2646,42 @@ export default function POSModule({
   };
 
   // 📝 + EXECUTE FINALIZE INVOICE
-  const executeFinalizeInvoice = async () => {
+  const executeFinalizeInvoice = async (customSplits?: any[], customPaymentCount?: number, customControlNumber?: string): Promise<any> => {
     if (cart.length === 0) {
       showToast('error', 'El carrito está vacío. Agregue productos para facturar.');
-      return;
+      return null;
     }
 
     const session = await dbService.getActiveCashSession();
     if (!session) {
       showToast('error', '⚠️ CAJA CERRADA: Debe aperturar la caja en la sección "Caja y Arqueo" antes de realizar ventas.');
-      return;
+      return null;
     }
 
     const stockErrors = cart.filter(item => item.product.sku !== '99999' && item.qty > item.product.stock);
     if (stockErrors.length > 0) {
       showToast('error', `No hay suficiente inventario para los siguientes productos: ${stockErrors.map(e => e.product.name).join(', ')}`);
-      return;
+      return null;
     }
 
     setIsLoading(true);
     try {
-      // 1. REBAJAR EL INVENTARIO / DECREASE THE INVENTORY STOCK
-      for (const item of cart) {
-        if (item.product.sku === '99999' || item.product.id.startsWith('vl-99999') || item.product.id === 'preset-sku-99999') {
-          continue;
-        }
-        const currentStock = item.product.stock;
-        const newStock = Math.max(0, currentStock - item.qty);
-        await dbService.updateProduct(item.product.id, { stock: newStock });
-      }
+      // 1. REBAJAR EL INVENTARIO EN PARALELO / DECREASE THE INVENTORY STOCK CONCURRENTLY
+      const stockUpdatePromises = cart
+        .filter(item => item.product.sku !== '99999' && !item.product.id.startsWith('vl-99999') && item.product.id !== 'preset-sku-99999')
+        .map(item => {
+          const currentStock = item.product.stock;
+          const newStock = Math.max(0, currentStock - item.qty);
+          return dbService.updateProduct(item.product.id, { stock: newStock });
+        });
 
       // 2. Structure invoice items with tax transferred information
       const invoiceItems = cart.map(item => {
-        const itemTaxRate = item.product.tax_rate !== undefined && item.product.tax_rate !== null ? item.product.tax_rate : 0;
-        const itemTaxId = item.product.tax_id || (itemTaxRate > 0 ? 'default-iva' : 'exento');
+        const itemTaxRate = applyIva ? getProductTaxRate(item.product) : 0;
+        const itemTaxId = applyIva ? (itemTaxRate > 0 ? (item.product.tax_id || 'default-iva') : 'exento') : 'exento';
         const itemTotal = item.product.price * item.qty;
-        const itemTaxAmount = itemTotal * (itemTaxRate / 100);
+        const netBase = itemTotal * (1 - discountRatio);
+        const itemTaxAmount = parseFloat((netBase * (itemTaxRate / 100)).toFixed(2));
         return {
           product_id: item.product.id,
           name: item.product.name,
@@ -1885,10 +2695,11 @@ export default function POSModule({
         };
       });
 
-      const rateForThisInvoice = customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || 45.5);
+      const rateForThisInvoice = customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES);
 
-      const ratesSnapshot: Record<CurrencyCode, number> = {
+      const ratesSnapshot: Record<string, number> = {
         USD: 1.0,
+        USDT: 1.0,
         VES: rateForThisInvoice,
         EUR: currencyRates.EUR || 0.92,
         COP: currencyRates.COP || 4100
@@ -1896,34 +2707,123 @@ export default function POSModule({
 
       const calculatedTotalsByCurrency: Record<string, number> = {
         USD: total,
+        USDT: total,
         VES: parseFloat((total * ratesSnapshot.VES).toFixed(2)),
         EUR: parseFloat((total * ratesSnapshot.EUR).toFixed(2)),
         COP: parseFloat((total * ratesSnapshot.COP).toFixed(0))
       };
 
-      const detailedSplitPayments = splitPayments.map(sp => {
-        const paymentCurr: CurrencyCode = getMethodCurrency(sp.method);
-        const rateUsed = ratesSnapshot[paymentCurr] || 1;
-        const normUsd = paymentCurr === 'USD' ? sp.amount : sp.amount / rateUsed;
-        const normVes = paymentCurr === 'VES' ? sp.amount : normUsd * ratesSnapshot.VES;
-        const normEur = paymentCurr === 'EUR' ? sp.amount : normUsd * (ratesSnapshot.EUR || 0.92);
-        const normCop = paymentCurr === 'COP' ? sp.amount : normUsd * (ratesSnapshot.COP || 4100);
+      let detailedSplitPayments: any[] = [];
 
-        return {
-          method: sp.method,
-          currency: paymentCurr,
-          amount: sp.amount,
-          amount_usd: parseFloat(normUsd.toFixed(2)),
-          amount_ves: parseFloat(normVes.toFixed(2)),
-          amount_eur: parseFloat(normEur.toFixed(2)),
-          amount_cop: parseFloat(normCop.toFixed(0)),
-          rate: rateUsed
-        };
-      });
+      if (saleCondition === 'credito') {
+        const initialAmtUsd = Math.min(total, Math.max(0, Number(cxcInitialPayment) || 0));
+        const remainingAmtUsd = Math.max(0, parseFloat((total - initialAmtUsd).toFixed(2)));
+        const nonCxcAccounts = bankAccounts.filter(a => a.id !== 'cxc-virtual');
+        const targetAcc = (cxcInitialBankId ? nonCxcAccounts.find(a => a.id === cxcInitialBankId) : null) || nonCxcAccounts[0] || bankAccounts[0];
+        const paymentCurr: CurrencyCode = (targetAcc?.currency as CurrencyCode) || 'VES';
+        const rateUsed = ratesSnapshot[paymentCurr] || rateForThisInvoice;
+        const initialAmtInCurrency = paymentCurr === 'USD' ? initialAmtUsd : parseFloat((initialAmtUsd * rateUsed).toFixed(2));
+
+        detailedSplitPayments = [
+          {
+            method: 'Cuentas por Cobrar (Crédito Cliente)',
+            currency: 'USD' as CurrencyCode,
+            amount: remainingAmtUsd,
+            amount_usd: remainingAmtUsd,
+            amount_ves: parseFloat((remainingAmtUsd * rateForThisInvoice).toFixed(2)),
+            amount_eur: parseFloat((remainingAmtUsd * (ratesSnapshot.EUR || 0.92)).toFixed(2)),
+            amount_cop: parseFloat((remainingAmtUsd * (ratesSnapshot.COP || 4100)).toFixed(0)),
+            rate: 1,
+            bankAccountId: 'cxc-virtual',
+            bank_account_id: 'cxc-virtual',
+            bank_account_name: 'Cuentas por Cobrar (Crédito Cliente)'
+          }
+        ];
+
+        if (initialAmtUsd > 0) {
+          detailedSplitPayments.push({
+            method: targetAcc ? targetAcc.name : 'Efectivo',
+            currency: paymentCurr,
+            amount: initialAmtInCurrency,
+            amount_usd: parseFloat(initialAmtUsd.toFixed(2)),
+            amount_ves: parseFloat((initialAmtUsd * rateForThisInvoice).toFixed(2)),
+            amount_eur: parseFloat((initialAmtUsd * (ratesSnapshot.EUR || 0.92)).toFixed(2)),
+            amount_cop: parseFloat((initialAmtUsd * (ratesSnapshot.COP || 4100)).toFixed(0)),
+            rate: rateUsed,
+            bankAccountId: targetAcc?.id,
+            bank_account_id: targetAcc?.id,
+            bank_account_name: targetAcc?.name || 'Efectivo'
+          });
+        }
+      } else {
+        const effectivePaymentCount = customPaymentCount !== undefined ? customPaymentCount : paymentCount;
+        const effectiveSplitPayments = customSplits !== undefined ? customSplits : splitPayments;
+
+        detailedSplitPayments = effectivePaymentCount > 1 
+          ? effectiveSplitPayments.map(sp => {
+              const isCxc = sp.bankAccountId === 'cxc-virtual' || 
+                            sp.method?.toLowerCase().includes('cuentas por cobrar') || 
+                            sp.method?.toLowerCase().includes('crédito') || 
+                            sp.method?.toLowerCase().includes('credito');
+
+              const bank = isCxc ? null : (bankAccounts.find(a => a.id === sp.bankAccountId) || bankAccounts[0]);
+              const paymentCurr: CurrencyCode = isCxc 
+                ? 'USD' 
+                : ((sp.currency as CurrencyCode) || (bank?.currency as CurrencyCode) || getPaymentCurrency(sp));
+
+              const rateUsed = ratesSnapshot[paymentCurr] || (paymentCurr === 'VES' ? rateForThisInvoice : 1);
+              const normUsd = (paymentCurr === 'USD' || paymentCurr === 'USDT') ? sp.amount : sp.amount / rateUsed;
+              const normVes = paymentCurr === 'VES' ? sp.amount : normUsd * ratesSnapshot.VES;
+              const normEur = paymentCurr === 'EUR' ? sp.amount : normUsd * (ratesSnapshot.EUR || 0.92);
+              const normCop = paymentCurr === 'COP' ? sp.amount : normUsd * (ratesSnapshot.COP || 4100);
+
+              return {
+                method: isCxc ? (sp.method || 'Cuentas por Cobrar (Crédito Cliente)') : (bank ? bank.name : sp.method),
+                currency: paymentCurr,
+                amount: sp.amount,
+                amount_usd: parseFloat(normUsd.toFixed(2)),
+                amount_ves: parseFloat(normVes.toFixed(2)),
+                amount_eur: parseFloat(normEur.toFixed(2)),
+                amount_cop: parseFloat(normCop.toFixed(0)),
+                rate: rateUsed,
+                bankAccountId: isCxc ? 'cxc-virtual' : (sp.bankAccountId || bank?.id),
+                bank_account_id: isCxc ? 'cxc-virtual' : (sp.bankAccountId || bank?.id),
+                bank_account_name: isCxc ? 'Cuentas por Cobrar (Crédito Cliente)' : (bank?.name || sp.method)
+              };
+            })
+          : (() => {
+              const singleSp = effectiveSplitPayments[0];
+              const targetBankId = singleSp?.bankAccountId || selectedBankId || bankAccounts[0]?.id;
+              const bank = bankAccounts.find(a => a.id === targetBankId) || bankAccounts[0];
+              const paymentCurr: CurrencyCode = (singleSp?.currency as CurrencyCode) || (bank?.currency as CurrencyCode) || getPaymentCurrency(singleSp || 'USD');
+              const rateUsed = ratesSnapshot[paymentCurr] || rateForThisInvoice;
+              const finalAmount = singleSp?.amount && singleSp.amount > 0 
+                ? singleSp.amount 
+                : (paymentCurr === 'VES' ? parseFloat((total * ratesSnapshot.VES).toFixed(2)) : parseFloat(total.toFixed(2)));
+              const normUsd = (paymentCurr === 'USD' || paymentCurr === 'USDT') ? finalAmount : finalAmount / rateUsed;
+              const normVes = paymentCurr === 'VES' ? finalAmount : normUsd * ratesSnapshot.VES;
+              const normEur = paymentCurr === 'EUR' ? finalAmount : normUsd * (ratesSnapshot.EUR || 0.92);
+              const normCop = paymentCurr === 'COP' ? finalAmount : normUsd * (ratesSnapshot.COP || 4100);
+
+              return [{
+                method: bank ? bank.name : (paymentMethod || 'Cuenta Bancaria'),
+                currency: paymentCurr,
+                amount: parseFloat(finalAmount.toFixed(2)),
+                amount_usd: parseFloat(normUsd.toFixed(2)),
+                amount_ves: parseFloat(normVes.toFixed(2)),
+                amount_eur: parseFloat(normEur.toFixed(2)),
+                amount_cop: parseFloat(normCop.toFixed(0)),
+                rate: rateUsed,
+                bankAccountId: bank?.id,
+                bank_account_id: bank?.id,
+                bank_account_name: bank?.name
+              }];
+            })();
+      }
 
       const finalPaymentMethod = paymentCount > 1 
-        ? `Multimétodo: ${splitPayments.map(p => `${p.method} (${p.amount} ${getMethodCurrency(p.method)})`).join(' + ')}`
-        : paymentMethod;
+        ? `Multimétodo: ${detailedSplitPayments.map(p => `${p.method} (${p.amount} ${p.currency})`).join(' + ')}`
+        : (detailedSplitPayments[0]?.method || paymentMethod || splitPayments[0]?.method || 'Efectivo VES');
 
       const taxesDetail = appliedTaxes.map(t => ({
         id: t.id,
@@ -1932,80 +2832,184 @@ export default function POSModule({
         amount: t.amount
       }));
 
-      // 3. Create the Invoice in Supabase
-      const created = await dbService.createInvoice({
-        document_type: documentType,
-        customer_name: selectedClient,
-        payment_method: finalPaymentMethod,
-        subtotal: subtotal,
-        iva: iva,
-        total: total,
-        items: invoiceItems,
-        notes: saleConcept ? `${saleConcept} | ${saleNote}` : saleNote,
-        taxes_detail: taxesDetail,
-        bcv_rate: rateForThisInvoice,
-        currency_code: activeCurrency,
-        currency_rates_snapshot: ratesSnapshot,
-        totals_by_currency: calculatedTotalsByCurrency,
-        split_payments: detailedSplitPayments
-      });
-
-      // 3.2 Register income in Cash register (Caja)
-      try {
-        const amountBs = total * rateForThisInvoice;
-        const amountEur = total * (ratesSnapshot.EUR || 0.92);
-        const amountCop = total * (ratesSnapshot.COP || 4100);
-        const docLabel = documentType === 'nota_entrega' ? 'Nota de Entrega' : 'Factura';
-        await dbService.addCashOp({
-          type: 'ingreso',
-          concept: `Venta Flash - ${docLabel} ${created.control_number || ''} (${selectedClient}) ${saleConcept ? `- ${saleConcept}` : ''}`,
-          amount: total,
-          amount_bs: amountBs,
-          amount_eur: amountEur,
-          amount_cop: amountCop,
+      // 3. Create the Invoice and update inventory in parallel
+      const targetControlNumber = customControlNumber || wizardInvoiceNumber || dbService.getNextInvoiceControlNumber(documentType);
+      const [, created] = await Promise.all([
+        Promise.all(stockUpdatePromises),
+        dbService.createInvoice({
+          document_type: documentType,
+          control_number: targetControlNumber,
+          customer_name: selectedClient,
+          customer_document: wizardSelectedClientObj?.document || (clients.find(c => c.name === selectedClient)?.document) || '',
+          customer_phone: wizardSelectedClientObj?.phone || (clients.find(c => c.name === selectedClient)?.phone) || '',
+          customer_email: wizardSelectedClientObj?.email || (clients.find(c => c.name === selectedClient)?.email) || '',
+          customer_address: wizardSelectedClientObj?.address || (clients.find(c => c.name === selectedClient)?.address) || '',
+          payment_method: finalPaymentMethod,
+          subtotal: subtotal,
+          discount: calculatedDiscountUsd,
+          discount_code: discountCode || null,
+          iva: iva,
+          igtf: calculatedIgtfUsd,
+          total: total,
+          items: invoiceItems,
+          notes: saleConcept ? `${saleConcept} | ${saleNote}` : saleNote,
+          taxes_detail: taxesDetail,
+          bcv_rate: rateForThisInvoice,
           currency_code: activeCurrency,
           currency_rates_snapshot: ratesSnapshot,
-          payment_method: finalPaymentMethod,
+          totals_by_currency: calculatedTotalsByCurrency,
           split_payments: detailedSplitPayments
-        });
-      } catch (cajaErr) {
-        console.error("Failed to register POS sale in cash register:", cajaErr);
+        })
+      ]);
+
+      // 4. Secondary operations: Cash Register, Bank Movements, and Draft Deletion
+      const docLabel = documentType === 'nota_entrega' ? 'Nota de Entrega' : 'Factura';
+
+      // Immediate actual cash/bank payments (excluding credit / CxC)
+      const immediatePayments = detailedSplitPayments.filter(p => p.bankAccountId !== 'cxc-virtual');
+      const immediateTotalUsd = immediatePayments.reduce((acc, p) => acc + (p.amount_usd || 0), 0);
+      const immediateTotalVes = immediatePayments.reduce((acc, p) => acc + (p.amount_ves || 0), 0);
+      const immediateTotalEur = immediatePayments.reduce((acc, p) => acc + (p.amount_eur || 0), 0);
+      const immediateTotalCop = immediatePayments.reduce((acc, p) => acc + (p.amount_cop || 0), 0);
+
+      // Cuentas por cobrar (Crédito) payments
+      const cxcPayments = detailedSplitPayments.filter(p => p.bankAccountId === 'cxc-virtual');
+      const totalCxcUsd = cxcPayments.reduce((acc, p) => acc + (p.amount_usd || 0), 0);
+
+      const postSalePromises: Promise<any>[] = [];
+
+      // 4.1 Solo registrar ingreso de caja por el monto efectivamente cobrado de inmediato (Abono inicial o Contado)
+      if (immediateTotalUsd > 0) {
+        postSalePromises.push(
+          dbService.addCashOp({
+            type: 'ingreso',
+            concept: totalCxcUsd > 0 
+              ? `Abono Inicial - ${docLabel} ${created.control_number || ''} (${selectedClient})`
+              : `Venta Flash - ${docLabel} ${created.control_number || ''} (${selectedClient}) ${saleConcept ? `- ${saleConcept}` : ''}`,
+            amount: immediateTotalUsd,
+            amount_bs: immediateTotalVes,
+            amount_eur: immediateTotalEur,
+            amount_cop: immediateTotalCop,
+            currency_code: activeCurrency,
+            currency_rates_snapshot: ratesSnapshot,
+            payment_method: immediatePayments.length > 1 
+              ? `Multimétodo: ${immediatePayments.map(p => `${p.method} (${p.amount} ${p.currency})`).join(' + ')}` 
+              : (immediatePayments[0]?.method || 'Efectivo'),
+            split_payments: immediatePayments
+          })
+        );
       }
 
-      // 3.3 Register income into Bank Accounts & Bank Transfers
-      try {
-        await dbService.recordSaleIncomeToBankAccounts({
-          invoice: created,
-          splitPayments: detailedSplitPayments,
-          singlePaymentMethod: finalPaymentMethod,
-          totalUsd: total,
-          totalVes: total * rateForThisInvoice,
-          bcvRate: rateForThisInvoice,
-          createdBy: currentUser?.name || currentUser?.email || 'Cajero POS'
-        });
-      } catch (bankErr) {
-        console.error("Failed to record POS sale in bank accounts:", bankErr);
+      // 4.2 Solo registrar ingresos a cuentas bancarias por los abonos o pagos reales inmediatos
+      if (immediatePayments.length > 0) {
+        postSalePromises.push(
+          dbService.recordSaleIncomeToBankAccounts({
+            invoice: created,
+            splitPayments: immediatePayments,
+            singlePaymentMethod: immediatePayments.length > 1
+              ? `Multimétodo: ${immediatePayments.map(p => `${p.method} (${p.amount} ${p.currency})`).join(' + ')}`
+              : (immediatePayments[0]?.method || 'Efectivo'),
+            totalUsd: immediateTotalUsd,
+            totalVes: immediateTotalVes,
+            bcvRate: rateForThisInvoice,
+            createdBy: currentUser?.name || currentUser?.email || 'Cajero POS',
+            bankAccountId: immediatePayments[0]?.bankAccountId
+          })
+        );
       }
 
-      // 3.5 Delete the draft from the wait list if active
-      if (activeDraftId) {
-        try {
-          await dbService.deleteDraftInvoice(activeDraftId);
-        } catch (delErr) {
-          console.error("Failed to delete draft after finalizing invoice:", delErr);
+      // 🛒 CHECK FOR CXC / CUENTAS POR COBRAR PAYMENTS
+      if (totalCxcUsd > 0) {
+        const clientPhone = wizardSelectedClientObj?.phone || wizardSelectedClientObj?.telefono || '';
+        const entityNameForCxc = clientPhone ? `${selectedClient} ${clientPhone}` : selectedClient;
+
+        const invNum = created.control_number || `INV-${created.id.substring(0, 8).toUpperCase()}`;
+        let finalSubject = cxcSubject?.trim() || 'crédito por venta POS';
+        if (!finalSubject.includes(invNum)) {
+          finalSubject = finalSubject.replace(/#.*$/, '').trim();
+          finalSubject = `${finalSubject} #${invNum}`;
         }
+
+        const initialAbonoUsd = Number(immediateTotalUsd.toFixed(2));
+        const remainingDebtUsd = Number(totalCxcUsd.toFixed(2));
+        const totalInvoiceUsd = Number(total.toFixed(2));
+
+        const cxcRecord = {
+          id: crypto.randomUUID(),
+          subject: finalSubject,
+          entity_name: entityNameForCxc || 'Consumidor final',
+          client_id: wizardSelectedClientObj?.id || null,
+          client_name: entityNameForCxc || 'Consumidor final',
+          client_phone: clientPhone,
+          customer_name: entityNameForCxc || 'Consumidor final',
+          customer_phone: clientPhone,
+          customer_document: wizardSelectedClientObj?.document || wizardSelectedClientObj?.documento || '',
+          description: cxcDescription || `Crédito registrado vía POS`,
+          total_amount: totalInvoiceUsd,
+          paid_amount: initialAbonoUsd,
+          remaining_amount: remainingDebtUsd,
+          currency: 'USD',
+          bcv_rate: rateForThisInvoice,
+          status: (remainingDebtUsd <= 0 ? 'cobrado' : initialAbonoUsd > 0 ? 'parcial' : 'pendiente') as any,
+          issue_date: cxcIssueDate ? new Date(cxcIssueDate).toISOString() : new Date().toISOString(),
+          due_date: cxcDueDate ? new Date(cxcDueDate + 'T12:00:00').toISOString() : new Date(Date.now() + 15 * 24 * 60 * 60 * 1000).toISOString(),
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        };
+
+        postSalePromises.push(dbService.saveAccountReceivable(cxcRecord));
+
+        if (initialAbonoUsd > 0) {
+          const initialPaymentRecord: AccountReceivablePayment = {
+            id: crypto.randomUUID(),
+            account_receivable_id: cxcRecord.id,
+            cxc_id: cxcRecord.id,
+            amount: initialAbonoUsd,
+            amount_bs: Number((immediateTotalVes || (initialAbonoUsd * rateForThisInvoice)).toFixed(2)),
+            payment_method: immediatePayments.length > 1 
+              ? `Multimétodo: ${immediatePayments.map(p => `${p.method} (${p.amount} ${p.currency})`).join(' + ')}`
+              : (immediatePayments[0]?.method || 'Efectivo'),
+            bank_account_id: immediatePayments[0]?.bankAccountId || null,
+            payment_date: cxcIssueDate ? new Date(cxcIssueDate).toISOString() : new Date().toISOString(),
+            reference: `ABONO-INICIAL #${invNum}`,
+            notes: `Abono inicial al procesar venta ${docLabel} ${invNum}`,
+            created_by: currentUser?.name || currentUser?.email || 'Cajero POS',
+            created_at: new Date().toISOString()
+          };
+          postSalePromises.push(dbService.recordInitialAccountReceivablePayment(initialPaymentRecord));
+        }
+
+        if (wizardSelectedClientObj && wizardSelectedClientObj.id) {
+          const currentDebt = Number(wizardSelectedClientObj.credit_usd) || 0;
+          const newDebt = currentDebt + remainingDebtUsd;
+          postSalePromises.push(dbService.updateClient(wizardSelectedClientObj.id, {
+            credit_usd: newDebt
+          }));
+
+          // Actualizar estado local de los clientes en el POS
+          setClients(prev => prev.map(c => c.id === wizardSelectedClientObj.id ? { ...c, credit_usd: newDebt } : c));
+          setWizardSelectedClientObj(prev => prev ? { ...prev, credit_usd: newDebt } : null);
+        }
+      }
+
+      if (activeDraftId) {
+        postSalePromises.push(dbService.deleteDraftInvoice(activeDraftId));
         setActiveDraftId(null);
       }
+
+      // Execute secondary accounting operations in parallel
+      await Promise.allSettled(postSalePromises);
 
       if (onRefreshData) {
         onRefreshData();
       }
 
-      // 5. Open success modal & show receipt overlay
+      // 5. Open success modal & show receipt overlay IMMEDIATELY
       setCompletedInvoice(created);
       setSuccessSaleName(saleConcept || (cart.length > 0 ? cart[0].product.name : `Venta #${created.control_number || ''}`));
       setShowSuccessModal(true);
       setShowChangeModal(false);
+      setIsLoading(false);
 
       // Play Cash Register "Cha-Ching" sound effect
       playCashRegisterSound();
@@ -2027,13 +3031,12 @@ export default function POSModule({
       // 5.5 Clear sales cart and reset ALL fields for next sale
       resetVentaFlash();
 
-      // 6. Reload history lists
-      await loadInvoiceData();
-      await checkActiveSession();
       showToast('success', '¡Venta registrada e inventario actualizado exitosamente!');
+      return created;
     } catch (err: any) {
       console.error('Error finalizing invoice:', err);
       showToast('error', `Error al procesar facturación: ${err.message || 'Error desconocido'}`);
+      return null;
     } finally {
       setIsLoading(false);
     }
@@ -2045,45 +3048,66 @@ export default function POSModule({
       return;
     }
 
-    // ✅ Validar que todos los métodos de pago estén conciliados
-    const splitSumUsd = splitPayments.reduce(
-      (acc, sp) => acc + methodAmountToUsd(sp.amount || 0, sp.method),
-      0
-    );
-    const diffUsd = parseFloat((total - splitSumUsd).toFixed(2));
-    if (diffUsd > 0.02) {
-      showToast(
-        'error',
-        `⚠️ Quedan $${diffUsd.toFixed(2)} sin asignar a un método de pago. Complete los montos antes de facturar.`
-      );
-      return;
-    }
-    if (diffUsd < -0.02) {
-      showToast(
-        'error',
-        `⚠️ El monto asignado excede el total en $${Math.abs(diffUsd).toFixed(2)}. Corrija los montos antes de facturar.`
-      );
-      return;
+    // Initialize/sync the wizard client object if selectedClient already matches someone
+    const cleanCurrentClientName = (selectedClient || '').trim().toLowerCase();
+    const matchedClient = (wizardSelectedClientObj && (wizardSelectedClientObj.name || '').trim().toLowerCase() === cleanCurrentClientName)
+      ? wizardSelectedClientObj
+      : clients.find(c => (c.name || '').trim().toLowerCase() === cleanCurrentClientName);
+
+    if (matchedClient) {
+      setWizardSelectedClientObj(matchedClient);
+      setWizardIsNewClient(false);
+    } else if (cleanCurrentClientName === 'consumidor final' || !cleanCurrentClientName) {
+      setWizardSelectedClientObj({
+        id: 'cf',
+        name: 'Consumidor final',
+        document: 'V-99999999',
+        email: '',
+        phone: '',
+        address: 'Mostrador',
+        credit_usd: 0
+      });
+      setWizardIsNewClient(false);
+    } else {
+      setWizardSelectedClientObj({
+        name: selectedClient,
+        document: '',
+        email: '',
+        phone: '',
+        address: '',
+        credit_usd: 0
+      });
+      setWizardIsNewClient(true);
     }
 
-    executeFinalizeInvoice();
+    setWizardClientSearchQuery(selectedClient === 'Consumidor final' ? '' : selectedClient);
+    setWizardStep(1);
+
+    // Pre-populate upcoming invoice control number for CxC concept
+    const nextInvoiceNum = dbService.getNextInvoiceControlNumber(documentType);
+    setWizardInvoiceNumber(nextInvoiceNum);
+    setCxcSubject(`crédito por venta POS #${nextInvoiceNum}`);
+    const cartSummary = cart.length > 0 ? cart.map(i => `${i.qty}x ${i.product.name}`).join(', ') : 'Crédito registrado vía POS';
+    setCxcDescription(cartSummary);
+
+    setShowCheckoutWizard(true);
   };
 
   const activeClientObj = clients.find(c => (c.name || '').toLowerCase() === selectedClient.toLowerCase());
 
   return (
-    <div className="relative text-left p-4 md:p-6 bg-gray-50/50 min-h-screen">
+    <div className="relative text-left p-4 md:p-6 bg-[#F8F9FA] min-h-screen font-poppins text-[#2B2D42]">
       
-      {/* Modal: Agregar Cargo Extra */}
+      {/* Modal: Aplicar Cargos */}
       {showExtraChargeModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
-          <div className="bg-white rounded-3xl border border-gray-100 w-full max-w-sm shadow-2xl p-5 space-y-4 text-left">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 font-poppins">
+          <div className="bg-white rounded-3xl border border-[#1D3557]/20 w-full max-w-sm shadow-2xl p-5 space-y-4 text-left">
             <div className="flex justify-between items-center pb-2 border-b border-gray-100">
-              <h3 className="text-sm font-black text-gray-800">Agregar Cargo Extra</h3>
+              <h3 className="text-sm font-montserrat font-extrabold text-[#1D3557]">Aplicar Cargos</h3>
               <button
                 type="button"
                 onClick={() => setShowExtraChargeModal(false)}
-                className="text-gray-400 hover:text-gray-600 p-1"
+                className="text-gray-400 hover:text-gray-600 p-1 cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -2091,25 +3115,25 @@ export default function POSModule({
 
             <div className="space-y-3">
               <div>
-                <label className="block text-xs font-bold text-gray-600 mb-1">Concepto del cargo</label>
+                <label className="block text-xs font-bold text-[#2B2D42] mb-1">Concepto del cargo</label>
                 <input
                   type="text"
                   value={extraChargeName}
                   onChange={(e) => setExtraChargeName(e.target.value)}
                   placeholder="Ej: Delivery, Empaque, Servicio"
-                  className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                  className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#7C3AED]"
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-bold text-gray-600 mb-1">Monto en Dólares ($)</label>
+                <label className="block text-xs font-bold text-[#2B2D42] mb-1">Monto en Dólares ($)</label>
                 <input
                   type="number"
                   step="0.01"
                   value={extraChargeAmount}
                   onChange={(e) => setExtraChargeAmount(e.target.value)}
                   placeholder="0.00"
-                  className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-mono font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                  className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-mono font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#7C3AED]"
                 />
               </div>
             </div>
@@ -2118,7 +3142,7 @@ export default function POSModule({
               <button
                 type="button"
                 onClick={() => setShowExtraChargeModal(false)}
-                className="flex-1 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold text-xs rounded-xl transition"
+                className="flex-1 py-2.5 bg-gray-100 hover:bg-gray-200 text-[#2B2D42] font-bold text-xs rounded-xl transition cursor-pointer"
               >
                 Cancelar
               </button>
@@ -2128,14 +3152,14 @@ export default function POSModule({
                   const amt = parseFloat(extraChargeAmount);
                   if (!isNaN(amt) && amt > 0) {
                     setExtraCharges(prev => [...prev, { id: Date.now().toString(), name: extraChargeName.trim() || 'Cargo Extra', amount: amt }]);
-                    showToast('success', `Cargo "${extraChargeName}" de ${amt.toFixed(2)} agregado.`);
+                    showToast('success', `Cargo "${extraChargeName}" de $${amt.toFixed(2)} aplicado.`);
                   }
                   setShowExtraChargeModal(false);
                   setExtraChargeAmount('');
                 }}
-                className="flex-1 py-2 bg-[#005da9] hover:bg-[#004b88] text-white font-black text-xs rounded-xl transition shadow-xs"
+                className="flex-1 py-2.5 bg-[#7C3AED] hover:bg-[#6D28D9] text-white font-montserrat font-extrabold text-xs rounded-xl transition shadow-xs cursor-pointer"
               >
-                Agregar
+                Aplicar cargo
               </button>
             </div>
           </div>
@@ -2149,28 +3173,29 @@ export default function POSModule({
             ? 'bg-emerald-50 border-emerald-200 text-emerald-800' 
             : 'bg-rose-50 border-rose-200 text-rose-800'
         }`}>
-          {toast.type === 'success' ? <CheckCircle className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
+          {toast.type === 'success' ? <CheckCircle className="w-4 h-4 text-emerald-600" /> : <AlertCircle className="w-4 h-4 text-rose-600" />}
           <span>{toast.message}</span>
         </div>
       )}
 
+      {!showCheckoutWizard && (
+      <>
       {/* TOP HEADER CARD WITH QUICK ACTION BUTTONS */}
-      <div className="bg-white border border-gray-100 rounded-2xl shadow-xs p-4 mb-6">
+      <div className="bg-white border border-[#1D3557]/15 rounded-2xl shadow-xs p-4 mb-6">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="p-2.5 bg-[#005da9]/10 text-[#005da9] rounded-2xl shrink-0">
+            <div className="p-2.5 bg-[#1D3557] text-[#40E0D0] rounded-2xl shrink-0 shadow-xs">
               <ShoppingBag className="w-6 h-6" />
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <h2 className="text-lg font-black text-gray-900 uppercase tracking-tight">Venta Flash</h2>
+                <h2 className="text-lg font-montserrat font-extrabold text-[#1D3557] uppercase tracking-tight">Venta Flash</h2>
                 {activeSession && (
-                  <span className="text-[10px] font-black px-2.5 py-0.5 rounded-full border bg-emerald-50 border-emerald-200 text-emerald-700">
+                  <span className="text-[10px] font-montserrat font-black px-2.5 py-0.5 rounded-full border bg-[#40E0D0]/20 border-[#40E0D0] text-[#1D3557]">
                     🟢 CAJA ABIERTA (#{activeSession.session_code || activeSession.id?.slice(0, 5)})
                   </span>
                 )}
               </div>
-              <p className="text-xs text-gray-400 font-medium">Facturación rápida, punto de venta y cobranzas</p>
             </div>
           </div>
 
@@ -2186,7 +3211,7 @@ export default function POSModule({
                   setAperturaEmployee(defaultEmp);
                   setShowOpenCajaModal(true);
                 }}
-                className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-md hover:shadow-lg"
+                className="px-3.5 py-2 bg-[#40E0D0] hover:bg-[#36cebe] text-[#1D3557] font-montserrat text-xs font-extrabold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-md hover:shadow-lg"
                 title="Abrir Caja registradora para iniciar turno"
               >
                 <Unlock className="w-4 h-4 shrink-0" />
@@ -2196,7 +3221,7 @@ export default function POSModule({
               <button 
                 type="button"
                 onClick={prepareCloseCajaModal}
-                className="px-3.5 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-xs font-black rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
+                className="px-3.5 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-xs font-bold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
                 title="Cerrar Caja registradora y realizar arqueo"
               >
                 <Lock className="w-3.5 h-3.5 text-rose-600 shrink-0" />
@@ -2204,50 +3229,25 @@ export default function POSModule({
               </button>
             )}
 
-            {/* Botón Facturas en Espera (Pausadas) - Siempre visible */}
+            {/* Botón Facturas en Espera (Pausadas) - Estilo Frenyer */}
             <button 
+              type="button"
               onClick={() => setShowDraftsListModal(true)}
-              className={`px-3.5 py-2 text-xs font-black rounded-xl transition-all flex items-center gap-2 shadow-md cursor-pointer border ${
-                draftInvoices.length > 0
-                  ? 'bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-white border-amber-600 animate-pulse hover:shadow-lg'
-                  : 'bg-amber-50 hover:bg-amber-100 text-amber-700 border-amber-200 hover:shadow-sm'
-              }`}
-              title="Abrir pantalla flotante con ventas en espera"
+              className="inline-flex items-center gap-2 px-4 py-2 bg-white hover:bg-slate-50 active:bg-slate-100 text-slate-700 font-montserrat font-bold text-xs rounded-full border border-slate-200/90 shadow-xs hover:shadow-md transition-all cursor-pointer select-none"
+              title="Abrir formulario flotante con facturas en espera"
             >
-              <Pause className={`w-4 h-4 shrink-0 ${draftInvoices.length > 0 ? 'fill-white' : 'fill-amber-400'}`} />
-              <span>Facturas en Espera ({draftInvoices.length})</span>
+              <Pause className="w-3.5 h-3.5 text-[#005da9]" />
+              <span className="uppercase tracking-wider">Facturas en Espera</span>
+              <span className={`px-2 py-0.5 rounded-full font-black text-[11px] font-mono border ${
+                draftInvoices.length > 0 
+                  ? 'bg-blue-50 text-[#005da9] border-blue-200/80 shadow-2xs' 
+                  : 'bg-slate-100 text-slate-500 border-slate-200'
+              }`}>
+                {draftInvoices.length}
+              </span>
             </button>
 
-            {/* Botón Últimas Facturas Emitidas */}
-            <button 
-              onClick={() => {
-                setShowHistoryModal(true);
-                loadInvoiceData();
-              }}
-              className="px-3.5 py-2 bg-white hover:bg-gray-50 text-[#005da9] border border-gray-200 text-xs font-bold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
-              title="Buscar y revisar historial de facturas y notas de entrega emitidas"
-            >
-              <FileText className="w-3.5 h-3.5 text-[#005da9]" />
-              <span>Últimas Facturas</span>
-            </button>
-
-            {/* Botón ingreso/egreso */}
-            <button 
-              onClick={() => {
-                setManualType('egreso');
-                setManualConcept('');
-                setManualAmountUsd('');
-                setManualObservations('');
-                setShowManualModal(true);
-              }}
-              className="px-3.5 py-2 bg-white hover:bg-gray-50 text-[#005da9] border border-gray-200 text-xs font-bold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
-              title="Registrar Ingreso u Egreso Financiero"
-            >
-              <DollarSign className="w-3.5 h-3.5 text-[#005da9]" />
-              <span>ingreso/egreso</span>
-            </button>
-
-            {/* Botón Crear Producto (Vinculado a pantalla + Nuevo Producto) */}
+            {/* Botón Crear Producto */}
             <button 
               onClick={() => {
                 if (onOpenProductForm) {
@@ -2256,7 +3256,7 @@ export default function POSModule({
                   setShowCreateProductModal(true);
                 }
               }}
-              className="px-3.5 py-2 bg-white hover:bg-gray-50 text-[#005da9] border border-gray-200 text-xs font-bold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
+              className="px-3.5 py-2 bg-white hover:bg-[#F8F9FA] text-[#1D3557] border border-[#1D3557]/20 text-xs font-bold rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs font-montserrat"
               title="Crear un nuevo producto en el catálogo"
             >
               <PackagePlus className="w-3.5 h-3.5 text-[#005da9]" />
@@ -2283,7 +3283,7 @@ export default function POSModule({
                 <input
                   type="text"
                   placeholder="Buscar producto por SKU (ej: 99999), Nombre, Marca o escanea Código de Barras..."
-                  className="w-full pl-10 pr-12 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:bg-white transition font-bold"
+                  className="w-full pl-10 pr-12 py-2.5 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:bg-white transition font-bold"
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
                   onKeyDown={handleSearchKeyDown}
@@ -2302,10 +3302,10 @@ export default function POSModule({
                   <button
                     type="button"
                     onClick={() => setShowPosScanner(true)}
-                    className="p-1 text-[#005da9] hover:text-white hover:bg-[#005da9] rounded-md transition-all cursor-pointer flex items-center justify-center border border-[#005da9]/10 bg-[#005da9]/5"
+                    className="p-1 text-[#1D3557] hover:text-white hover:bg-[#1D3557] rounded-md transition-all cursor-pointer flex items-center justify-center border border-[#1D3557]/10 bg-[#1D3557]/5"
                     title="Escanear con cámara"
                   >
-                    <Scan className="w-4 h-4" />
+                    <Scan className="w-4 h-4 text-[#005da9]" />
                   </button>
                 </div>
               </div>
@@ -2326,10 +3326,10 @@ export default function POSModule({
             <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none">
               <button
                 onClick={() => setSelectedCategoryId('all')}
-                className={`px-3 py-1.5 rounded-xl text-xs font-black transition shrink-0 border cursor-pointer ${
+                className={`px-3 py-1.5 rounded-xl text-xs font-montserrat font-black transition shrink-0 border cursor-pointer ${
                   selectedCategoryId === 'all'
-                    ? 'bg-[#005da9] text-white border-[#004b87] shadow-xs'
-                    : 'bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100'
+                    ? 'bg-[#1D3557] text-white border-[#1D3557] shadow-xs'
+                    : 'bg-[#F8F9FA] text-[#2B2D42] border-gray-200 hover:bg-gray-100'
                 }`}
               >
                 Todos ({displayProductsList.length})
@@ -2340,10 +3340,10 @@ export default function POSModule({
                   <button
                     key={cat.id}
                     onClick={() => setSelectedCategoryId(cat.id)}
-                    className={`px-3 py-1.5 rounded-xl text-xs font-extrabold transition shrink-0 border cursor-pointer ${
+                    className={`px-3 py-1.5 rounded-xl text-xs font-montserrat font-extrabold transition shrink-0 border cursor-pointer ${
                       selectedCategoryId === cat.id
-                        ? 'bg-[#005da9] text-white border-[#004b87] shadow-xs'
-                        : 'bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100'
+                        ? 'bg-[#1D3557] text-white border-[#1D3557] shadow-xs'
+                        : 'bg-[#F8F9FA] text-[#2B2D42] border-gray-200 hover:bg-gray-100'
                     }`}
                   >
                     {cat.name} ({count})
@@ -2354,7 +3354,7 @@ export default function POSModule({
           </div>
 
           {/* GRILLA DE PRODUCTOS Y SELECCIÓN RÁPIDA */}
-          <div className="bg-white border border-gray-100 rounded-2xl shadow-xs p-5">
+          <div className="bg-white border border-[#1D3557]/15 rounded-2xl shadow-xs p-5">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4 pb-3 border-b border-gray-100">
               <div className="flex items-center gap-2.5">
                 <div className="p-2 bg-amber-50 text-amber-600 rounded-xl border border-amber-200/80 shadow-3xs">
@@ -2362,13 +3362,13 @@ export default function POSModule({
                 </div>
                 <div>
                   <div className="flex items-center gap-2">
-                    <span className="text-xs font-black text-gray-800 uppercase tracking-tight">Catálogo de Productos</span>
+                    <span className="text-xs font-montserrat font-extrabold text-[#1D3557] uppercase tracking-tight">Catálogo de Productos</span>
                     <span className="bg-amber-100 text-amber-900 text-[9px] px-2 py-0.5 rounded-full font-black border border-amber-300/70 flex items-center gap-1 shadow-3xs">
                       <Flame className="w-2.5 h-2.5 text-amber-600 fill-amber-600" />
                       Top 10 Más Vendidos
                     </span>
                   </div>
-                  <p className="text-[10px] text-gray-400 font-medium mt-0.5">
+                  <p className="text-[10px] text-[#2B2D42]/70 font-medium mt-0.5">
                     {catalogShowLimit === 'top10'
                       ? 'Mostrando únicamente los 10 productos más vendidos'
                       : 'Mostrando catálogo completo de productos'
@@ -2378,14 +3378,14 @@ export default function POSModule({
               </div>
 
               <div className="flex items-center gap-2">
-                <div className="inline-flex bg-gray-100/80 p-1 rounded-xl border border-gray-200/80">
+                <div className="inline-flex bg-[#F8F9FA] p-1 rounded-xl border border-gray-200">
                   <button
                     type="button"
                     onClick={() => setCatalogShowLimit('top10')}
                     className={`px-2.5 py-1 rounded-lg text-[10px] font-black transition flex items-center gap-1 cursor-pointer ${
                       catalogShowLimit === 'top10'
                         ? 'bg-amber-500 text-white shadow-xs font-black'
-                        : 'text-gray-500 hover:text-gray-900'
+                        : 'text-[#2B2D42] hover:text-[#1D3557]'
                     }`}
                   >
                     <Flame className="w-3 h-3 text-white fill-white" />
@@ -2396,8 +3396,8 @@ export default function POSModule({
                     onClick={() => setCatalogShowLimit('all')}
                     className={`px-2.5 py-1 rounded-lg text-[10px] font-black transition flex items-center gap-1 cursor-pointer ${
                       catalogShowLimit === 'all'
-                        ? 'bg-[#005da9] text-white shadow-xs font-black'
-                        : 'text-gray-500 hover:text-gray-900'
+                        ? 'bg-[#1D3557] text-white shadow-xs font-black'
+                        : 'text-[#2B2D42] hover:text-[#1D3557]'
                     }`}
                   >
                     <Grid className="w-3 h-3 text-white" />
@@ -2405,20 +3405,20 @@ export default function POSModule({
                   </button>
                 </div>
 
-                <span className="text-[10px] font-extrabold text-gray-500 bg-gray-50 border border-gray-200 px-2.5 py-1 rounded-xl shrink-0">
+                <span className="text-[10px] font-extrabold text-[#2B2D42] bg-[#F8F9FA] border border-gray-200 px-2.5 py-1 rounded-xl shrink-0">
                   {filteredProducts.length} ítems
                 </span>
               </div>
             </div>
 
             {filteredProducts.length === 0 ? (
-              <div className="py-12 text-center text-gray-400 bg-gray-50/50 rounded-2xl border border-dashed border-gray-200">
+              <div className="py-12 text-center text-gray-400 bg-[#F8F9FA] rounded-2xl border border-dashed border-gray-200">
                 <Package className="w-9 h-9 mx-auto mb-2 text-gray-300" />
-                <p className="text-xs font-bold text-gray-500">No se encontraron productos en esta categoría o búsqueda.</p>
+                <p className="text-xs font-bold text-[#2B2D42]">No se encontraron productos en esta categoría o búsqueda.</p>
                 <button
                   type="button"
                   onClick={() => { setSelectedCategoryId('all'); setSearchTerm(''); setCatalogShowLimit('all'); }}
-                  className="mt-3 text-[11px] font-extrabold text-[#005da9] hover:underline cursor-pointer"
+                  className="mt-3 text-[11px] font-extrabold text-[#005da9] hover:underline cursor-pointer font-montserrat"
                 >
                   Ver todos los productos
                 </button>
@@ -2444,18 +3444,19 @@ export default function POSModule({
                       isVentaLibre
                         ? 'bg-amber-50/50 border-amber-300 hover:border-[#005da9] hover:shadow-xs cursor-pointer'
                         : isOutOfStock 
-                          ? 'bg-gray-50/80 border-gray-100 opacity-50 cursor-not-allowed' 
+                          ? 'bg-[#F8F9FA] border-gray-100 opacity-50 cursor-not-allowed' 
                           : 'bg-white border-gray-200 hover:border-[#005da9] hover:shadow-md cursor-pointer'
                     }`}
                   >
                     {/* Thumbnail Image Container */}
-                    <div className="relative w-full h-24 sm:h-28 mb-2 rounded-xl bg-gray-50 border border-gray-100 overflow-hidden flex items-center justify-center shrink-0">
+                    <div className="relative w-full h-24 sm:h-28 mb-2 rounded-xl bg-[#F8F9FA] border border-gray-100 overflow-hidden flex items-center justify-center shrink-0">
                       {imgUrl ? (
                         <img 
                           src={imgUrl} 
                           alt={p.name} 
                           className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                           referrerPolicy="no-referrer"
+                          onError={(e) => handleImageError(e, DEFAULT_PRODUCT_FALLBACK)}
                         />
                       ) : (
                         <div className={`flex flex-col items-center justify-center p-2 text-center ${isVentaLibre ? 'text-amber-500' : 'text-gray-300'}`}>
@@ -2481,7 +3482,7 @@ export default function POSModule({
                       )}
 
                       {qtyInCart > 0 && (
-                        <span className="absolute top-1.5 right-1.5 bg-[#005da9] text-white font-extrabold text-[10px] rounded-full w-5 h-5 flex items-center justify-center shadow-md border border-white z-10 animate-bounce-short">
+                        <span className="absolute top-1.5 right-1.5 bg-[#1D3557] text-[#40E0D0] font-montserrat font-extrabold text-[10px] rounded-full w-5 h-5 flex items-center justify-center shadow-md border border-white z-10 animate-bounce-short">
                           {qtyInCart}
                         </span>
                       )}
@@ -2495,12 +3496,12 @@ export default function POSModule({
 
                     <div>
                       <div className="flex justify-between items-start gap-1">
-                        <span className="text-[11px] font-black text-gray-800 line-clamp-2 leading-snug group-hover:text-[#005da9] transition">{p.name}</span>
+                        <span className="text-[11px] font-black text-[#2B2D42] line-clamp-2 leading-snug group-hover:text-[#1D3557] transition">{p.name}</span>
                       </div>
                       <div className="flex items-center gap-1.5 mt-1 flex-wrap">
                         <span className="text-[9px] text-gray-400 font-mono font-bold">{p.sku}</span>
                         {p.barcode_qr && (
-                          <span className="text-[8px] text-[#005da9] bg-blue-50 px-1 py-0.2 rounded font-mono font-bold">
+                          <span className="text-[8px] text-[#1D3557] bg-[#1D3557]/10 px-1 py-0.2 rounded font-mono font-bold">
                             📟 {p.barcode_qr}
                           </span>
                         )}
@@ -2509,7 +3510,7 @@ export default function POSModule({
 
                     <div className="flex items-center justify-between mt-2.5 pt-2 border-t border-gray-100">
                       {isVentaLibre ? (
-                        <span className="text-xs font-black text-[#005da9]">Precio abierto</span>
+                        <span className="text-xs font-montserrat font-black text-[#1D3557]">Precio abierto</span>
                       ) : (
                         (() => {
                           const activeRate = customBcvRate > 0 ? customBcvRate : (bcvRate > 0 ? bcvRate : (currencyRates?.VES || 36.5));
@@ -2520,10 +3521,10 @@ export default function POSModule({
                           const decimalPart = standardParts[1] || '00';
 
                           return (
-                            <div className="flex items-start text-[#0F1111] select-none font-sans">
-                              <span className="text-[10px] font-black mr-0.5 mt-[1px] text-gray-900">Bs.</span>
-                              <span className="text-sm sm:text-base font-black leading-none tracking-tight text-gray-900">{integerPart}</span>
-                              <span className="text-[10px] font-bold ml-[0.5px] leading-none mt-[1px] text-gray-900">,{decimalPart}</span>
+                            <div className="flex items-start text-[#2B2D42] select-none font-sans">
+                              <span className="text-[10px] font-black mr-0.5 mt-[1px] text-[#2B2D42]">Bs.</span>
+                              <span className="text-sm sm:text-base font-black leading-none tracking-tight text-[#1D3557]">{integerPart}</span>
+                              <span className="text-[10px] font-bold ml-[0.5px] leading-none mt-[1px] text-[#1D3557]">,{decimalPart}</span>
                             </div>
                           );
                         })()
@@ -2553,11 +3554,11 @@ export default function POSModule({
         <div className="xl:col-span-5 space-y-6">
 
           {/* TABLA / LISTA DE ÍTEMS AGREGADOS (PRODUCTOS EN LA VENTA) */}
-          <div className="bg-white border border-gray-100 rounded-2xl shadow-xs p-5">
+          <div className="bg-white border border-[#1D3557]/15 rounded-2xl shadow-xs p-5">
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
-                <ShoppingCart className="w-4 h-4 text-[#005da9]" />
-                <span className="text-xs font-black text-gray-800 uppercase tracking-tight">
+                <ShoppingCart className="w-4 h-4 text-[#1D3557]" />
+                <span className="text-xs font-montserrat font-extrabold text-[#1D3557] uppercase tracking-tight">
                   Productos en la Venta ({cart.reduce((sum, item) => sum + item.qty, 0)} ítems)
                 </span>
               </div>
@@ -2654,7 +3655,7 @@ export default function POSModule({
                               <button
                                 type="button"
                                 onClick={() => openVentaLibreModal(item.product)}
-                                className="text-[10px] text-[#005da9] hover:underline font-bold flex items-center gap-0.5 cursor-pointer"
+                                className="text-[10px] text-[#005da9] hover:underline font-bold flex items-center gap-0.5 cursor-pointer font-montserrat"
                               >
                                 <Pencil className="w-3 h-3" />
                                 Editar
@@ -2709,37 +3710,88 @@ export default function POSModule({
                 })}
               </div>
             )}
+
+            {cart.length > 0 && (
+              <div className="mt-5 pt-4 border-t border-gray-100 space-y-4">
+                {/* Visual subtotal summary */}
+                <div className="flex items-center justify-between text-xs font-bold text-gray-500">
+                  <span className="uppercase tracking-wider text-[10px]">Monto Parcial:</span>
+                  <div className="text-right">
+                    <span className="block text-base font-black text-[#1D3557]">${subtotal.toFixed(2)}</span>
+                    <span className="block text-base font-black text-[#1D3557] font-mono">Bs. {(subtotal * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                  </div>
+                </div>
+
+                <div>
+                  {/* Botón Cobrar CTA con estilo Frenyer: gradiente distintivo, tipografía Montserrat font-black, borde perimetral cobalto, sombra sutil e iconos turquesa Frenyer */}
+                  <button
+                    type="button"
+                    onClick={handleFinalizeInvoice}
+                    disabled={isLoading}
+                    className="w-full py-3.5 px-6 bg-gradient-to-r from-[#1D3557] via-[#005da9] to-[#1D3557] hover:brightness-110 active:brightness-95 text-white font-montserrat font-black text-sm uppercase tracking-wider rounded-full border-2 border-[#005da9]/50 shadow-xs hover:shadow-md transition-all duration-300 ease-in-out flex items-center justify-center gap-2.5 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed select-none"
+                    title="Cobrar venta actual"
+                  >
+                    <CreditCard className="w-4 h-4 text-[#40E0D0] stroke-[2.5]" />
+                    <span>Cobrar</span>
+                    <ChevronRight className="w-4 h-4 text-[#40E0D0] stroke-[3]" />
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
 
-          {/* DATOS DE FACTURA O NOTA DE ENTREGA: 2-COLUMN MODERN CHECKOUT */}
-          <div className="bg-white border border-gray-100 rounded-3xl shadow-sm p-5 md:p-6 space-y-6">
+          {/* DATOS DE FACTURA O NOTA DE ENTREGA: 2-COLUMN MODERN CHECKOUT (REPLACED BY STEP-BY-STEP WIZARD) */}
+          {false && (
+          <div className="bg-white border border-[#1D3557]/15 rounded-3xl shadow-xs p-5 md:p-6 space-y-6">
             
             {/* Header / Tipo de Documento & Cliente */}
             <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-gray-100">
               <div className="flex items-center gap-3">
-                <div className="flex bg-gray-100/90 p-1 rounded-2xl border border-gray-200/80">
+                <div className="flex bg-[#F8F9FA] p-1 rounded-2xl border border-gray-200">
                   <button
                     type="button"
-                    onClick={() => setDocumentType('factura')}
-                    className={`px-4 py-2 text-xs font-black rounded-xl transition-all flex items-center gap-2 cursor-pointer ${
+                    onClick={() => {
+                      setDocumentType('factura');
+                      const nextNum = dbService.getNextInvoiceControlNumber('factura');
+                      setWizardInvoiceNumber(nextNum);
+                      setCxcSubject(prev => {
+                        if (!prev || prev.includes('#')) {
+                          const base = prev ? prev.replace(/#.*$/, '').trim() : 'crédito por venta POS';
+                          return `${base} #${nextNum}`;
+                        }
+                        return `${prev} #${nextNum}`;
+                      });
+                    }}
+                    className={`px-4 py-2 text-xs font-montserrat font-extrabold rounded-xl transition-all flex items-center gap-2 cursor-pointer ${
                       documentType === 'factura'
-                        ? 'bg-[#005da9] text-white shadow-xs'
-                        : 'text-gray-600 hover:text-gray-900'
+                        ? 'bg-[#1D3557] text-white shadow-xs'
+                        : 'text-[#2B2D42] hover:text-[#1D3557]'
                     }`}
                   >
-                    <FileText className="w-4 h-4" />
+                    <FileText className="w-4 h-4 text-[#40E0D0]" />
                     <span>Factura</span>
                   </button>
                   <button
                     type="button"
-                    onClick={() => setDocumentType('nota_entrega')}
-                    className={`px-4 py-2 text-xs font-black rounded-xl transition-all flex items-center gap-2 cursor-pointer ${
+                    onClick={() => {
+                      setDocumentType('nota_entrega');
+                      const nextNum = dbService.getNextInvoiceControlNumber('nota_entrega');
+                      setWizardInvoiceNumber(nextNum);
+                      setCxcSubject(prev => {
+                        if (!prev || prev.includes('#')) {
+                          const base = prev ? prev.replace(/#.*$/, '').trim() : 'crédito por venta POS';
+                          return `${base} #${nextNum}`;
+                        }
+                        return `${prev} #${nextNum}`;
+                      });
+                    }}
+                    className={`px-4 py-2 text-xs font-montserrat font-extrabold rounded-xl transition-all flex items-center gap-2 cursor-pointer ${
                       documentType === 'nota_entrega'
-                        ? 'bg-amber-600 text-white shadow-xs'
-                        : 'text-gray-600 hover:text-gray-900'
+                        ? 'bg-[#00BFFF] text-white shadow-xs'
+                        : 'text-[#2B2D42] hover:text-[#1D3557]'
                     }`}
                   >
-                    <FileCheck className="w-4 h-4" />
+                    <FileCheck className="w-4 h-4 text-white" />
                     <span>Nota de Entrega</span>
                   </button>
                 </div>
@@ -2754,7 +3806,7 @@ export default function POSModule({
                     onChange={(e) => handleClientChange(e.target.value)}
                     onFocus={() => { if (selectedClient && selectedClient !== 'Consumidor final') setShowClientSuggestions(filteredClients.length > 0); }}
                     onBlur={() => setTimeout(() => setShowClientSuggestions(false), 200)}
-                    className="w-full px-3.5 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:bg-white transition"
+                    className="w-full px-3.5 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
                     placeholder="Consumidor final o nombre cliente"
                   />
                   {showClientSuggestions && (
@@ -2765,11 +3817,16 @@ export default function POSModule({
                           type="button"
                           onMouseDown={() => {
                             setSelectedClient(c.name);
+                            setWizardSelectedClientObj(c);
+                            setWizardClientSearchQuery(c.name);
                             setShowClientSuggestions(false);
                           }}
-                          className="w-full px-3 py-2 text-left hover:bg-blue-50 text-gray-800 font-bold transition flex justify-between"
+                          className="w-full px-3 py-2 text-left hover:bg-[#1D3557]/5 text-[#2B2D42] font-bold transition flex justify-between"
                         >
-                          <span>{c.name}</span>
+                          <div>
+                            <span className="block">{c.name}</span>
+                            {c.phone && <span className="text-[10px] text-gray-400 font-mono">{c.phone}</span>}
+                          </div>
                           <span className="font-mono text-gray-400">{c.document}</span>
                         </button>
                       ))}
@@ -2779,10 +3836,10 @@ export default function POSModule({
                 <button
                   type="button"
                   onClick={() => setShowClientSearchModal(true)}
-                  className="p-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl transition cursor-pointer"
+                  className="p-2 bg-gray-100 hover:bg-gray-200 text-[#2B2D42] rounded-xl transition cursor-pointer"
                   title="Buscar cliente registrado"
                 >
-                  <Search className="w-4 h-4" />
+                  <Search className="w-4 h-4 text-[#1D3557]" />
                 </button>
                 <button
                   type="button"
@@ -2795,10 +3852,10 @@ export default function POSModule({
                     setNewClientCredit('0');
                     setShowQuickClientModal(true);
                   }}
-                  className="p-2 bg-blue-50 hover:bg-blue-100 text-[#005da9] rounded-xl transition cursor-pointer"
+                  className="p-2 bg-[#1D3557]/10 hover:bg-[#1D3557]/20 text-[#1D3557] rounded-xl transition cursor-pointer"
                   title="Crear nuevo cliente"
                 >
-                  <UserPlus className="w-4 h-4" />
+                  <UserPlus className="w-4 h-4 text-[#1D3557]" />
                 </button>
               </div>
             </div>
@@ -2808,31 +3865,31 @@ export default function POSModule({
               
               {/* LEFT COLUMN: RESUMEN (lg:col-span-5) */}
               <div className="lg:col-span-5 space-y-4">
-                <div className="border border-gray-150 rounded-3xl p-5 bg-white shadow-2xs space-y-4">
-                  <div className="text-center pb-2 border-b border-gray-100">
-                    <span className="text-sm font-black text-gray-900 tracking-tight">Resumen:</span>
+                <div className="border border-[#1D3557]/15 rounded-3xl p-5 bg-[#F8F9FA]/50 shadow-2xs space-y-4">
+                  <div className="text-center pb-2 border-b border-gray-200">
+                    <span className="text-sm font-montserrat font-extrabold text-[#1D3557] tracking-tight">Resumen de Cuenta:</span>
                   </div>
 
-                  {/* Subtotal con Acordeón desplegable (Image 4) */}
+                  {/* Subtotal con Acordeón desplegable */}
                   <div className="space-y-1.5">
                     <button
                       type="button"
                       onClick={() => setIsResumenOpen(!isResumenOpen)}
-                      className="w-full flex items-center justify-between text-xs font-bold text-gray-700 hover:text-[#005da9] transition cursor-pointer"
+                      className="w-full flex items-center justify-between text-xs font-bold text-[#2B2D42] hover:text-[#1D3557] transition cursor-pointer"
                     >
                       <div className="flex items-center gap-1.5">
                         <span>Subtotal:</span>
-                        <ChevronRight className={`w-3.5 h-3.5 text-[#005da9] transition-transform duration-200 ${isResumenOpen ? 'rotate-90' : ''}`} />
+                        <ChevronRight className={`w-3.5 h-3.5 text-[#00BFFF] transition-transform duration-200 ${isResumenOpen ? 'rotate-90' : ''}`} />
                       </div>
-                      <span className="font-mono font-black text-gray-900">${subtotal.toFixed(2)}</span>
+                      <span className="font-mono font-black text-[#1D3557]">${subtotal.toFixed(2)}</span>
                     </button>
 
                     {isResumenOpen && (
-                      <div className="pl-3 pr-2 py-2 bg-gray-50/80 rounded-2xl border border-gray-150 space-y-1.5 text-[11px] max-h-44 overflow-y-auto">
+                      <div className="pl-3 pr-2 py-2 bg-white rounded-2xl border border-gray-200 space-y-1.5 text-[11px] max-h-44 overflow-y-auto">
                         {cart.map((item, idx) => (
-                          <div key={idx} className="flex justify-between items-center text-gray-600">
+                          <div key={idx} className="flex justify-between items-center text-[#2B2D42]">
                             <span className="truncate pr-2">{item.product.name} <span className="text-gray-400 font-bold">x{item.qty}</span></span>
-                            <span className="font-mono font-bold text-gray-800 shrink-0">${(item.product.price * item.qty).toFixed(2)}</span>
+                            <span className="font-mono font-bold text-[#1D3557] shrink-0">${(item.product.price * item.qty).toFixed(2)}</span>
                           </div>
                         ))}
                       </div>
@@ -2840,141 +3897,296 @@ export default function POSModule({
                   </div>
 
                   {/* Descuento */}
-                  <div className="flex justify-between text-xs text-gray-600 font-medium">
-                    <span>Descuento:</span>
-                    <span className={`font-mono font-bold ${calculatedDiscountUsd > 0 ? 'text-emerald-600' : 'text-gray-700'}`}>
+                  <div className="flex justify-between items-center text-xs text-[#2B2D42] font-medium">
+                    <div className="flex items-center gap-1.5">
+                      <span>Descuento:</span>
+                      {calculatedDiscountUsd > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleRemoveDiscount}
+                          title="Quitar descuento (0%)"
+                          className="text-[10px] text-red-600 hover:text-red-700 bg-red-50 hover:bg-red-100 px-1.5 py-0.5 rounded-full font-bold cursor-pointer transition flex items-center gap-0.5 border border-red-200"
+                        >
+                          <X className="w-3 h-3" />
+                          <span>Quitar</span>
+                        </button>
+                      )}
+                    </div>
+                    <span className={`font-mono font-bold ${calculatedDiscountUsd > 0 ? 'text-emerald-600 font-extrabold' : 'text-gray-700'}`}>
                       -${calculatedDiscountUsd.toFixed(2)}
                     </span>
                   </div>
 
                   {/* Cargos extras */}
-                  <div className="flex justify-between text-xs text-gray-600 font-medium">
+                  <div className="flex justify-between text-xs text-[#2B2D42] font-medium">
                     <span>Cargos extras:</span>
-                    <span className="font-mono font-bold text-gray-800">${extraChargesTotal.toFixed(2)}</span>
+                    <span className="font-mono font-bold text-[#2B2D42]">${extraChargesTotal.toFixed(2)}</span>
                   </div>
 
-                  {/* IVA 16% */}
-                  <div className="flex justify-between text-xs text-gray-600 font-medium">
-                    <span>IVA 16%:</span>
-                    <span className="font-mono font-bold text-gray-800">${applyIva ? calculatedIvaUsd.toFixed(2) : '0.00'}</span>
-                  </div>
+                  {/* IVA / Tipo de Impuesto */}
+                  {taxItemsSummary.map((taxItem, tIdx) => (
+                    <div key={tIdx} className="flex justify-between items-center text-xs text-[#2B2D42] font-medium">
+                      <span>{taxItem.label}</span>
+                      <div className="text-right">
+                        <span className="font-mono font-bold text-[#2B2D42]">${taxItem.amountUsd.toFixed(2)}</span>
+                        <span className="font-mono text-gray-800 text-xs sm:text-sm font-black ml-1.5">
+                          (Bs. {taxItem.amountVes.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                        </span>
+                      </div>
+                    </div>
+                  ))}
 
                   {/* IGTF 3% */}
-                  <div className="flex justify-between text-xs text-gray-600 font-medium">
-                    <span>IGTF 3%:</span>
-                    <span className="font-mono font-bold text-gray-800">${applyIgtf ? calculatedIgtfUsd.toFixed(2) : '0.00'}</span>
-                  </div>
+                  {hasUsdPayment && (
+                    <div className="flex justify-between items-center text-xs text-amber-900 font-semibold">
+                      <span>IGTF 3%:</span>
+                      <div className="text-right">
+                        <span className="font-mono font-bold">${applyIgtf ? calculatedIgtfUsd.toFixed(2) : '0.00'}</span>
+                        <span className="font-mono text-amber-950 text-xs sm:text-sm font-black ml-1.5">
+                          (Bs. {((applyIgtf ? calculatedIgtfUsd : 0) * (customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES))).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                        </span>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Divider y Total a pagar */}
-                  <div className="border-t border-gray-200/80 pt-3 flex justify-between items-baseline">
-                    <span className="text-sm font-black text-gray-900">Total a pagar:</span>
+                  <div className="border-t border-[#1D3557]/20 pt-3 flex justify-between items-baseline">
+                    <span className="text-sm font-montserrat font-extrabold text-[#1D3557]">Total a pagar:</span>
                     <div className="text-right">
-                      <div className="text-xl font-black text-gray-950 font-mono tracking-tight">
+                      <div className="text-xl font-montserrat font-black text-[#1D3557] font-mono tracking-tight">
                         ${total.toFixed(2)}
                       </div>
-                      <div className="text-xs font-bold text-[#005da9] font-mono">
-                        Bs. {(total * (customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || 45.5))).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      <div className="text-sm sm:text-base font-black text-[#1D3557] font-mono">
+                        Bs. {((Number(total) || 0) * (customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES))).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                       </div>
                     </div>
                   </div>
                 </div>
 
-                {/* Código de descuento */}
-                <div className="space-y-1.5">
-                  <label className="block text-xs font-bold text-gray-700">Código de descuento</label>
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      value={discountCode}
-                      onChange={(e) => setDiscountCode(e.target.value)}
-                      placeholder="XXXXXXXX"
-                      className="flex-1 px-3.5 py-2 bg-white border border-gray-200 rounded-xl text-xs font-mono font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9] uppercase placeholder:text-gray-300 shadow-2xs"
-                    />
-                    {discountCode && (
-                      <button
-                        type="button"
-                        onClick={() => handleApplyDiscountCode(discountCode)}
-                        className="px-3.5 py-2 bg-[#005da9] hover:bg-[#004b88] text-white font-black text-xs rounded-xl transition cursor-pointer shadow-xs"
-                      >
-                        Aplicar
-                      </button>
+                {/* Botones de acción del lado del resumen: Descuento y Aplicar cargos */}
+                <div className="pt-3 border-t border-gray-100 grid grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => setShowDiscountSection(prev => !prev)}
+                    className={`py-2.5 px-3 rounded-2xl border font-black text-xs transition-all duration-200 flex items-center justify-center gap-1.5 cursor-pointer shadow-3xs ${
+                      showDiscountSection || calculatedDiscountUsd > 0
+                        ? 'bg-[#7C3AED]/10 border-[#7C3AED] text-[#7C3AED]'
+                        : 'bg-[#F8F9FA] hover:bg-gray-100 border-gray-200 text-[#1D3557]'
+                    }`}
+                  >
+                    <Percent className="w-3.5 h-3.5" />
+                    <span>Descuento</span>
+                    {calculatedDiscountUsd > 0 && (
+                      <span className="ml-1 text-[10px] bg-[#7C3AED] text-white px-1.5 py-0.5 rounded-full font-mono font-bold">
+                        -${calculatedDiscountUsd.toFixed(2)}
+                      </span>
                     )}
-                  </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setShowExtraChargeModal(true)}
+                    className={`py-2.5 px-3 rounded-2xl border font-black text-xs transition-all duration-200 flex items-center justify-center gap-1.5 cursor-pointer shadow-3xs ${
+                      extraChargesTotal > 0
+                        ? 'bg-amber-50 border-amber-300 text-amber-900'
+                        : 'bg-[#F8F9FA] hover:bg-gray-100 border-gray-200 text-[#1D3557]'
+                    }`}
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Aplicar cargos</span>
+                    {extraChargesTotal > 0 && (
+                      <span className="ml-1 text-[10px] bg-amber-500 text-white px-1.5 py-0.5 rounded-full font-mono font-bold">
+                        +${extraChargesTotal.toFixed(2)}
+                      </span>
+                    )}
+                  </button>
                 </div>
 
-                {/* Toggles (Switches estilo iOS/Tailwind) */}
-                <div className="space-y-3 pt-1">
-                  <label className="flex items-center justify-between cursor-pointer select-none group">
-                    <span className="text-xs font-bold text-gray-700 group-hover:text-gray-900">Aplicar IVA (16%)</span>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={applyIva}
-                      onClick={() => setApplyIva(!applyIva)}
-                      className={`relative inline-flex h-5 w-10 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                        applyIva ? 'bg-[#005da9]' : 'bg-gray-300'
-                      }`}
-                    >
-                      <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
-                        applyIva ? 'translate-x-5' : 'translate-x-0'
-                      }`} />
-                    </button>
-                  </label>
+                {/* Formulario Descuento (Activable con el botón Descuento) */}
+                {(showDiscountSection || calculatedDiscountUsd > 0) && (
+                  <div className="space-y-1.5 pt-2 border-t border-gray-100">
+                    <div className="flex items-center justify-between">
+                      <label className="block text-xs font-bold text-[#1D3557]">Descuento</label>
+                      <div className="flex items-center gap-2">
+                        {calculatedDiscountUsd > 0 && (
+                          <button
+                            type="button"
+                            onClick={handleRemoveDiscount}
+                            className="text-[10px] text-red-600 hover:text-red-700 font-extrabold flex items-center gap-0.5 cursor-pointer bg-red-50 hover:bg-red-100 px-2 py-0.5 rounded-full transition border border-red-200"
+                          >
+                            <X className="w-3 h-3" />
+                            <span>Quitar</span>
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => setShowDiscountSection(false)}
+                          className="text-gray-400 hover:text-gray-600 p-0.5 cursor-pointer"
+                          title="Cerrar"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
 
-                  <label className="flex items-center justify-between cursor-pointer select-none group">
-                    <span className="text-xs font-bold text-gray-700 group-hover:text-gray-900">Aplicar IGTF (3%)</span>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={applyIgtf}
-                      onClick={() => setApplyIgtf(!applyIgtf)}
-                      className={`relative inline-flex h-5 w-10 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                        applyIgtf ? 'bg-[#005da9]' : 'bg-gray-300'
-                      }`}
-                    >
-                      <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
-                        applyIgtf ? 'translate-x-5' : 'translate-x-0'
-                      }`} />
-                    </button>
-                  </label>
+                    <div className="flex items-center gap-2">
+                      {/* Input Porcentaje (%) */}
+                      <div className="relative flex-1">
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={
+                            discountType === 'percent'
+                              ? discountPercent
+                              : discountType === 'amount' && subtotal > 0 && parseFloat(discountAmount) > 0
+                                ? parseFloat(((parseFloat(discountAmount) / subtotal) * 100).toFixed(2)).toString()
+                                : (discountPercent && discountPercent !== '0' ? discountPercent : '')
+                          }
+                          onChange={(e) => handlePercentChange(e.target.value)}
+                          placeholder="0"
+                          className="w-full px-3.5 py-2 pr-7 bg-white border border-gray-300 rounded-2xl text-sm font-bold text-[#1D3557] focus:outline-none focus:ring-2 focus:ring-[#7C3AED] shadow-2xs"
+                        />
+                        <span className="absolute right-3.5 top-2.5 text-xs font-extrabold text-[#1D3557] pointer-events-none">%</span>
+                      </div>
+
+                      {/* Signo de Igual (=) */}
+                      <span className="text-gray-600 font-bold text-base font-mono select-none px-0.5">=</span>
+
+                      {/* Input Monto ($ USD) */}
+                      <div className="relative flex-1">
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={
+                            discountType === 'amount'
+                              ? discountAmount
+                              : discountType === 'percent' && subtotal > 0 && parseFloat(discountPercent) > 0
+                                ? parseFloat((subtotal * (parseFloat(discountPercent) / 100)).toFixed(2)).toString()
+                                : (discountAmount && discountAmount !== '0' ? discountAmount : '')
+                          }
+                          onChange={(e) => handleAmountChange(e.target.value)}
+                          placeholder="0.00"
+                          className="w-full px-3.5 py-2 pr-7 bg-white border border-gray-300 rounded-2xl text-sm font-bold text-[#1D3557] focus:outline-none focus:ring-2 focus:ring-[#7C3AED] shadow-2xs"
+                        />
+                        <span className="absolute right-3.5 top-2.5 text-xs font-extrabold text-[#1D3557] pointer-events-none">$</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Detalle de Cargos Aplicados si existen */}
+                {extraCharges.length > 0 && (
+                  <div className="pt-2 border-t border-gray-100 space-y-1.5">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs font-bold text-[#1D3557]">Cargos aplicados:</span>
+                      <button
+                        type="button"
+                        onClick={() => setExtraCharges([])}
+                        className="text-[10px] font-bold text-rose-600 hover:text-rose-800 flex items-center gap-1 cursor-pointer"
+                      >
+                        <X className="w-3 h-3 text-rose-500" />
+                        <span>Limpiar</span>
+                      </button>
+                    </div>
+                    <div className="space-y-1">
+                      {extraCharges.map((charge) => (
+                        <div key={charge.id} className="flex items-center justify-between bg-amber-50/60 border border-amber-200/70 px-3 py-1.5 rounded-xl text-xs">
+                          <span className="font-bold text-[#1D3557]">{charge.name}</span>
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono font-bold text-amber-900">+${Number(charge.amount).toFixed(2)}</span>
+                            <button
+                              type="button"
+                              onClick={() => setExtraCharges(prev => prev.filter(c => c.id !== charge.id))}
+                              className="text-gray-400 hover:text-rose-600 p-0.5 transition cursor-pointer"
+                              title="Eliminar cargo"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Toggles (Switches) - Sujeto a impuesto y condicional IGTF */}
+                <div className="space-y-3 pt-1">
+                  <div className="bg-white border border-gray-200 rounded-xl p-3 shadow-2xs">
+                    <label className="flex items-center justify-between cursor-pointer select-none">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-bold text-[#1D3557]">Sujeto a impuesto</span>
+                        {applyIva && (
+                          <span className="text-[9px] font-black uppercase px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
+                            Activo
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={applyIva}
+                        onClick={() => setApplyIva(!applyIva)}
+                        className={`relative inline-flex h-5 w-10 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                          applyIva ? 'bg-[#1D3557]' : 'bg-gray-300'
+                        }`}
+                      >
+                        <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
+                          applyIva ? 'translate-x-5' : 'translate-x-0'
+                        }`} />
+                      </button>
+                    </label>
+                  </div>
+
+                  {hasUsdPayment && (
+                    <div className="bg-white border border-gray-200 rounded-xl p-3 shadow-2xs">
+                      <label className="flex items-center justify-between cursor-pointer select-none">
+                        <span className="text-xs font-bold text-[#1D3557]">Aplicar IGTF (3%)</span>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={applyIgtf}
+                          onClick={() => setApplyIgtf(!applyIgtf)}
+                          className={`relative inline-flex h-5 w-10 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                            applyIgtf ? 'bg-[#1D3557]' : 'bg-gray-300'
+                          }`}
+                        >
+                          <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
+                            applyIgtf ? 'translate-x-5' : 'translate-x-0'
+                          }`} />
+                        </button>
+                      </label>
+                    </div>
+                  )}
                 </div>
               </div>
 
               {/* RIGHT COLUMN: MÉTODOS DE PAGO Y TASA (lg:col-span-7) */}
               <div className="lg:col-span-7 space-y-4">
                 
-                {/* Barra superior: + Agregar cargo extra y Tasa de cambio */}
-                <div className="flex items-center justify-between pb-2 border-b border-gray-100">
-                  <button
-                    type="button"
-                    onClick={() => setShowExtraChargeModal(true)}
-                    className="text-xs font-black text-[#005da9] hover:text-[#004b88] flex items-center gap-1 cursor-pointer hover:underline"
-                  >
-                    <Plus className="w-4 h-4" />
-                    <span>Agregar cargo extra</span>
-                  </button>
-
+                {/* Barra superior: Tasa de cambio */}
+                <div className="flex items-center justify-end pb-2 border-b border-gray-100">
                   {/* Badge Tasa de cambio */}
-                  <div className="flex items-center gap-2 bg-amber-50/90 border border-amber-200/80 px-3 py-1 rounded-full text-xs">
-                    <span className="font-bold text-gray-700">Tasa de cambio (Bs/$):</span>
+                  <div className="flex items-center gap-2 bg-[#F8F9FA] border border-[#7C3AED]/30 px-3 py-1 rounded-full text-xs">
+                    <span className="font-bold text-[#2B2D42]">Tasa de cambio (Bs/$):</span>
                     <input
                       type="number"
                       step="0.01"
-                      value={customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || 45.5)}
+                      min="0"
+                      value={customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES)}
                       onChange={(e) => setCustomBcvRate(parseFloat(e.target.value) || 0)}
-                      className="w-20 px-2 py-0.5 bg-white border border-amber-300 rounded-lg text-xs font-mono font-black text-[#004b88] text-center focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                      className="w-28 px-2 py-0.5 bg-white border border-[#7C3AED]/30 rounded-lg text-xs font-mono font-black text-[#7C3AED] text-center focus:outline-none focus:ring-2 focus:ring-[#7C3AED]"
                     />
                   </div>
                 </div>
 
-                {/* Lista de Métodos de Pago Dinámicos */}
+                  {/* Lista de Métodos de Pago Dinámicos */}
                 <div className="space-y-3.5">
                   {splitPayments.map((p, idx) => {
-                    const methodCurr = getMethodCurrency(p.method);
-                    const currSymbol = methodCurr === 'VES' ? 'BS' : methodCurr === 'USD' ? '$' : methodCurr === 'EUR' ? '€' : 'COP';
+                    const methodCurr = getPaymentCurrency(p);
+                    const currSymbol = methodCurr === 'VES' ? 'Bs' : methodCurr === 'USD' ? '$' : methodCurr === 'EUR' ? '€' : 'COP';
                     
                     return (
-                      <div key={idx} className="relative p-4 bg-gray-50/60 border border-gray-200/70 rounded-2xl space-y-2.5">
+                      <div key={idx} className="relative p-4 bg-[#F8F9FA] border border-gray-200 rounded-2xl space-y-3.5">
                         {splitPayments.length > 1 && (
                           <button
                             type="button"
@@ -2987,47 +4199,46 @@ export default function POSModule({
                         )}
 
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 items-end pr-5">
-                          {/* Selector Método de pago */}
-                          <div className="space-y-1">
-                            <label className="block text-[11px] font-bold text-gray-600">Método de pago</label>
+                          {/* Selector Cuenta Bancaria (Principal) */}
+                          <div className="space-y-1 col-span-2">
+                            <label className="block text-[11px] font-bold text-[#2B2D42]">Cuenta Bancaria / Destino</label>
                             <select
-                              value={p.method}
-                              onChange={(e) => handleUpdateSplitMethod(idx, e.target.value)}
-                              className="w-full bg-white border border-gray-200 text-gray-800 font-bold text-xs rounded-xl px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-[#005da9] cursor-pointer shadow-2xs"
+                              value={p.bankAccountId || bankAccounts[0]?.id || ''}
+                              onChange={(e) => handleBankChange(idx, e.target.value)}
+                              className="w-full bg-white border border-gray-200 text-[#2B2D42] font-bold text-xs rounded-xl px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-[#00BFFF] cursor-pointer shadow-2xs"
                             >
-                              {getActiveMethods().map((m) => (
-                                <option key={m.id} value={m.id}>
-                                  {m.label || m.id}
+                              {bankAccounts.filter(a => a.id !== 'cxc-virtual').map((a) => (
+                                <option key={a.id} value={a.id}>
+                                  {a.name} ({a.currency}) • Saldo: {a.currency} {(Number(a.balance) || 0).toLocaleString('es-VE', { minimumFractionDigits: 2 })}
                                 </option>
                               ))}
                             </select>
                           </div>
-
-                          {/* Input Monto a pagar */}
-                          <div className="space-y-1">
-                            <div className="flex justify-between items-center">
-                              <label className="block text-[11px] font-bold text-gray-600">Monto a pagar</label>
-                              <button
-                                type="button"
-                                onClick={() => handleFillRemaining(idx)}
-                                className="text-[10px] text-[#005da9] font-black hover:underline cursor-pointer"
-                              >
-                                Restante
-                              </button>
-                            </div>
-                            <div className="relative">
-                              <input
-                                type="number"
-                                step="0.01"
-                                value={p.amount || ''}
-                                onChange={(e) => handleUpdateSplitAmount(idx, parseFloat(e.target.value) || 0)}
-                                placeholder="0.00"
-                                className="w-full pl-3 pr-12 py-2 bg-white border border-gray-200 rounded-xl text-xs font-mono font-black text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9] shadow-2xs"
-                              />
-                              <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-black font-mono text-gray-500">
-                                {currSymbol}
-                              </span>
-                            </div>
+                        </div>
+                        {/* Input de monto y labels */}
+                        <div className="flex flex-col gap-1">
+                          <div className="flex justify-between items-center">
+                            <label className="block text-[11px] font-bold text-[#2B2D42]">
+                              Monto a pagar ({currSymbol})
+                            </label>
+                            <button
+                              type="button"
+                              onClick={() => handleFillRemaining(idx)}
+                              className="text-[10px] text-[#005da9] font-black hover:underline cursor-pointer"
+                            >
+                              Restante
+                            </button>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="number"
+                              step="0.01"
+                              value={p.amount !== undefined ? p.amount : ''}
+                              onChange={(e) => handleUpdateSplitAmount(idx, parseFloat(e.target.value))}
+                              className="w-full px-3 py-2 bg-white border border-[#40E0D0] rounded-xl text-xs font-mono font-black text-[#1D3557] text-center focus:outline-none focus:ring-2 focus:ring-[#00BFFF]"
+                              placeholder="0.00"
+                            />
+                            <span className="text-xs font-black text-gray-500 min-w-[24px]">{currSymbol}</span>
                           </div>
                         </div>
                       </div>
@@ -3049,7 +4260,7 @@ export default function POSModule({
 
                 {/* Validador de Pago en Vivo */}
                 {(() => {
-                  const splitSumUsd = splitPayments.reduce((acc, sp) => acc + methodAmountToUsd(sp.amount || 0, sp.method), 0);
+                  const splitSumUsd = splitPayments.reduce((acc, sp) => acc + methodAmountToUsd(sp.amount || 0, sp), 0);
                   const diffUsd = parseFloat((total - splitSumUsd).toFixed(2));
                   if (Math.abs(diffUsd) < 0.02) {
                     return (
@@ -3066,7 +4277,7 @@ export default function POSModule({
                           <span>Pendiente por asignar:</span>
                         </div>
                         <span className="font-mono text-amber-950 font-black">
-                          ${diffUsd.toFixed(2)} (Bs. {(diffUsd * (customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || 45.5))).toFixed(2)})
+                          ${diffUsd.toFixed(2)} (Bs. {(diffUsd * (customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES))).toFixed(2)})
                         </span>
                       </div>
                     );
@@ -3078,86 +4289,79 @@ export default function POSModule({
                           <span>Excedente por asignar:</span>
                         </div>
                         <span className="font-mono text-rose-950 font-black">
-                          ${Math.abs(diffUsd).toFixed(2)} (Bs. {(Math.abs(diffUsd) * (customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || 45.5))).toFixed(2)})
+                          ${Math.abs(diffUsd).toFixed(2)} (Bs. {(Math.abs(diffUsd) * (customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES))).toFixed(2)})
                         </span>
                       </div>
                     );
                   }
                 })()}
 
-                {/* Botones de Navegación: Poner en Espera | Facturar */}
-                <div className="flex items-center justify-end gap-3 pt-4 border-t border-gray-100">
-                  <div className="flex items-center gap-2">
-                    {/* ⏸ Botón Poner en Espera */}
-                    <button
-                      type="button"
-                      onClick={handlePostponeSale}
-                      disabled={isLoading || cart.length === 0}
-                      className="px-5 py-2.5 bg-white hover:bg-gray-50 disabled:opacity-50 text-[#005da9] border border-gray-200 font-bold text-xs rounded-xl transition flex items-center gap-2 cursor-pointer shadow-xs"
-                      title="Guardar esta venta en espera para retomar después"
-                    >
-                      <div className="w-4 h-4 rounded-full border border-[#005da9] flex items-center justify-center shrink-0">
-                        <div className="flex gap-[2.5px]">
-                          <div className="w-[1.5px] h-1.5 bg-[#005da9] rounded-xs"></div>
-                          <div className="w-[1.5px] h-1.5 bg-[#005da9] rounded-xs"></div>
-                        </div>
-                      </div>
-                      <span>Poner en espera</span>
-                    </button>
-
-                    {/* ✅ Botón Facturar */}
-                    <button
-                      type="button"
-                      onClick={handleFinalizeInvoice}
-                      disabled={isLoading || cart.length === 0}
-                      className="px-8 py-2.5 bg-[#005da9] hover:bg-[#004b88] disabled:bg-gray-300 text-white font-black text-xs uppercase tracking-wider rounded-xl transition shadow-md flex items-center gap-2 cursor-pointer"
-                    >
-                      {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-                      <span>Facturar</span>
-                    </button>
-                  </div>
+                {/* Botón Facturar */}
+                <div className="flex items-center justify-end pt-4 border-t border-gray-100">
+                  {/* ✅ Botón Facturar (CTA Principal con Turquesa Vivo #40E0D0 y Azul Profundo #1D3557) */}
+                  <button
+                    type="button"
+                    onClick={handleFinalizeInvoice}
+                    disabled={isLoading || cart.length === 0}
+                    className="w-full sm:w-auto px-8 py-2.5 bg-[#40E0D0] hover:bg-[#36cebe] disabled:bg-gray-300 text-[#1D3557] font-montserrat font-black text-xs uppercase tracking-wider rounded-xl transition shadow-md flex items-center justify-center gap-2 cursor-pointer border-b-2 border-[#1D3557]/20"
+                  >
+                    {isLoading ? <Loader2 className="w-4 h-4 animate-spin text-[#1D3557]" /> : null}
+                    <span>Facturar</span>
+                  </button>
                 </div>
               </div>
             </div>
           </div>
+          )}
         </div>
       </div>
+      </>
+      )}
 
-      {/* -------------------- MODAL: CONFIRMACIÓN FUSIONAR / REEMPLAZAR DRAFT -------------------- */}
+      {/* -------------------- MODAL: CONFIRMACIÓN FUSIONAR / REEMPLAZAR DRAFT (ESTILO FRENYER) -------------------- */}
       {showMergeModal && pendingDraftToResume && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
-          <div className="bg-white rounded-3xl border border-gray-100 w-full max-w-sm shadow-2xl p-5 relative text-left">
-            <div className="flex items-center gap-2 text-amber-600 mb-2">
-              <AlertCircle className="w-5 h-5 shrink-0" />
-              <h3 className="text-sm font-black uppercase tracking-tight">Caja Ocupada</h3>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4 animate-fadeIn">
+          <div className="bg-white rounded-3xl border border-slate-200/90 w-full max-w-sm shadow-2xl p-6 relative text-left space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="w-11 h-11 rounded-full bg-amber-50 border border-amber-200/80 flex items-center justify-center text-amber-600 shadow-2xs shrink-0">
+                <AlertCircle className="w-5 h-5 text-amber-600" />
+              </div>
+              <div>
+                <h3 className="text-sm font-montserrat font-extrabold text-[#1D3557] uppercase tracking-tight">Caja Ocupada</h3>
+                <p className="text-xs text-slate-500 font-medium">El carrito actual contiene productos</p>
+              </div>
             </div>
-            <p className="text-[11px] text-gray-500 font-medium mb-5 leading-normal">
-              El carrito actual de la caja no está vacío. ¿Cómo desea cargar la factura postergada de <span className="font-bold text-gray-800">"{pendingDraftToResume.reference}"</span>?
+
+            <p className="text-xs text-slate-600 font-medium leading-relaxed bg-amber-50/50 p-3.5 rounded-2xl border border-amber-200/60">
+              ¿Cómo desea cargar los productos de la factura en espera <strong className="text-amber-900 font-mono font-bold">"{pendingDraftToResume.reference}"</strong>?
             </p>
 
-            <div className="space-y-2">
+            <div className="space-y-2.5 pt-1">
               <button
+                type="button"
                 onClick={() => executeResumeDraft(pendingDraftToResume, 'merge')}
-                className="w-full py-2.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 font-black text-xs rounded-xl transition flex items-center justify-center gap-1.5"
+                className="w-full py-2.5 px-4 bg-white hover:bg-emerald-50 active:bg-emerald-100 text-emerald-700 border border-emerald-200/90 font-montserrat font-bold text-xs rounded-full shadow-xs hover:shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
               >
-                <Plus className="w-4 h-4" />
+                <Plus className="w-4 h-4 text-emerald-600" />
                 <span>Fusionar con Carrito Actual</span>
               </button>
               
               <button
+                type="button"
                 onClick={() => executeResumeDraft(pendingDraftToResume, 'replace')}
-                className="w-full py-2.5 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 font-black text-xs rounded-xl transition flex items-center justify-center gap-1.5"
+                className="w-full py-2.5 px-4 bg-white hover:bg-blue-50 active:bg-blue-100 text-[#005da9] border border-blue-200/90 font-montserrat font-bold text-xs rounded-full shadow-xs hover:shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer"
               >
-                <RefreshCw className="w-3.5 h-3.5" />
+                <RefreshCw className="w-3.5 h-3.5 text-[#005da9]" />
                 <span>Reemplazar Carrito Actual</span>
               </button>
 
               <button
+                type="button"
                 onClick={() => {
                   setShowMergeModal(false);
                   setPendingDraftToResume(null);
                 }}
-                className="w-full py-2 text-gray-400 hover:text-gray-600 font-bold text-xs rounded-xl text-center"
+                className="w-full py-2 text-slate-500 hover:text-slate-700 font-bold text-xs rounded-full border border-slate-200/80 bg-white hover:bg-slate-50 shadow-2xs transition-all text-center cursor-pointer"
               >
                 Cancelar
               </button>
@@ -3245,7 +4449,7 @@ export default function POSModule({
                     {completedInvoice.items?.map((item: any, i: number) => {
                       const itemPrice = Number(item.price || 0);
                       const itemTotal = Number(item.total || itemPrice * (item.qty || 1));
-                      const rate = completedInvoice.bcv_rate || customBcvRate || bcvRate || 45.5;
+                      const rate = completedInvoice.bcv_rate || customBcvRate || bcvRate || getCachedCurrencyRates().VES;
                       const itemPriceBs = itemPrice * rate;
                       const itemTotalBs = itemTotal * rate;
 
@@ -3288,7 +4492,7 @@ export default function POSModule({
                     <div className="text-right">
                       <span className="font-mono block">${Number(completedInvoice.total || 0).toFixed(2)}</span>
                       <span className="text-xs font-bold text-[#005da9] font-mono">
-                        Bs. {(Number(completedInvoice.total || 0) * (completedInvoice.bcv_rate || customBcvRate || bcvRate || 45.5)).toFixed(2)}
+                        Bs. {(Number(completedInvoice.total || 0) * (completedInvoice.bcv_rate || customBcvRate || bcvRate || getCachedCurrencyRates().VES)).toFixed(2)}
                       </span>
                     </div>
                   </div>
@@ -3297,31 +4501,31 @@ export default function POSModule({
             </div>
 
             {/* Footer con controles de Impresión: Carta, 58mm, 80mm, Aceptar (Image 5) */}
-            <div className="p-4 bg-gray-50 border-t border-gray-100 flex flex-wrap gap-2 justify-center items-center shrink-0">
+            <div className="p-4 bg-[#F8F9FA] border-t border-gray-100 flex flex-wrap gap-2 justify-center items-center shrink-0">
               <button
                 type="button"
                 onClick={() => printInvoiceDocument(completedInvoice, businessInfo, 'carta', customBcvRate || bcvRate)}
-                className="px-4 py-2.5 bg-white hover:bg-blue-50 text-[#005da9] border border-[#005da9]/30 font-bold text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
+                className="px-4 py-2.5 bg-white hover:bg-[#F8F9FA] text-[#1D3557] border border-[#1D3557]/30 font-bold text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
               >
-                <Printer className="w-4 h-4" />
+                <Printer className="w-4 h-4 text-[#00BFFF]" />
                 <span>Imprimir (carta)</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => printInvoiceDocument(completedInvoice, businessInfo, '58mm', customBcvRate || bcvRate)}
-                className="px-4 py-2.5 bg-white hover:bg-blue-50 text-[#005da9] border border-[#005da9]/30 font-bold text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
+                className="px-4 py-2.5 bg-white hover:bg-[#F8F9FA] text-[#1D3557] border border-[#1D3557]/30 font-bold text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
               >
-                <Printer className="w-4 h-4" />
+                <Printer className="w-4 h-4 text-[#00BFFF]" />
                 <span>Imprimir (58mm)</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => printInvoiceDocument(completedInvoice, businessInfo, '80mm', customBcvRate || bcvRate)}
-                className="px-4 py-2.5 bg-white hover:bg-blue-50 text-[#005da9] border border-[#005da9]/30 font-bold text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
+                className="px-4 py-2.5 bg-white hover:bg-[#F8F9FA] text-[#1D3557] border border-[#1D3557]/30 font-bold text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
               >
-                <Printer className="w-4 h-4" />
+                <Printer className="w-4 h-4 text-[#00BFFF]" />
                 <span>Imprimir (80mm)</span>
               </button>
 
@@ -3331,7 +4535,7 @@ export default function POSModule({
                   setCompletedInvoice(null);
                   resetVentaFlash();
                 }}
-                className="px-8 py-2.5 bg-[#005da9] hover:bg-[#004b88] text-white font-black text-xs uppercase tracking-wider rounded-xl transition shadow-md cursor-pointer"
+                className="px-8 py-2.5 bg-[#40E0D0] hover:bg-[#36cebe] text-[#1D3557] font-montserrat font-black text-xs uppercase tracking-wider rounded-xl transition shadow-md cursor-pointer border-b-2 border-[#1D3557]/20"
               >
                 Aceptar
               </button>
@@ -3345,10 +4549,10 @@ export default function POSModule({
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-xs p-4">
           <div className="bg-white rounded-3xl border border-gray-100 w-full max-w-lg shadow-2xl overflow-hidden text-left flex flex-col max-h-[85vh]">
             {/* Header */}
-            <div className="p-5 bg-gray-50 border-b border-gray-100 flex justify-between items-center shrink-0">
+            <div className="p-5 bg-[#F8F9FA] border-b border-gray-100 flex justify-between items-center shrink-0">
               <div className="flex items-center gap-2">
-                <Users className="w-5 h-5 text-[#005da9]" />
-                <h3 className="text-sm font-black text-gray-800 uppercase tracking-tight">Buscar Cliente Registrado</h3>
+                <Users className="w-5 h-5 text-[#1D3557]" />
+                <h3 className="text-sm font-montserrat font-extrabold text-[#1D3557] uppercase tracking-tight">Buscar Cliente Registrado</h3>
               </div>
               <button 
                 onClick={() => setShowClientSearchModal(false)}
@@ -3361,20 +4565,20 @@ export default function POSModule({
             {/* Search Input */}
             <div className="p-4 bg-white border-b border-gray-50 shrink-0">
               <div className="relative">
-                <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+                <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-[#00BFFF]" />
                 <input
                   type="text"
                   value={clientSearchQuery}
                   onChange={(e) => setClientSearchQuery(e.target.value)}
                   placeholder="Buscar por nombre, cédula/RIF, teléfono o correo..."
-                  className="w-full pl-10 pr-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:bg-white transition"
+                  className="w-full pl-10 pr-4 py-2.5 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
                   autoFocus
                 />
               </div>
             </div>
 
             {/* Clients List */}
-            <div className="p-4 overflow-y-auto flex-1 bg-gray-50/50 space-y-2 max-h-[45vh]">
+            <div className="p-4 overflow-y-auto flex-1 bg-[#F8F9FA]/50 space-y-2 max-h-[45vh]">
               {clients.filter(c => {
                 const q = clientSearchQuery.toLowerCase();
                 return (
@@ -3419,12 +4623,14 @@ export default function POSModule({
                     type="button"
                     onClick={() => {
                       setSelectedClient(c.name);
+                      setWizardSelectedClientObj(c);
+                      setWizardClientSearchQuery(c.name);
                       setShowClientSearchModal(false);
                     }}
-                    className="w-full text-left p-3.5 bg-white border border-gray-100 hover:border-[#005da9] hover:bg-blue-50/30 rounded-2xl transition flex items-center justify-between gap-4 group"
+                    className="w-full text-left p-3.5 bg-white border border-gray-100 hover:border-[#00BFFF] hover:bg-[#1D3557]/5 rounded-2xl transition flex items-center justify-between gap-4 group"
                   >
                     <div className="min-w-0">
-                      <div className="font-extrabold text-gray-900 text-xs truncate group-hover:text-[#005da9] transition-colors">{c.name}</div>
+                      <div className="font-extrabold text-[#2B2D42] text-xs truncate group-hover:text-[#1D3557] transition-colors">{c.name}</div>
                       <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-1 text-[10px] text-gray-400 font-bold">
                         <span className="font-mono text-gray-500">Doc: {c.document}</span>
                         {c.phone && <span>Tel: {c.phone}</span>}
@@ -3437,7 +4643,7 @@ export default function POSModule({
                           Crédito: ${Number(c.credit_usd).toFixed(2)}
                         </span>
                       )}
-                      <span className="text-[10px] text-[#005da9] font-black uppercase opacity-0 group-hover:opacity-100 transition-opacity">
+                      <span className="text-[10px] text-[#1D3557] font-black uppercase opacity-0 group-hover:opacity-100 transition-opacity">
                         Seleccionar
                       </span>
                     </div>
@@ -3447,11 +4653,21 @@ export default function POSModule({
             </div>
 
             {/* Footer */}
-            <div className="p-4 bg-gray-50 border-t border-gray-100 flex justify-between items-center shrink-0">
+            <div className="p-4 bg-[#F8F9FA] border-t border-gray-100 flex justify-between items-center shrink-0">
               <button
                 type="button"
                 onClick={() => {
                   setSelectedClient('Consumidor final');
+                  setWizardSelectedClientObj({
+                    id: 'cf',
+                    name: 'Consumidor final',
+                    document: 'V-99999999',
+                    phone: '',
+                    email: '',
+                    address: 'Mostrador',
+                    credit_usd: 0
+                  });
+                  setWizardClientSearchQuery('Consumidor final');
                   setShowClientSearchModal(false);
                 }}
                 className="py-2 px-3 text-red-600 hover:bg-red-50 hover:text-red-700 font-bold text-xs rounded-xl transition"
@@ -3462,7 +4678,7 @@ export default function POSModule({
                 <button
                   type="button"
                   onClick={() => setShowClientSearchModal(false)}
-                  className="py-2 px-4 bg-gray-100 hover:bg-gray-200 text-gray-600 font-bold text-xs rounded-xl transition"
+                  className="py-2 px-4 bg-gray-100 hover:bg-gray-200 text-[#2B2D42] font-bold text-xs rounded-xl transition"
                 >
                   Cerrar
                 </button>
@@ -3478,9 +4694,9 @@ export default function POSModule({
                     setNewClientCredit('0');
                     setShowQuickClientModal(true);
                   }}
-                  className="py-2 px-4 bg-[#005da9] hover:bg-[#004b88] text-white font-black text-xs uppercase rounded-xl transition flex items-center gap-1"
+                  className="py-2 px-4 bg-[#1D3557] hover:bg-[#152742] text-white font-montserrat font-bold text-xs uppercase rounded-xl transition flex items-center gap-1"
                 >
-                  <UserPlus className="w-3.5 h-3.5" />
+                  <UserPlus className="w-3.5 h-3.5 text-[#40E0D0]" />
                   <span>Nuevo Cliente</span>
                 </button>
               </div>
@@ -3621,16 +4837,16 @@ export default function POSModule({
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-fadeIn">
           <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full overflow-hidden border border-gray-100 flex flex-col">
             {/* Modal Header */}
-            <div className="bg-[#005da9] text-white p-4 flex items-center justify-between">
+            <div className="bg-[#1D3557] text-white p-4 flex items-center justify-between">
               <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-lg bg-amber-400/20 text-amber-300 flex items-center justify-center font-mono font-black text-xs border border-amber-300/30 shrink-0">
+                <div className="w-8 h-8 rounded-lg bg-[#40E0D0]/20 text-[#40E0D0] flex items-center justify-center font-mono font-black text-xs border border-[#40E0D0]/30 shrink-0">
                   99999
                 </div>
                 <div>
-                  <h3 className="font-extrabold text-sm tracking-tight text-white">
+                  <h3 className="font-montserrat font-extrabold text-sm tracking-tight text-white">
                     Venta Libre / Ítem Genérico (Código 99999)
                   </h3>
-                  <p className="text-[10px] text-blue-100 font-medium">
+                  <p className="text-[10px] text-gray-200 font-medium">
                     Ingrese el nombre y precio personalizado para esta factura.
                   </p>
                 </div>
@@ -3647,7 +4863,7 @@ export default function POSModule({
             {/* Modal Body Form */}
             <form onSubmit={handleConfirmVentaLibre} className="p-5 space-y-4">
               <div>
-                <label className="block text-xs font-black text-gray-700 uppercase tracking-wider mb-1">
+                <label className="block text-xs font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
                   Nombre o Descripción del Producto / Servicio <span className="text-red-500">*</span>
                 </label>
                 <input
@@ -3656,14 +4872,14 @@ export default function POSModule({
                   placeholder="Ej: Servicio de Copia Especial, Trabajo Técnico..."
                   value={vlName}
                   onChange={(e) => setVlName(e.target.value)}
-                  className="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:bg-white transition"
+                  className="w-full px-3.5 py-2.5 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
                   autoFocus
                 />
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-black text-gray-700 uppercase tracking-wider mb-1">
+                  <label className="block text-xs font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
                     Precio ($ USD) <span className="text-red-500">*</span>
                   </label>
                   <div className="relative">
@@ -3676,18 +4892,18 @@ export default function POSModule({
                       placeholder="0.00"
                       value={vlPrice}
                       onChange={(e) => setVlPrice(e.target.value)}
-                      className="w-full pl-7 pr-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-extrabold text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:bg-white transition"
+                      className="w-full pl-7 pr-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-extrabold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
                     />
                   </div>
                   {vlPrice && !isNaN(parseFloat(vlPrice)) && parseFloat(vlPrice) > 0 && (
                     <span className="text-[10px] text-emerald-700 font-extrabold block mt-1">
-                      Bs. {(parseFloat(vlPrice) * bcvRate).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      Bs. {((parseFloat(vlPrice) || 0) * (bcvRate || 1)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </span>
                   )}
                 </div>
 
                 <div>
-                  <label className="block text-xs font-black text-gray-700 uppercase tracking-wider mb-1">
+                  <label className="block text-xs font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
                     Cantidad
                   </label>
                   <input
@@ -3696,13 +4912,13 @@ export default function POSModule({
                     required
                     value={vlQty}
                     onChange={(e) => setVlQty(e.target.value)}
-                    className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-extrabold text-gray-900 text-center focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:bg-white transition"
+                    className="w-full px-3 py-2 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-extrabold text-[#2B2D42] text-center focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
                   />
                 </div>
               </div>
 
               <div>
-                <label className="block text-xs font-black text-gray-700 uppercase tracking-wider mb-1">
+                <label className="block text-xs font-montserrat font-extrabold text-[#1D3557] uppercase tracking-wider mb-1">
                   Impuesto del Artículo
                 </label>
                 <select
@@ -3717,7 +4933,7 @@ export default function POSModule({
                       setVlTaxRate(found ? found.rate : 0);
                     }
                   }}
-                  className="w-full px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:bg-white transition"
+                  className="w-full px-3 py-2.5 bg-[#F8F9FA] border border-gray-200 rounded-xl text-xs font-bold text-[#2B2D42] focus:outline-none focus:ring-2 focus:ring-[#00BFFF] focus:bg-white transition"
                 >
                   <option value="exento">Exento / Sin Impuesto (0%)</option>
                   {taxes.filter(t => t.is_active !== false).map((t) => (
@@ -3729,15 +4945,15 @@ export default function POSModule({
               </div>
 
               {!editingVlId && (
-                <div className="flex items-start gap-2.5 p-3 bg-blue-50/70 border border-blue-100/90 rounded-2xl">
+                <div className="flex items-start gap-2.5 p-3 bg-[#1D3557]/5 border border-[#1D3557]/10 rounded-2xl">
                   <input
                     type="checkbox"
                     id="vlSaveDbCheckbox"
                     checked={vlSaveDb}
                     onChange={(e) => setVlSaveDb(e.target.checked)}
-                    className="w-4 h-4 mt-0.5 text-[#005da9] rounded focus:ring-[#005da9] cursor-pointer shrink-0"
+                    className="w-4 h-4 mt-0.5 text-[#1D3557] rounded focus:ring-[#00BFFF] cursor-pointer shrink-0"
                   />
-                  <label htmlFor="vlSaveDbCheckbox" className="text-xs font-bold text-gray-800 cursor-pointer select-none">
+                  <label htmlFor="vlSaveDbCheckbox" className="text-xs font-bold text-[#2B2D42] cursor-pointer select-none">
                     Guardar en el catálogo de productos de ventas
                     <span className="block text-[10px] text-gray-500 font-normal mt-0.5">
                       Al activar, el producto o servicio quedará registrado en la lista de productos para ser usado en ventas futuras.
@@ -3752,14 +4968,14 @@ export default function POSModule({
                   type="button"
                   onClick={() => setShowVentaLibreModal(false)}
                   disabled={isSavingVl}
-                  className="px-4 py-2 border border-gray-200 text-gray-600 font-bold text-xs rounded-xl hover:bg-gray-50 transition cursor-pointer"
+                  className="px-4 py-2 border border-gray-200 text-[#2B2D42] font-bold text-xs rounded-xl hover:bg-gray-50 transition cursor-pointer"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
                   disabled={isSavingVl}
-                  className="px-4 py-2 bg-[#005da9] hover:bg-[#004b87] text-white font-extrabold text-xs rounded-xl shadow-md transition flex items-center gap-1.5 cursor-pointer"
+                  className="px-4 py-2 bg-[#1D3557] hover:bg-[#152742] text-white font-montserrat font-bold text-xs rounded-xl shadow-md transition flex items-center gap-1.5 cursor-pointer"
                 >
                   {isSavingVl ? (
                     <>
@@ -3768,7 +4984,7 @@ export default function POSModule({
                     </>
                   ) : (
                     <>
-                      <CheckCircle className="w-3.5 h-3.5 text-amber-300" />
+                      <CheckCircle className="w-3.5 h-3.5 text-[#40E0D0]" />
                       <span>Agregar a Facturación</span>
                     </>
                   )}
@@ -3779,105 +4995,225 @@ export default function POSModule({
         </div>
       )}
 
-      {/* -------------------- MODAL FLOTANTE: FACTURAS EN ESPERA -------------------- */}
+      {/* -------------------- MODAL FLOTANTE: FORMULARIO DE FACTURAS EN ESPERA (STILO FRENYER) -------------------- */}
       {showDraftsListModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-xs p-4">
-          <div className="bg-white rounded-3xl border border-gray-100 w-full max-w-2xl shadow-2xl overflow-hidden text-left flex flex-col max-h-[85vh]">
-            {/* Modal Header */}
-            <div className="p-5 bg-gradient-to-r from-amber-500 to-amber-600 text-white flex justify-between items-center shrink-0">
-              <div className="flex items-center gap-3">
-                <div className="p-2.5 bg-white/20 rounded-2xl shrink-0">
-                  <Pause className="w-6 h-6 fill-white" />
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-3 sm:p-6 animate-fadeIn">
+          <div className="bg-white rounded-3xl border border-slate-200/90 w-full max-w-3xl shadow-2xl overflow-hidden text-left flex flex-col max-h-[90vh]">
+            
+            {/* Cabecera Estilo Frenyer */}
+            <div className="px-6 py-5 bg-white border-b border-slate-100 flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-3.5">
+                <div className="w-11 h-11 rounded-full bg-blue-50 border border-blue-200/80 flex items-center justify-center text-[#005da9] shadow-2xs shrink-0">
+                  <Pause className="w-5 h-5 text-[#005da9]" />
                 </div>
                 <div>
-                  <div className="flex items-center gap-2">
-                    <h3 className="text-base font-black uppercase tracking-tight">Facturas en Espera (Ventas Pausadas)</h3>
-                    <span className="px-2.5 py-0.5 bg-white/20 text-white text-[11px] font-black rounded-full">
-                      {draftInvoices.length}
+                  <div className="flex items-center gap-2.5">
+                    <h3 className="text-base font-montserrat font-extrabold text-[#1D3557] uppercase tracking-tight">
+                      Facturas en Espera
+                    </h3>
+                    <span className="px-2.5 py-0.5 bg-blue-50 text-[#005da9] border border-blue-200/80 rounded-full font-black text-xs font-mono shadow-2xs">
+                      {draftInvoices.length} {draftInvoices.length === 1 ? 'venta pausada' : 'ventas pausadas'}
                     </span>
                   </div>
-                  <p className="text-xs text-amber-100 font-medium mt-0.5">
-                    Seleccione una factura guardada en espera para recuperarla en la venta actual o descartarla.
+                  <p className="text-xs text-slate-500 font-medium mt-0.5">
+                    Ventas pausadas listas para recuperar en la caja o descartar definitivamente.
                   </p>
                 </div>
               </div>
               <button 
+                type="button"
                 onClick={() => setShowDraftsListModal(false)}
-                className="p-1.5 bg-white/10 hover:bg-white/20 text-white rounded-xl transition cursor-pointer"
+                className="w-9 h-9 rounded-full bg-white hover:bg-slate-50 text-slate-400 hover:text-[#1D3557] border border-slate-200/80 flex items-center justify-center transition shadow-2xs cursor-pointer"
+                title="Cerrar ventana"
               >
-                <X className="w-5 h-5" />
+                <X className="w-4 h-4" />
               </button>
             </div>
 
-            {/* Modal Content List */}
-            <div className="p-5 overflow-y-auto flex-1 bg-gray-50/50 space-y-3">
-              {draftInvoices.length === 0 ? (
-                <div className="py-12 text-center flex flex-col items-center justify-center space-y-2">
-                  <div className="p-3 bg-amber-50 text-amber-500 rounded-full">
-                    <Pause className="w-8 h-8 fill-amber-500" />
+            {/* Barra de Búsqueda y Herramientas Estilo Frenyer */}
+            <div className="px-6 py-3.5 bg-slate-50/70 border-b border-slate-200/70 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
+              <div className="relative w-full sm:w-80">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="text"
+                  value={draftSearchQuery}
+                  onChange={(e) => setDraftSearchQuery(e.target.value)}
+                  placeholder="Buscar por referencia (ESP-...), cliente o ítem..."
+                  className="w-full pl-9.5 pr-8 py-2 bg-white border border-slate-200/90 rounded-full text-xs text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-[#005da9] focus:ring-2 focus:ring-blue-100 transition shadow-2xs font-montserrat"
+                />
+                {draftSearchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setDraftSearchQuery('')}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 self-end sm:self-auto">
+                <button
+                  type="button"
+                  onClick={loadInvoiceData}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 bg-white hover:bg-slate-50 active:bg-slate-100 text-slate-600 font-montserrat font-bold text-xs rounded-full border border-slate-200/90 shadow-2xs hover:shadow-xs transition cursor-pointer"
+                  title="Actualizar listado de facturas en espera"
+                >
+                  <RefreshCw className={`w-3 h-3 text-[#005da9] ${isLoading ? 'animate-spin' : ''}`} />
+                  <span>Actualizar</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Lista de Facturas en Espera Estilo Frenyer */}
+            <div className="p-6 overflow-y-auto flex-1 bg-slate-50/40 space-y-3">
+              {filteredDraftInvoices.length === 0 ? (
+                <div className="py-14 text-center flex flex-col items-center justify-center space-y-3 bg-white rounded-2xl border border-slate-200/80 p-8">
+                  <div className="w-14 h-14 rounded-full bg-blue-50 border border-blue-200/80 flex items-center justify-center text-[#005da9] shadow-2xs">
+                    <Pause className="w-6 h-6 text-[#005da9]" />
                   </div>
-                  <p className="text-xs font-bold text-gray-700">No hay facturas en espera en este momento.</p>
-                  <p className="text-[10px] text-gray-400 max-w-xs">
-                    Cuando pause una venta con el botón "Poner en Espera", aparecerá en esta pantalla flotante.
-                  </p>
+                  <div className="space-y-1 max-w-sm">
+                    <p className="text-sm font-montserrat font-extrabold text-[#1D3557]">
+                      {draftSearchQuery ? 'No se encontraron facturas coincidentes' : 'No hay facturas en espera en este momento'}
+                    </p>
+                    <p className="text-xs text-slate-400 font-medium">
+                      {draftSearchQuery 
+                        ? 'Pruebe buscando con otro término, número de referencia o nombre de cliente.'
+                        : 'Para colocar una venta en espera y limpiar el carro, use el botón "Poner en Espera" en la tabla de productos o en la barra de cobro.'}
+                    </p>
+                  </div>
+                  {draftSearchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setDraftSearchQuery('')}
+                      className="px-4 py-1.5 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold rounded-full border border-slate-200 shadow-2xs transition"
+                    >
+                      Limpiar búsqueda
+                    </button>
+                  )}
                 </div>
               ) : (
-                <div className="space-y-2.5">
-                  {draftInvoices.map((draft) => {
-                    const totalItemsCount = draft.items?.reduce((sum: number, i: any) => sum + (i.qty || 1), 0) || 0;
+                <div className="space-y-3">
+                  {filteredDraftInvoices.map((draft) => {
+                    const totalItemsCount = draft.items?.reduce((sum: number, i: any) => sum + (Number(i.qty) || 1), 0) || 0;
+                    const effectiveRate = customBcvRate > 0 ? customBcvRate : (bcvRate > 0 ? bcvRate : (currencyRates?.VES || getCachedCurrencyRates().VES || 1));
+                    const totalVES = Number(draft.total || 0) * effectiveRate;
+                    const isExpanded = expandedDraftId === draft.id;
+
                     return (
                       <div 
                         key={draft.id} 
-                        className="bg-white border border-gray-200 hover:border-amber-400 rounded-2xl p-4 shadow-2xs transition flex flex-col sm:flex-row sm:items-center justify-between gap-3 group"
+                        className="bg-white border border-slate-200/90 hover:border-[#005da9]/40 rounded-2xl p-4.5 shadow-xs hover:shadow-md transition-all space-y-3"
                       >
-                        <div className="space-y-1">
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono font-black text-xs text-amber-800 bg-amber-50 border border-amber-200 px-2.5 py-0.5 rounded-lg">
+                        {/* Fila Superior: Referencia, Cliente, Fecha */}
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-2.5">
+                            <span className="px-3 py-1 bg-blue-50 text-[#005da9] border border-blue-200/90 rounded-full font-mono font-black text-xs shadow-2xs">
                               {draft.reference || 'ESP-XXXX'}
                             </span>
-                            <span className="font-extrabold text-gray-900 text-xs">
+                            <span className="font-montserrat font-bold text-xs text-[#1D3557] flex items-center gap-1.5">
+                              <User className="w-3.5 h-3.5 text-[#005da9]" />
                               {draft.customer_name || 'Consumidor final'}
                             </span>
                           </div>
-                          <div className="flex items-center gap-3 text-[11px] text-gray-400 font-medium">
-                            <span>📦 <strong className="text-gray-700">{totalItemsCount}</strong> ítem(s)</span>
-                            <span>•</span>
-                            <span>💳 <strong className="text-gray-700">{draft.payment_method || 'Efectivo'}</strong></span>
-                            <span>•</span>
-                            <span className="text-gray-400 text-[10px]">
-                              {draft.created_at ? new Date(draft.created_at).toLocaleTimeString('es-VE', { hour: '2-digit', minute: '2-digit' }) : 'Reciente'}
+
+                          <div className="flex items-center gap-1 text-[11px] text-slate-400 font-mono font-medium">
+                            <Clock className="w-3 h-3 text-slate-400" />
+                            <span>
+                              {draft.created_at ? new Date(draft.created_at).toLocaleString('es-VE', { 
+                                dateStyle: 'short', 
+                                timeStyle: 'short' 
+                              }) : 'Reciente'}
                             </span>
                           </div>
                         </div>
 
-                        <div className="flex items-center justify-between sm:justify-end gap-3 shrink-0 pt-2 sm:pt-0 border-t sm:border-0 border-gray-100">
-                          <div className="text-left sm:text-right">
-                            <span className="text-[9px] text-gray-400 font-bold uppercase block leading-none">Monto Total</span>
-                            <span className="text-sm font-black text-[#005da9]">
-                              ${Number(draft.total || 0).toFixed(2)}
+                        {/* Fila Media: Badges de Ítems, Método y Montos */}
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1 border-t border-slate-100">
+                          <div className="flex flex-wrap items-center gap-2 text-xs">
+                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-slate-50 border border-slate-200/80 rounded-full text-slate-600 font-medium text-[11px]">
+                              <ShoppingBag className="w-3 h-3 text-slate-500" />
+                              <strong className="font-bold text-slate-800">{totalItemsCount}</strong> {totalItemsCount === 1 ? 'ítem' : 'ítems'}
                             </span>
-                          </div>
-
-                          <div className="flex items-center gap-1.5">
+                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-slate-50 border border-slate-200/80 rounded-full text-slate-600 font-medium text-[11px]">
+                              <CreditCard className="w-3 h-3 text-slate-500" />
+                              <span className="truncate max-w-[180px] font-bold text-slate-800">{draft.payment_method || 'Al contado'}</span>
+                            </span>
                             <button
-                              onClick={() => {
-                                handleResumeDraft(draft);
-                                setShowDraftsListModal(false);
-                              }}
-                              className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-xs rounded-xl transition flex items-center gap-1.5 shadow-xs cursor-pointer"
+                              type="button"
+                              onClick={() => setExpandedDraftId(isExpanded ? null : draft.id)}
+                              className="inline-flex items-center gap-1 text-[11px] font-bold text-[#005da9] hover:underline cursor-pointer select-none ml-1"
                             >
-                              <Play className="w-3.5 h-3.5 fill-white" />
-                              <span>Recuperar</span>
-                            </button>
-
-                            <button
-                              onClick={() => handleDeleteDraft(draft.id, draft.reference)}
-                              className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-50 rounded-xl transition cursor-pointer"
-                              title="Eliminar factura en espera"
-                            >
-                              <Trash2 className="w-4 h-4" />
+                              <span>{isExpanded ? 'Ocultar detalle' : 'Ver productos'}</span>
+                              {isExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                             </button>
                           </div>
+
+                          <div className="flex items-baseline justify-between sm:justify-end gap-3 shrink-0">
+                            <div className="text-left sm:text-right">
+                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block leading-none">
+                                Total Venta
+                              </span>
+                              <div className="flex items-baseline gap-1.5 mt-0.5">
+                                <span className="text-base font-mono font-black text-[#1D3557]">
+                                  ${Number(draft.total || 0).toFixed(2)}
+                                </span>
+                                <span className="text-xs font-mono font-bold text-slate-500">
+                                  (Bs. {totalVES.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Vista Acordeón Expandible de Productos */}
+                        {isExpanded && draft.items && draft.items.length > 0 && (
+                          <div className="mt-2 pt-2 border-t border-slate-100 bg-slate-50/70 p-3 rounded-xl space-y-1.5">
+                            <span className="text-[10px] font-montserrat font-bold text-slate-500 uppercase tracking-wider block">
+                              Detalle de Productos ({draft.items.length})
+                            </span>
+                            <div className="space-y-1">
+                              {draft.items.map((item: any, idx: number) => (
+                                <div key={idx} className="flex items-center justify-between text-xs py-1 border-b border-slate-200/50 last:border-0">
+                                  <div className="flex items-center gap-2 min-w-0 pr-2">
+                                    <span className="font-mono text-[10px] bg-white border border-slate-200 px-1.5 py-0.5 rounded text-slate-600 shrink-0">
+                                      {item.sku || 'S/SKU'}
+                                    </span>
+                                    <span className="truncate font-medium text-slate-800 text-[11px]">{item.name}</span>
+                                    <span className="text-slate-400 text-[10px]">x{item.qty}</span>
+                                  </div>
+                                  <span className="font-mono font-bold text-[#1D3557] text-[11px] shrink-0">
+                                    ${Number(item.total || (item.price * item.qty) || 0).toFixed(2)}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Botones de Acción */}
+                        <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              handleResumeDraft(draft);
+                              setShowDraftsListModal(false);
+                            }}
+                            className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-xs rounded-xl transition flex items-center gap-1.5 shadow-xs cursor-pointer"
+                            title="Recuperar esta factura en el carrito de la venta"
+                          >
+                            <Play className="w-3.5 h-3.5 fill-white" />
+                            <span>Recuperar</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteDraft(draft.id, draft.reference)}
+                            className="p-1.5 text-rose-500 hover:text-rose-700 hover:bg-rose-50 rounded-xl transition cursor-pointer"
+                            title="Eliminar factura en espera permanentemente"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
                         </div>
                       </div>
                     );
@@ -3886,49 +5222,67 @@ export default function POSModule({
               )}
             </div>
 
-            {/* Modal Footer */}
-            <div className="p-4 bg-gray-50 border-t border-gray-100 flex justify-end">
+            {/* Modal Footer Estilo Frenyer */}
+            <div className="px-6 py-4 bg-white border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
+              <div className="text-xs text-slate-500 font-medium">
+                {filteredDraftInvoices.length > 0 && (
+                  <div className="flex items-center gap-1.5">
+                    <span>Total acumulado en espera:</span>
+                    <strong className="font-mono font-bold text-[#1D3557]">
+                      ${filteredDraftInvoices.reduce((sum, d) => sum + (Number(d.total) || 0), 0).toFixed(2)}
+                    </strong>
+                    <span className="text-slate-400 text-[11px] font-mono">
+                      (Bs. {(filteredDraftInvoices.reduce((sum, d) => sum + (Number(d.total) || 0), 0) * (customBcvRate > 0 ? customBcvRate : (bcvRate > 0 ? bcvRate : (currencyRates?.VES || getCachedCurrencyRates().VES || 1)))).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                    </span>
+                  </div>
+                )}
+              </div>
+
               <button
+                type="button"
                 onClick={() => setShowDraftsListModal(false)}
-                className="px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 font-bold text-xs rounded-xl transition cursor-pointer"
+                className="inline-flex items-center justify-center gap-1.5 px-6 py-2.5 bg-white hover:bg-slate-50 active:bg-slate-100 text-slate-700 font-montserrat font-bold text-xs rounded-full border border-slate-200/90 shadow-xs hover:shadow-md transition cursor-pointer select-none"
               >
-                Cerrar
+                <X className="w-3.5 h-3.5 text-[#005da9]" />
+                <span>Cerrar</span>
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* -------------------- MODAL DE CONFIRMACIÓN: ELIMINAR FACTURA EN ESPERA -------------------- */}
+      {/* -------------------- MODAL DE CONFIRMACIÓN: ELIMINAR FACTURA EN ESPERA (STILO FRENYER) -------------------- */}
       {draftToDelete && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-fadeIn">
-          <div className="bg-white rounded-3xl border border-gray-100 max-w-md w-full p-6 shadow-2xl text-left space-y-4">
-            <div className="flex items-center gap-3 text-rose-600">
-              <div className="p-3 bg-rose-50 rounded-2xl shrink-0">
-                <Trash2 className="w-6 h-6" />
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4 animate-fadeIn">
+          <div className="bg-white rounded-3xl border border-slate-200/90 max-w-md w-full p-6 shadow-2xl text-left space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="w-12 h-12 rounded-full bg-rose-50 border border-rose-200/80 flex items-center justify-center text-rose-600 shadow-2xs shrink-0">
+                <Trash2 className="w-6 h-6 text-rose-600" />
               </div>
               <div>
-                <h3 className="text-base font-black text-gray-900 uppercase tracking-tight">¿Eliminar Factura en Espera?</h3>
-                <p className="text-xs text-gray-500 font-medium">Confirmación de eliminación</p>
+                <h3 className="text-base font-montserrat font-extrabold text-[#1D3557] uppercase tracking-tight">
+                  ¿Eliminar Factura en Espera?
+                </h3>
+                <p className="text-xs text-slate-500 font-medium">Esta acción no se puede deshacer</p>
               </div>
             </div>
 
-            <p className="text-xs text-gray-600 font-medium leading-relaxed bg-rose-50/50 p-3.5 rounded-2xl border border-rose-100/80">
-              ¿Está seguro de que desea eliminar permanentemente la factura en espera con referencia <strong className="text-rose-700 font-extrabold">{draftToDelete.ref}</strong>? Esta acción no se puede deshacer.
+            <p className="text-xs text-slate-600 font-medium leading-relaxed bg-rose-50/50 p-4 rounded-2xl border border-rose-100/80">
+              ¿Está seguro de que desea eliminar permanentemente la factura en espera con referencia <strong className="text-rose-700 font-mono font-black">{draftToDelete.ref}</strong>?
             </p>
 
-            <div className="flex items-center justify-end gap-2 pt-2">
+            <div className="flex items-center justify-end gap-2.5 pt-2">
               <button
                 type="button"
                 onClick={() => setDraftToDelete(null)}
-                className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold rounded-xl transition cursor-pointer"
+                className="px-5 py-2.5 bg-white hover:bg-slate-50 text-slate-700 font-montserrat font-bold text-xs rounded-full border border-slate-200/90 shadow-xs hover:shadow-md transition cursor-pointer"
               >
                 Cancelar
               </button>
               <button
                 type="button"
                 onClick={confirmDeleteDraft}
-                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white text-xs font-black rounded-xl transition shadow-xs cursor-pointer flex items-center gap-1.5"
+                className="px-5 py-2.5 bg-white hover:bg-rose-50 active:bg-rose-100 text-rose-600 font-montserrat font-black text-xs rounded-full border border-rose-200 shadow-xs hover:shadow-md transition cursor-pointer flex items-center gap-1.5"
               >
                 <Trash2 className="w-3.5 h-3.5" />
                 <span>Sí, Eliminar</span>
@@ -4066,7 +5420,7 @@ export default function POSModule({
                     <input
                       type="text"
                       disabled
-                      value={manualAmountBs.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      value={(Number(manualAmountBs) || 0).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                       className="w-full pl-9 pr-3.5 py-2.5 bg-gray-100 border border-gray-200 rounded-xl text-xs font-black text-gray-500 focus:outline-none"
                     />
                   </div>
@@ -4192,7 +5546,7 @@ export default function POSModule({
                 </div>
                 {gastoAmount && !isNaN(parseFloat(gastoAmount)) && parseFloat(gastoAmount) > 0 && (
                   <span className="text-[10px] text-amber-700 font-extrabold block mt-1">
-                    Equivalente: Bs. {(parseFloat(gastoAmount) * bcvRate).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    Equivalente: Bs. {((parseFloat(gastoAmount) || 0) * (bcvRate || 1)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </span>
                 )}
               </div>
@@ -4244,7 +5598,7 @@ export default function POSModule({
       {showCreateProductModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-fadeIn">
           <div className="bg-white rounded-3xl border border-gray-100 max-w-lg w-full overflow-hidden shadow-2xl text-left flex flex-col">
-            <div className="p-5 bg-[#005da9] text-white flex justify-between items-center shrink-0">
+            <div className="p-5 bg-[#1D3557] text-white flex justify-between items-center shrink-0">
               <div className="flex items-center gap-3">
                 <div className="p-2.5 bg-white/20 rounded-2xl shrink-0">
                   <PackagePlus className="w-6 h-6 text-white" />
@@ -4385,12 +5739,12 @@ export default function POSModule({
                 <button
                   type="submit"
                   disabled={isSavingProduct}
-                  className="px-4 py-2 bg-[#005da9] hover:bg-[#004b87] text-white font-extrabold text-xs rounded-xl shadow-md transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  className="px-4 py-2 bg-gradient-to-r from-[#40E0D0] to-[#00BFFF] hover:from-[#36cebe] hover:to-[#00a3da] text-[#1D3557] font-extrabold text-xs rounded-xl shadow-md transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
                 >
                   {isSavingProduct ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-[#1D3557]" />
                   ) : (
-                    <CheckCircle className="w-3.5 h-3.5 text-amber-300" />
+                    <CheckCircle className="w-3.5 h-3.5 text-[#1D3557]" />
                   )}
                   <span>Guardar y Agregar a Venta</span>
                 </button>
@@ -4405,7 +5759,7 @@ export default function POSModule({
           <div className="bg-white rounded-3xl border border-gray-100 max-w-4xl w-full max-h-[90vh] overflow-hidden shadow-2xl text-left flex flex-col">
             
             {/* Header del Modal */}
-            <div className="p-4 md:p-5 bg-gradient-to-r from-[#005da9] via-blue-700 to-blue-800 text-white flex justify-between items-center shrink-0 shadow-md">
+            <div className="p-4 md:p-5 bg-gradient-to-r from-[#1D3557] to-[#122238] text-white flex justify-between items-center shrink-0 shadow-md">
               <div className="flex items-center gap-3">
                 <div className="p-2.5 bg-white/20 rounded-2xl shrink-0 backdrop-blur-xs">
                   <FileText className="w-6 h-6 text-white" />
@@ -4475,7 +5829,7 @@ export default function POSModule({
                     onClick={() => setHistoryTypeFilter('todos')}
                     className={`px-3 py-1.5 rounded-lg text-xs font-extrabold transition-all cursor-pointer flex items-center gap-1.5 ${
                       historyTypeFilter === 'todos'
-                        ? 'bg-[#005da9] text-white shadow-xs'
+                        ? 'bg-gradient-to-r from-[#40E0D0] to-[#00BFFF] text-[#1D3557] shadow-xs'
                         : 'text-gray-600 hover:bg-gray-100'
                     }`}
                   >
@@ -4581,7 +5935,7 @@ export default function POSModule({
                         setHistorySearchQuery('');
                         setHistoryTypeFilter('todos');
                       }}
-                      className="mt-2 px-4 py-2 bg-[#005da9] hover:bg-[#004b87] text-white font-extrabold text-xs rounded-xl shadow-xs transition cursor-pointer"
+                      className="mt-2 px-4 py-2 bg-gradient-to-r from-[#40E0D0] to-[#00BFFF] hover:from-[#36cebe] hover:to-[#00a3da] text-[#1D3557] font-extrabold text-xs rounded-xl shadow-xs transition cursor-pointer"
                     >
                       Mostrar Todos los Comprobantes
                     </button>
@@ -4607,8 +5961,8 @@ export default function POSModule({
                         const docRef = inv.customer_id || inv.customer_document || inv.rif || inv.document || '';
                         
                         return (
-                          <tr key={inv.id || inv.control_number} className="hover:bg-blue-50/30 transition-colors">
-                            <td className="p-3 font-mono font-black text-[#005da9] text-xs">
+                          <tr key={inv.id || inv.control_number} className="hover:bg-cyan-50/30 transition-colors">
+                            <td className="p-3 font-mono font-black text-[#1D3557] text-xs">
                               {inv.control_number || 'S/N'}
                             </td>
                             <td className="p-3">
@@ -4653,8 +6007,19 @@ export default function POSModule({
                             </td>
                             <td className="p-3 text-center">
                               <button 
-                                onClick={() => {
+                                onClick={async () => {
                                   setCompletedInvoice(inv);
+                                  try {
+                                    const fresh = await dbService.getInvoiceByControlOrId(inv.control_number || inv.id);
+                                    if (fresh && fresh.items && fresh.items.length > 0) {
+                                      const isFallback = (fresh.items[0]?.sku === 'VENTA-FLASH' || (fresh.items[0]?.name && fresh.items[0].name.toLowerCase().includes('venta flash -')));
+                                      if (!isFallback || (!inv.items || inv.items.length === 0)) {
+                                        setCompletedInvoice(fresh);
+                                      }
+                                    }
+                                  } catch (e) {
+                                    // Keep existing invoice
+                                  }
                                 }}
                                 className="px-2.5 py-1.5 bg-blue-50 text-[#005da9] hover:bg-blue-600 hover:text-white rounded-xl transition-all inline-flex items-center gap-1 text-[11px] font-black cursor-pointer shadow-2xs"
                                 title="Ver detalle completo y reimprimir"
@@ -4892,6 +6257,1594 @@ export default function POSModule({
           }}
         />
       )}
+
+      {/* 🧙‍♂️ WIZARD CHECKOUT INLINE */}
+      <AnimatePresence>
+        {showCheckoutWizard && (
+          <div className="w-full max-w-6xl mx-auto font-montserrat mt-4">
+            <motion.div 
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 15 }}
+              className="bg-[#F8F9FA] rounded-[32px] border border-[#1D3557]/15 w-full shadow-sm overflow-hidden flex flex-col relative text-left"
+            >
+              {/* Back Link / Header Area */}
+              <div className="p-4 md:px-8 md:pt-5 pb-3 flex items-center justify-between border-b border-gray-100 bg-white">
+                <button
+                  type="button"
+                  onClick={() => setShowCheckoutWizard(false)}
+                  className="text-xs font-black text-[#1D3557] hover:text-[#005da9] flex items-center gap-1.5 transition cursor-pointer"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                  <span>Volver a ventas directa</span>
+                </button>
+                <span className="text-xs font-black text-gray-400 uppercase tracking-wider">
+                  Módulo de Cobranza
+                </span>
+              </div>
+
+              {/* Multi-Step Progress Stepper (Header) */}
+              <div className="bg-white px-5 py-4 border-b border-gray-100">
+                <div className="flex items-center justify-center max-w-md mx-auto relative h-10">
+                  <div className="absolute left-0 right-0 top-1/2 h-[2px] bg-gray-100 -translate-y-1/2 z-0" />
+                  <div 
+                    className="absolute left-0 top-1/2 h-[2px] bg-[#005da9] -translate-y-1/2 z-0 transition-all duration-300" 
+                    style={{ width: wizardStep === 1 ? '0%' : wizardStep === 2 ? '50%' : '100%' }}
+                  />
+                  
+                  <div className="flex justify-between w-full relative z-10">
+                    {/* Step 1: Datos del Cliente */}
+                    <div className="flex flex-col items-center">
+                      <button
+                        type="button"
+                        onClick={() => wizardStep > 1 && setWizardStep(1)}
+                        className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-black transition-all duration-300 ${
+                          wizardStep >= 1 ? 'bg-[#005da9] text-white ring-4 ring-[#005da9]/20' : 'bg-gray-100 text-gray-400'
+                        }`}
+                      >
+                        {wizardStep > 1 ? <Check className="w-3.5 h-3.5 stroke-[3]" /> : '1'}
+                      </button>
+                      <span className="text-[10px] font-black mt-1 text-gray-500 bg-white px-1.5">Datos del Cliente</span>
+                    </div>
+
+                    {/* Step 2: Métodos de Pago */}
+                    <div className="flex flex-col items-center">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (wizardStep > 2) setWizardStep(2);
+                          else if (wizardStep === 1 && wizardSelectedClientObj) setWizardStep(2);
+                        }}
+                        className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-black transition-all duration-300 ${
+                          wizardStep >= 2 ? 'bg-[#005da9] text-white ring-4 ring-[#005da9]/20' : 'bg-gray-100 text-gray-400'
+                        }`}
+                      >
+                        {wizardStep > 2 ? <Check className="w-3.5 h-3.5 stroke-[3]" /> : '2'}
+                      </button>
+                      <span className="text-[10px] font-black mt-1 text-gray-500 bg-white px-1.5">Métodos de Pago</span>
+                    </div>
+
+                    {/* Step 3: Resumen */}
+                    <div className="flex flex-col items-center">
+                      <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-black transition-all duration-300 ${
+                        wizardStep === 3 ? 'bg-[#005da9] text-white ring-4 ring-[#005da9]/20' : 'bg-gray-100 text-gray-400'
+                      }`}>
+                        3
+                      </div>
+                      <span className="text-[10px] font-black mt-1 text-gray-500 bg-white px-1.5">Resumen</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Main Content (Scrollable Area) */}
+              <div className="p-6 md:p-8 overflow-y-auto flex-1 max-h-[65vh]">
+                
+                {/* -------------------- STEP 1: DATOS DEL CLIENTE (SIMPLIFICADO) -------------------- */}
+                {wizardStep === 1 && (
+                  <div className="space-y-5 max-w-2xl mx-auto">
+                    {/* 1. PESTAÑAS DE MODO (ARRIBA) */}
+                    <div className="grid grid-cols-2 gap-2 bg-gray-100 p-1.5 rounded-2xl max-w-xs mx-auto border border-gray-200/60 shadow-3xs">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setWizardIsNewClient(false);
+                          if (!wizardSelectedClientObj || !wizardSelectedClientObj.name) {
+                            const cf = {
+                              id: 'cf',
+                              name: 'Consumidor final',
+                              document: 'V-99999999',
+                              email: '',
+                              phone: '',
+                              address: 'Mostrador',
+                              credit_usd: 0
+                            };
+                            setWizardSelectedClientObj(cf);
+                            setSelectedClient('Consumidor final');
+                          }
+                          setWizardClientSearchQuery('');
+                          setShowWizardSuggestions(false);
+                        }}
+                        className={`py-2 px-3 text-xs font-black uppercase tracking-wider rounded-xl transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                          !wizardIsNewClient 
+                            ? 'bg-white text-[#1D3557] shadow-sm font-black' 
+                            : 'text-gray-500 hover:text-gray-700'
+                        }`}
+                      >
+                        <Users className="w-3.5 h-3.5" />
+                        <span>Buscar Cliente</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setWizardIsNewClient(true);
+                          setWizardSelectedClientObj({
+                            name: '',
+                            document: '',
+                            email: '',
+                            phone: '',
+                            address: '',
+                            credit_usd: 0
+                          });
+                          setWizardClientSearchQuery('');
+                          setShowWizardSuggestions(false);
+                        }}
+                        className={`py-2 px-3 text-xs font-black uppercase tracking-wider rounded-xl transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                          wizardIsNewClient 
+                            ? 'bg-[#005da9] text-white shadow-sm font-black' 
+                            : 'text-gray-500 hover:text-gray-700'
+                        }`}
+                      >
+                        <UserPlus className="w-3.5 h-3.5" />
+                        <span>+ Nuevo Cliente</span>
+                      </button>
+                    </div>
+
+                    {/* 2. BÚSQUEDA ÚNICA Y ACCESO DIRECTO (SEARCHBAR INTELIGENTE) */}
+                    {!wizardIsNewClient && (
+                      <div className="relative">
+                        <div className="relative flex items-center">
+                          <Search className="w-4 h-4 text-[#005da9] absolute left-3.5 pointer-events-none" />
+                          <input
+                            type="text"
+                            value={wizardClientSearchQuery}
+                            onFocus={() => setShowWizardSuggestions(true)}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setWizardClientSearchQuery(val);
+                              setShowWizardSuggestions(true);
+                            }}
+                            className="w-full pl-10 pr-10 py-3 bg-white border border-gray-200 rounded-2xl text-xs font-bold text-[#2B2D42] placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] transition shadow-2xs"
+                            placeholder="🔍 Buscar cliente por Cédula, RIF, Nombre o Teléfono..."
+                          />
+                          {wizardClientSearchQuery && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setWizardClientSearchQuery('');
+                              }}
+                              className="absolute right-3.5 p-1 text-gray-400 hover:text-gray-600 rounded-lg"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+
+                        {/* Desplegable Autocomplete / Combobox */}
+                        {showWizardSuggestions && (
+                          <>
+                            {/* Backdrop to close suggestions on click outside */}
+                            <div 
+                              className="fixed inset-0 z-40" 
+                              onClick={() => setShowWizardSuggestions(false)} 
+                            />
+                            <div className="absolute z-50 left-0 right-0 mt-1.5 bg-white border border-gray-200 rounded-2xl shadow-xl max-h-60 overflow-y-auto divide-y divide-gray-100 text-xs">
+                              {/* Opción Rápida Consumidor Final */}
+                              {(!wizardClientSearchQuery || 'consumidor final'.includes(wizardClientSearchQuery.toLowerCase()) || 'v-99999999'.includes(wizardClientSearchQuery.toLowerCase())) && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const cf = {
+                                      id: 'cf',
+                                      name: 'Consumidor final',
+                                      document: 'V-99999999',
+                                      email: '',
+                                      phone: '',
+                                      address: 'Mostrador',
+                                      credit_usd: 0
+                                    };
+                                    setWizardSelectedClientObj(cf);
+                                    setSelectedClient('Consumidor final');
+                                    setWizardClientSearchQuery('');
+                                    setShowWizardSuggestions(false);
+                                  }}
+                                  className="w-full px-4 py-2.5 text-left hover:bg-[#005da9]/5 text-[#1D3557] font-bold transition flex items-center justify-between"
+                                >
+                                  <div>
+                                    <span className="block font-black text-[#1D3557]">★ Consumidor final</span>
+                                    <span className="block text-[10px] text-gray-400 font-mono">V-99999999 • Mostrador</span>
+                                  </div>
+                                  <span className="text-[10px] font-bold text-gray-400">Predeterminado</span>
+                                </button>
+                              )}
+
+                              {/* Clientes Filtrados */}
+                              {clients
+                                .filter((c) => {
+                                  if (!wizardClientSearchQuery.trim()) return true;
+                                  const q = wizardClientSearchQuery.toLowerCase();
+                                  return (
+                                    (c.name || '').toLowerCase().includes(q) ||
+                                    (c.document || '').toLowerCase().includes(q) ||
+                                    (c.phone || '').toLowerCase().includes(q)
+                                  );
+                                })
+                                .slice(0, 15)
+                                .map((c) => (
+                                  <button
+                                    key={c.id}
+                                    type="button"
+                                    onClick={() => {
+                                      setWizardSelectedClientObj(c);
+                                      setSelectedClient(c.name);
+                                      setWizardClientSearchQuery('');
+                                      setShowWizardSuggestions(false);
+                                    }}
+                                    className="w-full px-4 py-2.5 text-left hover:bg-[#005da9]/5 text-[#2B2D42] font-bold transition flex justify-between items-center"
+                                  >
+                                    <div>
+                                      <span className="block text-gray-900 font-extrabold">{c.name}</span>
+                                      <span className="block text-[10px] text-gray-400 font-mono mt-0.5">
+                                        {c.document || 'Sin Doc'} {c.phone ? `• ${c.phone}` : ''}
+                                      </span>
+                                    </div>
+                                    {c.credit_usd > 0 && (
+                                      <span className="px-2 py-0.5 bg-rose-50 text-rose-700 text-[10px] font-black rounded-lg border border-rose-100 shrink-0">
+                                        Deuda: ${c.credit_usd.toFixed(2)}
+                                      </span>
+                                    )}
+                                  </button>
+                                ))}
+
+                              {/* Si no hay clientes coincidentes o botón para registrar nuevo al final */}
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setWizardIsNewClient(true);
+                                  setWizardSelectedClientObj({
+                                    name: wizardClientSearchQuery.trim(),
+                                    document: '',
+                                    email: '',
+                                    phone: '',
+                                    address: '',
+                                    credit_usd: 0
+                                  });
+                                  setWizardClientSearchQuery('');
+                                  setShowWizardSuggestions(false);
+                                }}
+                                className="w-full px-4 py-3 text-left hover:bg-blue-50 text-[#005da9] font-black transition flex items-center gap-2 bg-gray-50/60"
+                              >
+                                <UserPlus className="w-3.5 h-3.5" />
+                                <span>
+                                  {wizardClientSearchQuery.trim() 
+                                    ? `+ Registrar "${wizardClientSearchQuery.trim()}" como nuevo cliente`
+                                    : '+ Registrar nuevo cliente'
+                                  }
+                                </span>
+                              </button>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
+
+                    {/* 3. FICHA DE DATOS ÚNICA (FORMULARIO DIRECTO EN 2 COLUMNAS) */}
+                    <div className="bg-white border border-gray-200/80 rounded-2xl p-5 shadow-2xs space-y-4">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                        {/* Columna Izquierda: Cédula / RIF * */}
+                        <div>
+                          <label className="block text-[11px] font-black text-[#1D3557] uppercase tracking-wider mb-1">
+                            Cédula / RIF *
+                          </label>
+                          <input
+                            type="text"
+                            value={wizardSelectedClientObj?.document || ''}
+                            onChange={(e) => {
+                              const doc = e.target.value;
+                              setWizardSelectedClientObj((prev: any) => ({ ...(prev || {}), document: doc }));
+                            }}
+                            className="w-full px-3.5 py-2.5 bg-white border border-gray-200 focus:border-[#005da9] focus:ring-2 focus:ring-[#005da9]/20 rounded-xl text-xs font-mono font-bold text-[#2B2D42] transition outline-none"
+                            placeholder="Ej: V-12345678 o J-12345678-0"
+                          />
+                        </div>
+
+                        {/* Columna Derecha: Nombre / Razón Social * */}
+                        <div>
+                          <label className="block text-[11px] font-black text-[#1D3557] uppercase tracking-wider mb-1">
+                            Nombre / Razón Social *
+                          </label>
+                          <input
+                            type="text"
+                            value={wizardSelectedClientObj?.name || ''}
+                            onChange={(e) => {
+                              const nom = e.target.value;
+                              setWizardSelectedClientObj((prev: any) => ({ ...(prev || {}), name: nom }));
+                              setSelectedClient(nom);
+                            }}
+                            className="w-full px-3.5 py-2.5 bg-white border border-gray-200 focus:border-[#005da9] focus:ring-2 focus:ring-[#005da9]/20 rounded-xl text-xs font-bold text-[#2B2D42] transition outline-none"
+                            placeholder="Ej: Juan Pérez o Inversiones Alva C.A."
+                          />
+                        </div>
+
+                        {/* Columna Izquierda: Teléfono (Opcional) */}
+                        <div>
+                          <label className="block text-[11px] font-black text-gray-500 uppercase tracking-wider mb-1">
+                            Teléfono (Opcional)
+                          </label>
+                          <input
+                            type="text"
+                            value={wizardSelectedClientObj?.phone || ''}
+                            onChange={(e) => {
+                              const tel = e.target.value;
+                              setWizardSelectedClientObj((prev: any) => ({ ...(prev || {}), phone: tel }));
+                            }}
+                            className="w-full px-3.5 py-2.5 bg-white border border-gray-200 focus:border-[#005da9] focus:ring-2 focus:ring-[#005da9]/20 rounded-xl text-xs font-mono font-bold text-[#2B2D42] transition outline-none"
+                            placeholder="Ej: 04125556677"
+                          />
+                        </div>
+
+                        {/* Columna Derecha: Correo Electrónico (Opcional) */}
+                        <div>
+                          <label className="block text-[11px] font-black text-gray-500 uppercase tracking-wider mb-1">
+                            Correo Electrónico (Opcional)
+                          </label>
+                          <input
+                            type="text"
+                            value={wizardSelectedClientObj?.email || ''}
+                            onChange={(e) => {
+                              const mail = e.target.value;
+                              setWizardSelectedClientObj((prev: any) => ({ ...(prev || {}), email: mail }));
+                            }}
+                            className="w-full px-3.5 py-2.5 bg-white border border-gray-200 focus:border-[#005da9] focus:ring-2 focus:ring-[#005da9]/20 rounded-xl text-xs font-bold text-[#2B2D42] transition outline-none"
+                            placeholder="ejemplo@correo.com"
+                          />
+                        </div>
+
+                        {/* Fila Completa: Dirección Fiscal (Opcional) */}
+                        <div className="md:col-span-2">
+                          <label className="block text-[11px] font-black text-gray-500 uppercase tracking-wider mb-1">
+                            Dirección Fiscal (Opcional)
+                          </label>
+                          <input
+                            type="text"
+                            value={wizardSelectedClientObj?.address || ''}
+                            onChange={(e) => {
+                              const dir = e.target.value;
+                              setWizardSelectedClientObj((prev: any) => ({ ...(prev || {}), address: dir }));
+                            }}
+                            className="w-full px-3.5 py-2.5 bg-white border border-gray-200 focus:border-[#005da9] focus:ring-2 focus:ring-[#005da9]/20 rounded-xl text-xs font-bold text-[#2B2D42] transition outline-none"
+                            placeholder="Dirección fiscal o habitacional..."
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Aviso sutil de deuda pendiente */}
+                    {wizardSelectedClientObj && Number(wizardSelectedClientObj.credit_usd || 0) > 0 && (
+                      <div className="p-3.5 bg-rose-50 border border-rose-100 rounded-2xl flex items-center gap-2.5 text-rose-800 text-xs font-bold">
+                        <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                        <div>
+                          Este cliente posee un saldo deudor pendiente de <span className="font-mono font-black text-rose-950">${Number(wizardSelectedClientObj.credit_usd).toFixed(2)} USD</span> en cuenta corriente.
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* -------------------- STEP 2: MÉTODOS DE PAGO -------------------- */}
+                {wizardStep === 2 && (
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start max-w-6xl mx-auto">
+                    
+                    {/* LEFT COLUMN: RESUMEN (lg:col-span-5) - Image 1 */}
+                    <div className="lg:col-span-5 space-y-4">
+                      <div className="bg-white border border-gray-200 rounded-3xl p-6 shadow-2xs space-y-4">
+                        <div className="text-xs font-black uppercase tracking-wider text-gray-400 pb-2 border-b border-gray-100">
+                          Resumen:
+                        </div>
+
+                        {/* Breakdown values with VES conversion */}
+                        <div className="space-y-2.5 text-xs font-bold text-gray-600">
+                          <div className="flex justify-between items-center">
+                            <span>Subtotal:</span>
+                            <div className="text-right">
+                              <span className="font-mono text-gray-900 font-bold">${subtotal.toFixed(2)}</span>
+                              <span className="font-mono text-gray-800 text-xs sm:text-sm font-black ml-1.5">
+                                (Bs. {(subtotal * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="flex justify-between items-center text-emerald-600">
+                            <span>Descuento:</span>
+                            <div className="text-right">
+                              <span className="font-mono font-black">-${calculatedDiscountUsd.toFixed(2)}</span>
+                              <span className="font-mono text-emerald-700 text-xs sm:text-sm font-black ml-1.5">
+                                (Bs. {(calculatedDiscountUsd * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="flex justify-between items-center">
+                            <span>Cargos extras:</span>
+                            <div className="text-right">
+                              <span className="font-mono text-gray-900 font-bold">+${extraChargesTotal.toFixed(2)}</span>
+                              <span className="font-mono text-gray-800 text-xs sm:text-sm font-black ml-1.5">
+                                (Bs. {(extraChargesTotal * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* IVA / Tipo de impuesto dinámico según producto */}
+                          {taxItemsSummary.map((taxItem, tIdx) => (
+                            <div key={tIdx} className="flex justify-between items-center">
+                              <span>{taxItem.label}</span>
+                              <div className="text-right">
+                                <span className="font-mono text-gray-900 font-bold">${taxItem.amountUsd.toFixed(2)}</span>
+                                <span className="font-mono text-gray-800 text-xs sm:text-sm font-black ml-1.5">
+                                  (Bs. {taxItem.amountVes.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+
+                          {hasUsdPayment && (
+                            <div className="flex justify-between items-center">
+                              <span>IGTF 3%:</span>
+                              <div className="text-right">
+                                <span className="font-mono text-gray-900 font-bold">${calculatedIgtfUsd.toFixed(2)}</span>
+                                <span className="font-mono text-gray-800 text-xs sm:text-sm font-black ml-1.5">
+                                  (Bs. {(calculatedIgtfUsd * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                                </span>
+                              </div>
+                            </div>
+                          )}
+
+                          <div className="pt-3 border-t border-gray-100 flex justify-between items-center text-sm font-black text-gray-900">
+                            <span>Total a pagar:</span>
+                            <div className="text-right">
+                              <span className="block font-mono text-xl font-black text-[#005da9]">${total.toFixed(2)}</span>
+                              <span className="block font-mono text-sm sm:text-base font-black text-gray-900 mt-0.5">
+                                Bs. {(total * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Botones de acción del lado del resumen: Descuento y Aplicar cargos */}
+                        <div className="pt-3 border-t border-gray-100 grid grid-cols-2 gap-2.5">
+                          <button
+                            type="button"
+                            onClick={() => setShowDiscountSection(prev => !prev)}
+                            className={`py-2.5 px-3 rounded-2xl border font-black text-xs transition-all duration-200 flex items-center justify-center gap-1.5 cursor-pointer shadow-3xs ${
+                              showDiscountSection || calculatedDiscountUsd > 0
+                                ? 'bg-[#005da9]/10 border-[#005da9] text-[#005da9]'
+                                : 'bg-[#F8F9FA] hover:bg-gray-100 border-gray-200 text-[#1D3557]'
+                            }`}
+                          >
+                            <Percent className="w-3.5 h-3.5" />
+                            <span>Descuento</span>
+                            {calculatedDiscountUsd > 0 && (
+                              <span className="ml-1 text-[10px] bg-[#005da9] text-white px-1.5 py-0.5 rounded-full font-mono font-bold">
+                                -${calculatedDiscountUsd.toFixed(2)}
+                              </span>
+                            )}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => setShowExtraChargeModal(true)}
+                            className={`py-2.5 px-3 rounded-2xl border font-black text-xs transition-all duration-200 flex items-center justify-center gap-1.5 cursor-pointer shadow-3xs ${
+                              extraChargesTotal > 0
+                                ? 'bg-amber-50 border-amber-300 text-amber-900'
+                                : 'bg-[#F8F9FA] hover:bg-gray-100 border-gray-200 text-[#1D3557]'
+                            }`}
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                            <span>Aplicar cargos</span>
+                            {extraChargesTotal > 0 && (
+                              <span className="ml-1 text-[10px] bg-amber-500 text-white px-1.5 py-0.5 rounded-full font-mono font-bold">
+                                +${extraChargesTotal.toFixed(2)}
+                              </span>
+                            )}
+                          </button>
+                        </div>
+
+                        {/* Formulario Descuento (Activable mediante el botón Descuento) */}
+                        {(showDiscountSection || calculatedDiscountUsd > 0) && (
+                          <div className="pt-3 border-t border-gray-100 space-y-2">
+                            <div className="flex justify-between items-center">
+                              <label className="block text-xs font-black text-[#1D3557] uppercase tracking-wider">
+                                Descuento
+                              </label>
+                              <div className="flex items-center gap-2">
+                                {(discountPercentNum > 0 || discountAmountNum > 0) && (
+                                  <button
+                                    type="button"
+                                    onClick={handleRemoveDiscount}
+                                    className="text-[10px] font-black text-rose-600 hover:text-rose-800 uppercase tracking-wider flex items-center gap-1 cursor-pointer bg-transparent border-none"
+                                  >
+                                    <X className="w-3 h-3 text-rose-500" />
+                                    <span>Quitar descuento</span>
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => setShowDiscountSection(false)}
+                                  className="text-gray-400 hover:text-gray-600 p-0.5 cursor-pointer"
+                                  title="Cerrar"
+                                >
+                                  <X className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                            <div className="flex items-center justify-between gap-3 bg-gray-50/50 p-3 rounded-2xl border border-gray-100">
+                              {/* Input Porcentaje (%) */}
+                              <div className="relative flex-1">
+                                <input
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={
+                                    discountType === 'percent'
+                                      ? discountPercent
+                                      : discountType === 'amount' && subtotal > 0 && parseFloat(discountAmount) > 0
+                                        ? parseFloat(((parseFloat(discountAmount) / subtotal) * 100).toFixed(2)).toString()
+                                        : (discountPercent && discountPercent !== '0' ? discountPercent : '')
+                                  }
+                                  placeholder="0"
+                                  onChange={(e) => handlePercentChange(e.target.value)}
+                                  className="w-full text-center py-2.5 pr-6 bg-white border border-gray-200 rounded-xl text-xs font-black text-gray-700 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] transition shadow-3xs"
+                                />
+                                <span className="absolute right-2.5 top-2.5 text-xs font-extrabold text-[#1D3557] pointer-events-none">%</span>
+                              </div>
+
+                              <span className="text-gray-400 font-extrabold text-sm select-none">=</span>
+
+                              {/* Input Monto ($ USD) */}
+                              <div className="relative flex-1">
+                                <input
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={
+                                    discountType === 'amount'
+                                      ? discountAmount
+                                      : discountType === 'percent' && subtotal > 0 && parseFloat(discountPercent) > 0
+                                        ? parseFloat((subtotal * (parseFloat(discountPercent) / 100)).toFixed(2)).toString()
+                                        : (discountAmount && discountAmount !== '0' ? discountAmount : '')
+                                  }
+                                  placeholder="0.00"
+                                  onChange={(e) => handleAmountChange(e.target.value)}
+                                  className="w-full text-center py-2.5 pr-6 bg-white border border-gray-200 rounded-xl text-xs font-black text-gray-700 focus:outline-none focus:ring-2 focus:ring-[#005da9] focus:border-[#005da9] transition shadow-3xs"
+                                />
+                                <span className="absolute right-2.5 top-2.5 text-xs font-extrabold text-[#1D3557] pointer-events-none">$</span>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Detalle de Cargos Aplicados si existen */}
+                        {extraCharges.length > 0 && (
+                          <div className="pt-3 border-t border-gray-100 space-y-2">
+                            <div className="flex justify-between items-center">
+                              <span className="text-xs font-black text-[#1D3557] uppercase tracking-wider">Cargos aplicados</span>
+                              <button
+                                type="button"
+                                onClick={() => setExtraCharges([])}
+                                className="text-[10px] font-black text-rose-600 hover:text-rose-800 uppercase tracking-wider flex items-center gap-1 cursor-pointer"
+                              >
+                                <X className="w-3 h-3 text-rose-500" />
+                                <span>Limpiar</span>
+                              </button>
+                            </div>
+                            <div className="space-y-1.5">
+                              {extraCharges.map((charge) => (
+                                <div key={charge.id} className="flex items-center justify-between bg-amber-50/60 border border-amber-200/70 px-3 py-1.5 rounded-xl text-xs">
+                                  <span className="font-bold text-[#1D3557]">{charge.name}</span>
+                                  <div className="flex items-center gap-2">
+                                    <span className="font-mono font-black text-amber-900">+${Number(charge.amount).toFixed(2)}</span>
+                                    <button
+                                      type="button"
+                                      onClick={() => setExtraCharges(prev => prev.filter(c => c.id !== charge.id))}
+                                      className="text-gray-400 hover:text-rose-600 p-0.5 transition cursor-pointer"
+                                      title="Eliminar cargo"
+                                    >
+                                      <X className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Sujeto a impuesto (Activación de impuesto según producto en base de datos) */}
+                        <div className="pt-3 border-t border-gray-100 space-y-3">
+                          <div className="bg-white border border-gray-200 rounded-2xl p-4 shadow-2xs transition hover:border-gray-300">
+                            <label className="flex items-center justify-between cursor-pointer select-none">
+                              <span className="text-sm font-extrabold text-[#111827]">
+                                Sujeto a impuesto
+                              </span>
+                              <button
+                                type="button"
+                                role="switch"
+                                aria-checked={applyIva}
+                                onClick={() => setApplyIva(!applyIva)}
+                                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                                  applyIva ? 'bg-[#111827]' : 'bg-gray-200'
+                                }`}
+                              >
+                                <span
+                                  className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-md ring-0 transition duration-200 ease-in-out ${
+                                    applyIva ? 'translate-x-5' : 'translate-x-0'
+                                  }`}
+                                />
+                              </button>
+                            </label>
+                          </div>
+
+                          {/* Aplicar IGTF (3%) - Mismos colores y estilo de Sujeto a impuesto, sin texto adicional */}
+                          {hasUsdPayment && (
+                            <div className="bg-white border border-gray-200 rounded-2xl p-4 shadow-2xs transition hover:border-gray-300">
+                              <label className="flex items-center justify-between cursor-pointer select-none">
+                                <span className="text-sm font-extrabold text-[#111827]">
+                                  Aplicar IGTF (3%)
+                                </span>
+                                <button
+                                  type="button"
+                                  role="switch"
+                                  aria-checked={applyIgtf}
+                                  onClick={() => setApplyIgtf(!applyIgtf)}
+                                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                                    applyIgtf ? 'bg-[#111827]' : 'bg-gray-200'
+                                  }`}
+                                >
+                                  <span
+                                    className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-md ring-0 transition duration-200 ease-in-out ${
+                                      applyIgtf ? 'translate-x-5' : 'translate-x-0'
+                                    }`}
+                                  />
+                                </button>
+                              </label>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* RIGHT COLUMN: SPLIT PAYMENTS & METHODS (lg:col-span-7) - Image 2 */}
+                    <div className="lg:col-span-7 space-y-4">
+                      
+                      {/* 🎛️ BUTTONS: AL CONTADO | CUENTAS POR COBRAR */}
+                      <div className="grid grid-cols-2 gap-3">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSaleCondition('pagada');
+                            // Reset split payments to default (fill total with first cash/bank account)
+                            const nonCxcAccounts = bankAccounts.filter(a => a.id !== 'cxc-virtual');
+                            const targetAcc = nonCxcAccounts[0] || bankAccounts[0];
+                            const rate = customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES);
+                            const isVES = targetAcc?.currency === 'VES';
+                            const initialAmt = isVES ? parseFloat((total * rate).toFixed(2)) : parseFloat(total.toFixed(2));
+                            setSplitPayments([
+                              {
+                                method: targetAcc?.name || 'Efectivo',
+                                amount: initialAmt,
+                                bankAccountId: targetAcc?.id,
+                                currency: targetAcc?.currency || (isVES ? 'VES' : 'USD')
+                              }
+                            ]);
+                            setPaymentCount(1);
+                          }}
+                          className={`py-3.5 px-4 font-extrabold text-xs uppercase tracking-wider rounded-2xl border transition-all duration-300 flex items-center justify-center gap-2 shadow-2xs cursor-pointer ${
+                            saleCondition === 'pagada'
+                              ? 'bg-[#005da9] text-white border-[#005da9]'
+                              : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50'
+                          }`}
+                        >
+                          <DollarSign className="w-4 h-4" />
+                          <span className="truncate">Al contado</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSaleCondition('credito');
+                            // Initialize CxC parameters
+                            const nextInvoiceNum = dbService.getNextInvoiceControlNumber(documentType);
+                            setWizardInvoiceNumber(nextInvoiceNum);
+                            setCxcSubject(`crédito por venta POS #${nextInvoiceNum}`);
+                            const cartSummary = cart.length > 0 ? cart.map(i => `${i.qty}x ${i.product.name}`).join(', ') : 'Crédito registrado vía POS';
+                            setCxcDescription(cartSummary);
+                            setCxcInitialPayment(0);
+                            // Pre-fill CxC split payment
+                            setSplitPayments([
+                              {
+                                method: 'Cuentas por Cobrar (Crédito Cliente)',
+                                amount: parseFloat(total.toFixed(2)),
+                                bankAccountId: 'cxc-virtual',
+                                currency: 'USD'
+                              }
+                            ]);
+                            setPaymentCount(1);
+                          }}
+                          className={`py-3.5 px-4 font-extrabold text-xs uppercase tracking-wider rounded-2xl border transition-all duration-300 flex items-center justify-center gap-2 shadow-2xs cursor-pointer ${
+                            saleCondition === 'credito'
+                              ? 'bg-[#1D3557] text-white border-[#1D3557]'
+                              : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50'
+                          }`}
+                        >
+                          <FileText className="w-4 h-4" />
+                          <span className="truncate">Crédito</span>
+                        </button>
+                      </div>
+
+                      {/* Top Bar for Tasa Display */}
+                      <div className="flex items-center justify-end bg-white border border-gray-100 p-3.5 rounded-2xl shadow-3xs">
+                        <div className="flex items-center gap-2 bg-[#005da9]/5 border border-[#005da9]/20 px-3.5 py-1.5 rounded-full text-xs">
+                          <span className="font-extrabold text-[#1D3557] whitespace-nowrap">Tasa de cambio (Bs/$):</span>
+                          <input
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            value={customBcvRate > 0 ? customBcvRate : (bcvRate ? Number(bcvRate.toFixed(2)) : getCachedCurrencyRates().VES)}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value);
+                              setCustomBcvRate(isNaN(val) ? 0 : val);
+                            }}
+                            className="w-28 sm:w-32 px-2.5 py-0.5 bg-white border border-[#005da9]/30 rounded-lg text-center font-mono font-black text-xs text-[#005da9] focus:outline-none focus:ring-2 focus:ring-[#005da9] shadow-3xs"
+                          />
+                        </div>
+                      </div>
+
+                      {saleCondition === 'pagada' ? (
+                        <>
+                          {/* Payment method boxes */}
+                          <div className="space-y-3.5">
+                            {splitPayments.map((p, idx) => {
+                              const bank = bankAccounts.find(a => a.id === p.bankAccountId) || bankAccounts.find(a => a.id !== 'cxc-virtual') || bankAccounts[0];
+                              const curr = (p.bankAccountId ? bank?.currency : (p.currency || bank?.currency)) || getPaymentCurrency(p);
+                              const currSymbol = curr === 'VES' ? 'Bs' : curr === 'USD' ? '$' : curr === 'EUR' ? '€' : 'COP';
+                              const effectiveRate = customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES);
+
+                              return (
+                                <div 
+                                  key={idx}
+                                  className="bg-white border border-gray-200 rounded-3xl p-5 shadow-2xs relative flex flex-col gap-4"
+                                >
+                                  {/* Remove button if more than 1 split payment */}
+                                  {splitPayments.length > 1 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRemoveSplitMethod(idx)}
+                                      className="absolute top-4 right-4 p-1.5 text-gray-400 hover:text-rose-600 hover:bg-rose-50 rounded-xl transition cursor-pointer"
+                                      title="Eliminar método"
+                                    >
+                                      <X className="w-4 h-4" />
+                                    </button>
+                                  )}
+
+                                  <div className="space-y-1">
+                                    <label className="block text-[11px] font-black uppercase text-gray-400">
+                                      Método de pago
+                                    </label>
+                                    <select
+                                      value={p.bankAccountId || bank?.id || bankAccounts[0]?.id || ''}
+                                      onChange={(e) => handleBankChange(idx, e.target.value)}
+                                      className="w-full bg-[#F8F9FA] border border-gray-200 text-[#2B2D42] font-bold text-xs rounded-xl px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-[#005da9] cursor-pointer"
+                                    >
+                                      {bankAccounts.filter(a => a.id !== 'cxc-virtual').map((a) => (
+                                        <option key={a.id} value={a.id}>
+                                          {a.name} ({a.currency}) • Saldo: {a.currency} {(Number(a.balance) || 0).toLocaleString('es-VE', { minimumFractionDigits: 2 })}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </div>
+
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-end">
+                                    <div className="space-y-1">
+                                      <div className="flex justify-between items-center">
+                                        <label className="block text-[11px] font-black uppercase text-gray-400">
+                                          Monto a pagar ({currSymbol === '$' ? '$' : currSymbol})
+                                        </label>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleFillRemaining(idx)}
+                                          className="text-[10px] text-[#005da9] font-black hover:underline cursor-pointer"
+                                        >
+                                          Restante
+                                        </button>
+                                      </div>
+                                      <div className="relative">
+                                        <span className={`absolute left-3 top-1/2 -translate-y-1/2 font-black text-gray-400 ${currSymbol === 'Bs' ? 'text-[11px]' : 'text-xs'}`}>
+                                          {currSymbol}
+                                        </span>
+                                        <input
+                                          type="number"
+                                          step="0.01"
+                                          value={p.amount !== undefined ? p.amount : ''}
+                                          onChange={(e) => handleUpdateSplitAmount(idx, parseFloat(e.target.value))}
+                                          className={`w-full ${currSymbol === 'Bs' ? 'pl-9' : 'pl-8'} pr-3 py-2.5 bg-white border border-[#005da9]/30 rounded-xl text-xs font-mono font-black text-[#1D3557] focus:outline-none focus:ring-2 focus:ring-[#005da9]`}
+                                          placeholder="0.00"
+                                        />
+                                      </div>
+                                    </div>
+
+                                    {/* Conversions description */}
+                                    <div className="text-xs text-gray-500 font-semibold pb-2">
+                                      {curr === 'USD' ? (
+                                        <span>Equivale a: <strong className="font-mono text-xs sm:text-sm font-black text-[#1D3557]">Bs. {(p.amount * effectiveRate).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></span>
+                                      ) : (
+                                        <span>Equivale a: <strong className="font-mono text-xs sm:text-sm font-black text-[#1D3557]">${(p.amount / (effectiveRate || 1)).toFixed(2)} USD</strong></span>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+
+                          {/* Add split method button */}
+                          <button
+                            type="button"
+                            onClick={handleAddSplitMethod}
+                            className="w-full py-3 border-2 border-dashed border-[#005da9]/30 text-[#005da9] hover:bg-[#005da9]/5 font-black text-xs rounded-2xl transition flex items-center justify-center gap-1.5 cursor-pointer"
+                          >
+                            <Plus className="w-4 h-4" />
+                            <span>Agregar método de pago</span>
+                          </button>
+
+                          {/* Reconciliation Banner */}
+                          {(() => {
+                            const splitSumUsd = splitPayments.reduce(
+                              (acc, sp) => acc + methodAmountToUsd(sp.amount || 0, sp),
+                              0
+                            );
+                            const diffUsd = parseFloat((total - splitSumUsd).toFixed(2));
+
+                            if (diffUsd > 0.02) {
+                              return (
+                                <div className="p-3 bg-amber-50 border border-amber-100 rounded-2xl text-amber-800 text-xs font-bold flex items-center justify-between gap-1.5">
+                                  <div className="flex items-center gap-1.5">
+                                    <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                                    <span>Falta asignar:</span>
+                                  </div>
+                                  <span className="font-mono text-amber-950 font-black text-xs sm:text-sm">
+                                    ${diffUsd.toFixed(2)} USD <span className="font-black text-xs sm:text-sm ml-1">(Bs. {(diffUsd * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})</span>
+                                  </span>
+                                </div>
+                              );
+                            } else if (diffUsd < -0.02) {
+                              const hasCashPayment = splitPayments.some(p => {
+                                const bank = bankAccounts.find(a => a.id === p.bankAccountId);
+                                const name = (bank?.name || '').toLowerCase();
+                                const bankName = (bank?.bank_name || '').toLowerCase();
+                                const meth = (p.method || '').toLowerCase();
+                                return name.includes('efectivo') || name.includes('cash') || 
+                                       bankName.includes('efectivo') || bankName.includes('cash') ||
+                                       meth.includes('efectivo') || meth.includes('cash');
+                              });
+
+                              if (hasCashPayment) {
+                                return (
+                                  <div className="p-3.5 bg-emerald-50 border border-emerald-100 rounded-2xl text-emerald-800 text-xs font-bold flex items-center justify-between gap-1.5">
+                                    <div className="flex items-center gap-1.5">
+                                      <CheckCircle className="w-4.5 h-4.5 text-emerald-600 shrink-0" />
+                                      <span>Vuelto a entregar (Cambio):</span>
+                                    </div>
+                                    <span className="font-mono text-emerald-950 font-black text-sm sm:text-base">
+                                      ${Math.abs(diffUsd).toFixed(2)} USD <span className="font-black text-sm sm:text-base ml-1">(Bs. {(Math.abs(diffUsd) * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})</span>
+                                    </span>
+                                  </div>
+                                );
+                              }
+
+                              return (
+                                <div className="p-3 bg-rose-50 border border-rose-100 rounded-2xl text-rose-800 text-xs font-bold flex items-center justify-between gap-1.5">
+                                  <div className="flex items-center gap-1.5">
+                                    <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                                    <span>Monto excedido:</span>
+                                  </div>
+                                  <span className="font-mono text-rose-950 font-black text-xs sm:text-sm">
+                                    ${Math.abs(diffUsd).toFixed(2)} USD <span className="font-black text-xs sm:text-sm ml-1">(Bs. {(Math.abs(diffUsd) * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})</span>
+                                  </span>
+                                </div>
+                              );
+                            } else {
+                              return (
+                                <div className="p-3.5 bg-emerald-50 border border-emerald-100 rounded-2xl text-emerald-800 text-xs font-bold flex items-center gap-2">
+                                  <CheckCircle className="w-4.5 h-4.5 text-emerald-600 shrink-0" />
+                                  <span>¡Monto total distribuido perfectamente!</span>
+                                </div>
+                              );
+                            }
+                          })()}
+                        </>
+                      ) : (
+                        /* CUENTAS POR COBRAR FORM - Image 1 */
+                        <div className="bg-white border border-gray-200 rounded-3xl p-6 shadow-2xs space-y-4">
+                          <div className="text-sm font-black text-[#1D3557] flex items-center gap-2 pb-2 border-b border-gray-100">
+                            <Plus className="w-4 h-4 text-[#1D3557]" />
+                            <span>Agregar Cuenta Pendiente</span>
+                          </div>
+
+                          <div className="space-y-1">
+                            <label className="block text-[11px] font-black uppercase text-gray-400">
+                              Asunto / Entidad Principal (Cliente / Deudor):
+                            </label>
+                            <input
+                              type="text"
+                              value={wizardSelectedClientObj?.phone ? `${selectedClient} ${wizardSelectedClientObj.phone}` : selectedClient}
+                              disabled
+                              className="w-full bg-[#F8F9FA] border border-gray-200 text-[#1D3557] font-extrabold text-xs rounded-xl px-3.5 py-2.5 cursor-not-allowed"
+                            />
+                            <p className="text-[10px] text-gray-400 font-bold">Viene predeterminado de la selección del cliente.</p>
+                          </div>
+
+                          <div className="space-y-1">
+                            <label className="block text-[11px] font-black uppercase text-gray-400">
+                              Concepto / Sub-asunto (ej. Factura #12345):
+                            </label>
+                            <input
+                              type="text"
+                              value={cxcSubject}
+                              onChange={(e) => setCxcSubject(e.target.value)}
+                              placeholder="crédito por venta POS #..."
+                              className="w-full bg-white border border-gray-200 text-[#2B2D42] font-bold text-xs rounded-xl px-3.5 py-2.5 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            />
+                          </div>
+
+                          <div className="space-y-1">
+                            <label className="block text-[11px] font-black uppercase text-gray-400">
+                              Descripción detallada:
+                            </label>
+                            <textarea
+                              rows={2}
+                              value={cxcDescription}
+                              onChange={(e) => setCxcDescription(e.target.value)}
+                              placeholder="Cuenta por pagar/cobrar generada por POS..."
+                              className="w-full bg-white border border-gray-200 text-[#2B2D42] font-bold text-xs rounded-xl px-3.5 py-2.5 focus:outline-none focus:ring-2 focus:ring-[#005da9] resize-none"
+                            />
+                          </div>
+
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div className="space-y-1">
+                              <label className="block text-[11px] font-black uppercase text-gray-400">
+                                Monto Total (USD):
+                              </label>
+                              <div className="relative">
+                                <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400 font-mono font-black text-xs">$</span>
+                                <input
+                                  type="text"
+                                  value={total.toFixed(2)}
+                                  disabled
+                                  className="w-full pl-7 pr-3 py-2.5 bg-[#F8F9FA] border border-gray-200 text-[#2B2D42] font-mono font-black text-xs rounded-xl cursor-not-allowed"
+                                />
+                              </div>
+                            </div>
+
+                            <div className="space-y-1">
+                              <label className="block text-[11px] font-black uppercase text-gray-400">
+                                Abono Inicial (Opcional):
+                              </label>
+                              <div className="relative">
+                                <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[#005da9] font-mono font-black text-xs">$</span>
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min="0"
+                                  max={total}
+                                  value={cxcInitialPayment || ''}
+                                  onChange={(e) => {
+                                    const val = parseFloat(e.target.value);
+                                    setCxcInitialPayment(isNaN(val) ? 0 : val);
+                                  }}
+                                  placeholder="0"
+                                  className="w-full pl-7 pr-3 py-2.5 bg-white border border-[#005da9]/30 text-[#005da9] font-mono font-black text-xs rounded-xl focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                                />
+                              </div>
+                            </div>
+                          </div>
+
+                          {(Number(cxcInitialPayment) || 0) > 0 && (
+                            <div className="space-y-1.5 p-3.5 bg-emerald-50/70 border border-emerald-200/80 rounded-2xl">
+                              <label className="block text-[11px] font-black uppercase text-emerald-800">
+                                Cuenta / Método donde ingresa el Abono Inicial:
+                              </label>
+                              <select
+                                value={cxcInitialBankId || (bankAccounts.find(a => a.id !== 'cxc-virtual')?.id || bankAccounts[0]?.id || '')}
+                                onChange={(e) => setCxcInitialBankId(e.target.value)}
+                                className="w-full bg-white border border-emerald-300 text-[#2B2D42] font-bold text-xs rounded-xl px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-emerald-500 cursor-pointer shadow-3xs"
+                              >
+                                {bankAccounts.filter(a => a.id !== 'cxc-virtual').map((a) => (
+                                  <option key={a.id} value={a.id}>
+                                    {a.name} ({a.currency}) • Saldo actual: {a.currency} {(Number(a.balance) || 0).toLocaleString('es-VE', { minimumFractionDigits: 2 })}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                          )}
+
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div className="space-y-1">
+                              <label className="block text-[11px] font-black uppercase text-gray-400">
+                                Fecha de Emisión:
+                              </label>
+                              <input
+                                type="datetime-local"
+                                value={cxcIssueDate}
+                                onChange={(e) => setCxcIssueDate(e.target.value)}
+                                className="w-full bg-white border border-gray-200 text-[#2B2D42] font-bold text-xs rounded-xl px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                              />
+                            </div>
+
+                            <div className="space-y-1">
+                              <label className="block text-[11px] font-black uppercase text-gray-400">
+                                Fecha de Expiración / Vencimiento:
+                              </label>
+                              <input
+                                type="date"
+                                value={cxcDueDate}
+                                onChange={(e) => setCxcDueDate(e.target.value)}
+                                className="w-full bg-white border border-gray-200 text-[#2B2D42] font-bold text-xs rounded-xl px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="p-3.5 bg-blue-50/70 border border-[#005da9]/20 rounded-2xl text-[#1D3557] text-xs font-bold flex flex-col gap-1">
+                            <div className="flex items-center gap-1.5 text-[#005da9] uppercase tracking-wider text-[10px] font-black">
+                              <Check className="w-4 h-4 shrink-0" />
+                              <span>Resumen de Crédito:</span>
+                            </div>
+                            <p className="font-semibold text-gray-700">
+                              Se registrará una Cuenta por Cobrar de <strong className="font-mono text-gray-900">${(total - (cxcInitialPayment || 0)).toFixed(2)} USD</strong> vinculada a este cliente.
+                            </p>
+                            {(cxcInitialPayment || 0) > 0 && (
+                              <p className="font-semibold text-emerald-700">
+                                El abono inicial de <strong className="font-mono">${(cxcInitialPayment || 0).toFixed(2)} USD</strong> se pagará al contado en efectivo o banco al presionar Siguiente.
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* -------------------- STEP 3: RESUMEN Y FINALIZACIÓN -------------------- */}
+                {wizardStep === 3 && (
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start max-w-5xl mx-auto">
+                    
+                    {/* LEFT COLUMN: RESUMEN DE COMPRA */}
+                    <div className="lg:col-span-5 space-y-4">
+                      <div className="bg-white border border-gray-200 rounded-3xl p-6 shadow-2xs space-y-4">
+                        <div className="text-xs font-black uppercase tracking-wider text-gray-400 pb-2 border-b border-gray-100">
+                          Resumen de compra
+                        </div>
+
+                        {/* List of items */}
+                        <div className="space-y-3.5 max-h-[350px] overflow-y-auto pr-1">
+                          {cart.map((item, index) => (
+                            <div key={index} className="flex justify-between items-start gap-2 text-xs">
+                              <div className="flex-1 min-w-0">
+                                <span className="block font-bold text-gray-800 truncate">{item.product.name}</span>
+                                <span className="block text-[10px] text-gray-400 font-mono mt-0.5">${item.product.price.toFixed(2)} x {item.qty}</span>
+                              </div>
+                              <span className="font-black text-gray-700 shrink-0 uppercase tracking-tight text-[11px] bg-gray-50 px-2 py-1 rounded-md border border-gray-100">
+                                X{item.qty}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* RIGHT COLUMN: CHECKOUT FORM DETAILS */}
+                    <div className="lg:col-span-7 space-y-4">
+                      <div className="bg-white border border-gray-200 rounded-3xl p-6 shadow-2xs space-y-5">
+                        
+                        {/* Selector Principal de Comprobante: Factura vs Nota - Botones Grandes y Visibles (Estilo Frenyer) */}
+                        <div>
+                          <div className="flex items-center justify-between mb-2.5">
+                            <label className="block text-xs font-black uppercase tracking-wider text-[#1D3557]">
+                              Tipo de Comprobante Fiscal / Documento
+                            </label>
+                            <span className="text-[11px] font-bold text-[#005da9] bg-blue-50 px-2.5 py-0.5 rounded-full border border-blue-100">
+                              {documentType === 'factura' ? 'Emisión de Factura Fiscal' : 'Emisión de Nota de Entrega'}
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 p-2 bg-gradient-to-b from-gray-50 to-gray-100/70 rounded-3xl border-2 border-gray-200 shadow-inner">
+                            <button
+                              type="button"
+                              id="btn-resumen-doc-factura"
+                              onClick={() => {
+                                setDocumentType('factura');
+                                const nextNum = dbService.getNextInvoiceControlNumber('factura');
+                                setWizardInvoiceNumber(nextNum);
+                                setCxcSubject(prev => {
+                                  if (!prev || prev.includes('#')) {
+                                    const base = prev ? prev.replace(/#.*$/, '').trim() : 'crédito por venta POS';
+                                    return `${base} #${nextNum}`;
+                                  }
+                                  return `${prev} #${nextNum}`;
+                                });
+                              }}
+                              className={`flex items-center justify-between gap-2.5 py-3 px-3.5 rounded-2xl transition-all duration-200 cursor-pointer text-left select-none ${
+                                documentType === 'factura'
+                                  ? 'bg-gradient-to-r from-[#1D3557] via-[#005da9] to-[#1D3557] text-white shadow-lg shadow-blue-950/20 ring-2 ring-[#005da9]/30 scale-[1.01]'
+                                  : 'bg-white text-gray-700 hover:text-[#1D3557] hover:bg-blue-50/40 border-2 border-gray-200 hover:border-[#1D3557]/40 shadow-xs'
+                              }`}
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <div className={`p-2 rounded-xl transition-colors shrink-0 ${
+                                  documentType === 'factura' 
+                                    ? 'bg-white/15 text-[#40E0D0] shadow-inner' 
+                                    : 'bg-blue-50 text-[#005da9] border border-blue-100'
+                                }`}>
+                                  <FileText className="w-4 h-4" />
+                                </div>
+                                <span className="text-xs font-black tracking-tight leading-none truncate">
+                                  FACTURA
+                                </span>
+                              </div>
+                              <div className={`w-4.5 h-4.5 rounded-full flex items-center justify-center border-2 shrink-0 transition-all ${
+                                documentType === 'factura'
+                                  ? 'border-[#40E0D0] bg-[#40E0D0] text-[#1D3557]'
+                                  : 'border-gray-300 bg-gray-50 text-transparent'
+                              }`}>
+                                <CheckCircle className="w-3 h-3" />
+                              </div>
+                            </button>
+
+                            <button
+                              type="button"
+                              id="btn-resumen-doc-nota"
+                              onClick={() => {
+                                setDocumentType('nota_entrega');
+                                const nextNum = dbService.getNextInvoiceControlNumber('nota_entrega');
+                                setWizardInvoiceNumber(nextNum);
+                                setCxcSubject(prev => {
+                                  if (!prev || prev.includes('#')) {
+                                    const base = prev ? prev.replace(/#.*$/, '').trim() : 'crédito por venta POS';
+                                    return `${base} #${nextNum}`;
+                                  }
+                                  return `${prev} #${nextNum}`;
+                                });
+                              }}
+                              className={`flex items-center justify-between gap-2.5 py-3 px-3.5 rounded-2xl transition-all duration-200 cursor-pointer text-left select-none ${
+                                documentType === 'nota_entrega'
+                                  ? 'bg-gradient-to-r from-[#005da9] via-[#0077cc] to-[#005da9] text-white shadow-lg shadow-blue-800/25 ring-2 ring-[#005da9]/30 scale-[1.01]'
+                                  : 'bg-white text-gray-700 hover:text-[#005da9] hover:bg-blue-50/40 border-2 border-gray-200 hover:border-[#005da9]/40 shadow-xs'
+                              }`}
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <div className={`p-2 rounded-xl transition-colors shrink-0 ${
+                                  documentType === 'nota_entrega' 
+                                    ? 'bg-white/15 text-cyan-200 shadow-inner' 
+                                    : 'bg-cyan-50 text-[#005da9] border border-cyan-100'
+                                }`}>
+                                  <FileCheck className="w-4 h-4" />
+                                </div>
+                                <span className="text-xs font-black tracking-tight leading-none truncate">
+                                  NOTA
+                                </span>
+                              </div>
+                              <div className={`w-4.5 h-4.5 rounded-full flex items-center justify-center border-2 shrink-0 transition-all ${
+                                documentType === 'nota_entrega'
+                                  ? 'border-white bg-white text-[#005da9]'
+                                  : 'border-gray-300 bg-gray-50 text-transparent'
+                              }`}>
+                                <CheckCircle className="w-3 h-3" />
+                              </div>
+                            </button>
+
+                            <button
+                              type="button"
+                              id="btn-resumen-doc-espera"
+                              onClick={handlePostponeSale}
+                              className="flex items-center justify-between gap-2.5 py-3 px-3.5 rounded-2xl transition-all duration-200 cursor-pointer text-left select-none bg-gradient-to-r from-amber-600 via-amber-700 to-amber-800 text-white shadow-lg shadow-amber-950/25 ring-2 ring-amber-500/30 hover:scale-[1.01]"
+                              title="Colocar venta actual en espera y limpiar carrito"
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <div className="p-2 rounded-xl bg-white/15 text-amber-200 shadow-inner shrink-0">
+                                  <Clock className="w-4 h-4" />
+                                </div>
+                                <span className="text-xs font-black tracking-tight leading-none truncate">
+                                  ESPERA
+                                </span>
+                              </div>
+                              <div className="w-4.5 h-4.5 rounded-full flex items-center justify-center border-2 border-amber-300 bg-amber-400 text-amber-950 shrink-0 shadow-xs">
+                                <PauseCircle className="w-3 h-3" />
+                              </div>
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Fecha y Control */}
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                          <div>
+                            <label className="block text-[11px] font-black uppercase text-gray-500 mb-1.5">Fecha</label>
+                            <input
+                              type="date"
+                              value={saleDate}
+                              onChange={(e) => setSaleDate(e.target.value)}
+                              className="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-mono font-bold text-gray-700 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-[11px] font-black uppercase text-gray-500 mb-1.5">
+                              {documentType === 'nota_entrega' ? 'Número de Nota' : 'Número de Factura'}
+                            </label>
+                            <input
+                              type="text"
+                              disabled
+                              value={wizardInvoiceNumber || dbService.getNextInvoiceControlNumber(documentType)}
+                              className="w-full px-3.5 py-2.5 bg-gray-100 border border-gray-200 rounded-xl text-xs font-mono font-black text-[#004b88]"
+                            />
+                          </div>
+                        </div>
+
+                        {/* Observaciones switch */}
+                        <div className="space-y-3">
+                          <label className="flex items-center justify-between cursor-pointer select-none group">
+                            <span className="text-xs font-bold text-gray-700 group-hover:text-[#005da9]">Observaciones</span>
+                            <button
+                              type="button"
+                              role="switch"
+                              aria-checked={showObservationsText}
+                              onClick={() => setShowObservationsText(!showObservationsText)}
+                              className={`relative inline-flex h-5 w-10 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                                showObservationsText ? 'bg-[#005da9]' : 'bg-gray-300'
+                              }`}
+                            >
+                              <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
+                                showObservationsText ? 'translate-x-5' : 'translate-x-0'
+                              }`} />
+                            </button>
+                          </label>
+
+                          {showObservationsText && (
+                            <textarea
+                              value={saleNote}
+                              onChange={(e) => setSaleNote(e.target.value)}
+                              placeholder="Escriba alguna observación para esta venta..."
+                              rows={3}
+                              className="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl text-xs font-bold text-gray-800 focus:outline-none focus:ring-2 focus:ring-[#005da9]"
+                            />
+                          )}
+                        </div>
+
+                        {/* Complete Financial Breakdown */}
+                        <div className="pt-4 border-t border-gray-100 space-y-2.5 text-xs">
+                          <div className="flex justify-between items-center text-gray-500">
+                            <span>Subtotal:</span>
+                            <div className="text-right">
+                              <span className="font-mono text-gray-800 font-bold">${subtotal.toFixed(2)}</span>
+                              <span className="font-mono text-gray-800 text-xs sm:text-sm font-black ml-1.5">
+                                (Bs. {(subtotal * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="flex justify-between items-center text-emerald-600">
+                            <span>Descuento:</span>
+                            <div className="text-right">
+                              <span className="font-mono text-emerald-700 font-bold">-${calculatedDiscountUsd.toFixed(2)}</span>
+                              <span className="font-mono text-emerald-700 text-xs sm:text-sm font-black ml-1.5">
+                                (Bs. {(calculatedDiscountUsd * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="flex justify-between items-center text-gray-500">
+                            <span>Servicios:</span>
+                            <div className="text-right">
+                              <span className="font-mono text-gray-800 font-bold">${extraChargesTotal.toFixed(2)}</span>
+                              <span className="font-mono text-gray-800 text-xs sm:text-sm font-black ml-1.5">
+                                (Bs. {(extraChargesTotal * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* IVA / Tipo de impuesto dinámico según producto */}
+                          {taxItemsSummary.map((taxItem, tIdx) => (
+                            <div key={tIdx} className="flex justify-between items-center text-gray-500">
+                              <span>{taxItem.label}</span>
+                              <div className="text-right">
+                                <span className="font-mono text-gray-800 font-bold">${taxItem.amountUsd.toFixed(2)}</span>
+                                <span className="font-mono text-gray-800 text-xs sm:text-sm font-black ml-1.5">
+                                  (Bs. {taxItem.amountVes.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+
+                          {hasUsdPayment && (
+                            <div className="flex justify-between items-center text-amber-900">
+                              <span className="font-semibold">IGTF 3%:</span>
+                              <div className="text-right">
+                                <span className="font-mono font-bold">${calculatedIgtfUsd.toFixed(2)}</span>
+                                <span className="font-mono text-amber-950 text-xs sm:text-sm font-black ml-1.5">
+                                  (Bs. {(calculatedIgtfUsd * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                                </span>
+                              </div>
+                            </div>
+                          )}
+
+                          <div className="pt-2 border-t border-gray-100 flex justify-between items-center text-sm font-black text-[#005da9]">
+                            <span>Total a pagar:</span>
+                            <div className="text-right">
+                              <span className="font-mono text-base font-black">${total.toFixed(2)}</span>
+                              <span className="font-mono text-xs sm:text-sm font-black text-gray-900 ml-1.5">
+                                (Bs. {(total * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                              </span>
+                            </div>
+                          </div>
+
+                          {saleCondition === 'credito' && (
+                            <div className="bg-[#005da9]/5 border border-[#005da9]/20 rounded-xl p-3 space-y-1.5 text-xs text-[#1D3557] mt-2">
+                              <div className="flex justify-between items-center font-bold">
+                                <span>Condición de venta:</span>
+                                <span className="uppercase text-[11px] bg-[#005da9]/20 px-2 py-0.5 rounded font-black text-[#005da9]">A Crédito (CxC)</span>
+                              </div>
+                              <div className="flex justify-between items-center">
+                                <span>Monto a crédito (CxC):</span>
+                                <span className="font-mono font-black text-[#005da9]">${(total - (Number(cxcInitialPayment) || 0)).toFixed(2)} USD</span>
+                              </div>
+                              {(Number(cxcInitialPayment) || 0) > 0 && (
+                                <div className="flex justify-between items-center text-emerald-700 font-semibold">
+                                  <span>Abono inicial pagado:</span>
+                                  <span className="font-mono">${(Number(cxcInitialPayment) || 0).toFixed(2)} USD</span>
+                                </div>
+                              )}
+                              <div className="flex justify-between items-center text-[11px] text-[#005da9]">
+                                <span>Cliente:</span>
+                                <span className="font-bold">{selectedClient}</span>
+                              </div>
+                            </div>
+                          )}
+
+                          {(() => {
+                            const splitSumUsd = saleCondition === 'credito'
+                              ? total
+                              : splitPayments.reduce(
+                                  (acc, sp) => acc + methodAmountToUsd(sp.amount || 0, sp),
+                                  0
+                                );
+                            const diffUsd = saleCondition === 'credito' ? 0 : Math.max(0, total - splitSumUsd);
+                            const changeUsd = saleCondition === 'credito' ? 0 : Math.max(0, splitSumUsd - total);
+                            return (
+                              <>
+                                <div className="flex justify-between items-center font-bold text-gray-700">
+                                  <span>Total {saleCondition === 'credito' ? 'acordado / cubierto' : 'pagado'}:</span>
+                                  <div className="text-right">
+                                    <span className="font-mono text-gray-900 font-bold">${splitSumUsd.toFixed(2)}</span>
+                                    <span className="font-mono text-gray-800 text-xs sm:text-sm font-black ml-1.5">
+                                      (Bs. {(splitSumUsd * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                                    </span>
+                                  </div>
+                                </div>
+
+                                <div className="flex justify-between items-center font-bold text-gray-600">
+                                  <span>Diferencia:</span>
+                                  <div className="text-right">
+                                    <span className={`font-mono font-bold ${diffUsd > 0.02 ? 'text-amber-600' : 'text-gray-900'}`}>
+                                      ${diffUsd.toFixed(2)}
+                                    </span>
+                                    <span className="font-mono text-gray-800 text-xs sm:text-sm font-black ml-1.5">
+                                      (Bs. {(diffUsd * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                                    </span>
+                                  </div>
+                                </div>
+
+                                {changeUsd > 0 && (
+                                  <div className="flex justify-between items-center font-black text-emerald-700 bg-emerald-50 p-2 rounded-xl border border-emerald-100 mt-2">
+                                    <span>Vuelto:</span>
+                                    <div className="text-right">
+                                      <span className="font-mono">${changeUsd.toFixed(2)}</span>
+                                      <span className="font-mono text-emerald-800 text-xs sm:text-sm font-black ml-1.5">
+                                        (Bs. {(changeUsd * (customBcvRate > 0 ? customBcvRate : bcvRate)).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
+                                      </span>
+                                    </div>
+                                  </div>
+                                )}
+                              </>
+                            );
+                          })()}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Wizard Footer Controls */}
+              <div className="p-5 md:px-8 border-t border-gray-100 bg-white flex justify-between items-center shrink-0">
+                
+                {/* Cancel / Anterior buttons */}
+                <div>
+                  {wizardStep === 1 ? (
+                    <button
+                      type="button"
+                      onClick={() => setShowCheckoutWizard(false)}
+                      className="px-6 py-2.5 bg-white border border-gray-300 hover:bg-gray-50 text-gray-600 font-extrabold text-xs rounded-xl transition cursor-pointer"
+                    >
+                      Volver
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setWizardStep((prev) => (prev - 1) as 1 | 2 | 3)}
+                      className="px-6 py-2.5 bg-white border border-gray-300 hover:bg-gray-50 text-gray-600 font-extrabold text-xs rounded-xl transition cursor-pointer"
+                    >
+                      Anterior
+                    </button>
+                  )}
+                </div>
+
+                {/* Continue / Submit buttons */}
+                <div>
+                  {wizardStep === 1 && (
+                    <button
+                      type="button"
+                      disabled={!wizardSelectedClientObj}
+                      onClick={handleWizardNextStep1}
+                      className="px-8 py-2.5 bg-[#005da9] hover:bg-[#004b88] disabled:bg-gray-200 text-white font-extrabold text-xs uppercase tracking-wider rounded-xl transition shadow-md cursor-pointer"
+                    >
+                      {wizardIsNewClient ? 'Registrar y Continuar' : 'Confirmar Datos'}
+                    </button>
+                  )}
+
+                  {wizardStep === 2 && (
+                    <button
+                      type="button"
+                      disabled={isLoading || (() => {
+                        if (saleCondition === 'credito') {
+                          return false; // Enable button to allow clicks for transition/charging
+                        }
+                        const splitSumUsd = splitPayments.reduce(
+                          (acc, sp) => acc + methodAmountToUsd(sp.amount || 0, sp),
+                          0
+                        );
+                        const diffUsd = parseFloat((total - splitSumUsd).toFixed(2));
+                        
+                        // Permitir avanzar si hay vuelto con efectivo
+                        const hasCashPayment = splitPayments.some(p => {
+                          const bank = bankAccounts.find(a => a.id === p.bankAccountId);
+                          const name = (bank?.name || '').toLowerCase();
+                          const bankName = (bank?.bank_name || '').toLowerCase();
+                          const meth = (p.method || '').toLowerCase();
+                          return name.includes('efectivo') || name.includes('cash') || 
+                                 bankName.includes('efectivo') || bankName.includes('cash') ||
+                                 meth.includes('efectivo') || meth.includes('cash');
+                        });
+
+                        if (hasCashPayment && diffUsd < 0) {
+                          return false; // Permitir avanzar con vuelto
+                        }
+
+                        return Math.abs(diffUsd) > 0.05;
+                      })()}
+                      onClick={async () => {
+                        if (saleCondition === 'credito') {
+                          const initialAmt = Number(cxcInitialPayment) || 0;
+                          if (initialAmt < 0 || initialAmt > total) {
+                            showToast('error', `El abono inicial no puede ser menor a 0 o mayor al total ($${total.toFixed(2)})`);
+                            return;
+                          }
+
+                          const remainingAmt = total - initialAmt;
+                          
+                          if (remainingAmt <= 0) {
+                            showToast('error', 'El monto a crédito debe ser mayor a 0. De lo contrario, use Pago al Contado.');
+                            return;
+                          }
+
+                          // Configure splitPayments
+                          const newSplit: any[] = [
+                            {
+                              method: 'Cuentas por Cobrar (Crédito Cliente)',
+                              amount: parseFloat(remainingAmt.toFixed(2)),
+                              bankAccountId: 'cxc-virtual',
+                              currency: 'USD'
+                            }
+                          ];
+
+                          if (initialAmt > 0) {
+                            // There is an initial payment. We distribute this initial payment to the chosen bank/cash account
+                            const nonCxcAccounts = bankAccounts.filter(a => a.id !== 'cxc-virtual');
+                            const targetAcc = (cxcInitialBankId ? nonCxcAccounts.find(a => a.id === cxcInitialBankId) : null) || 
+                                              nonCxcAccounts[0] || 
+                                              bankAccounts[0];
+                            const rate = customBcvRate > 0 ? customBcvRate : (currencyRates.VES || bcvRate || getCachedCurrencyRates().VES);
+                            const isVES = targetAcc?.currency === 'VES';
+                            const initialAmtInCurrency = isVES ? parseFloat((initialAmt * rate).toFixed(2)) : parseFloat(initialAmt.toFixed(2));
+
+                            newSplit.push({
+                              method: targetAcc?.name || 'Efectivo',
+                              amount: initialAmtInCurrency,
+                              bankAccountId: targetAcc?.id,
+                              currency: targetAcc?.currency || (isVES ? 'VES' : 'USD')
+                            });
+
+                            setSplitPayments(newSplit);
+                            setPaymentCount(2);
+                          } else {
+                            setSplitPayments(newSplit);
+                            setPaymentCount(1);
+                          }
+
+                          // Sincronizar número de secuencia del sistema para el concepto y para la factura
+                          const nextInv = wizardInvoiceNumber || dbService.getNextInvoiceControlNumber(documentType);
+                          setWizardInvoiceNumber(nextInv);
+                          if (!cxcSubject || !cxcSubject.includes('#')) {
+                            setCxcSubject(`crédito por venta POS #${nextInv}`);
+                          }
+
+                          // Continuar al Resumen (Paso 3)
+                          setWizardStep(3);
+                          showToast('success', 'Cuenta por cobrar aceptada. Continúe al resumen para verificar y finalizar con impresión.');
+                        } else {
+                          setWizardStep(3);
+                        }
+                      }}
+                      className="px-8 py-2.5 bg-[#005da9] hover:bg-[#004b88] disabled:bg-gray-200 text-white font-extrabold text-xs uppercase tracking-wider rounded-xl transition shadow-md cursor-pointer"
+                    >
+                      {saleCondition === 'credito' ? 'Aceptar Cuenta por Cobrar' : 'Siguiente'}
+                    </button>
+                  )}
+
+                  {wizardStep === 3 && (
+                    <button
+                      type="button"
+                      disabled={isLoading}
+                      onClick={async () => {
+                        setIsLoading(true);
+                        try {
+                          const invoiceNumToUse = wizardInvoiceNumber || dbService.getNextInvoiceControlNumber(documentType);
+                          const created = await executeFinalizeInvoice(splitPayments, paymentCount, invoiceNumToUse);
+                          setShowCheckoutWizard(false);
+                          if (created) {
+                            let prefFormat: 'carta' | '58mm' | '80mm' = 'carta';
+                            try {
+                              const sysCfg = localStorage.getItem('copias_bellavista_sys_config');
+                              if (sysCfg) {
+                                const parsed = JSON.parse(sysCfg);
+                                if (parsed.impresionTicketFormat && ['carta', '58mm', '80mm'].includes(parsed.impresionTicketFormat)) {
+                                  prefFormat = parsed.impresionTicketFormat;
+                                }
+                              }
+                            } catch (e) {}
+                            printInvoiceDocument(created, businessInfo, prefFormat, customBcvRate || bcvRate);
+                          }
+                        } catch (err) {
+                          console.error(err);
+                        } finally {
+                          setIsLoading(false);
+                        }
+                      }}
+                      className="px-10 py-2.5 bg-[#005da9] hover:bg-[#004b88] disabled:bg-gray-300 text-white font-black text-xs uppercase tracking-wider rounded-xl transition shadow-md cursor-pointer flex items-center gap-1.5"
+                    >
+                      {isLoading ? <Loader2 className="w-4 h-4 animate-spin text-white" /> : <Printer className="w-4 h-4 text-white" />}
+                      <span>Finalizar e Imprimir</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

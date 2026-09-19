@@ -565,12 +565,12 @@ export const setStoredLanguage = (lang: LanguageCode) => {
   } catch (e) {}
 };
 
-export type ThemeCode = 'claro' | 'minimalista_premium';
+export type ThemeCode = 'claro' | 'minimalista_premium' | 'oscuro';
 
 export const getStoredTheme = (): ThemeCode => {
   try {
     const saved = localStorage.getItem('copias_bellavista_theme');
-    if (saved === 'claro' || saved === 'minimalista_premium') return saved as ThemeCode;
+    if (saved === 'claro' || saved === 'minimalista_premium' || saved === 'oscuro') return saved as ThemeCode;
   } catch (e) {}
   return 'claro';
 };
@@ -584,6 +584,9 @@ export const applyTheme = (theme: ThemeCode) => {
     if (theme === 'minimalista_premium') {
       document.documentElement.classList.add('theme-minimalista-premium');
       document.body.classList.add('theme-minimalista-premium');
+    } else if (theme === 'oscuro') {
+      document.documentElement.classList.add('dark');
+      document.body.classList.add('dark');
     }
     window.dispatchEvent(new CustomEvent('bellavista_theme_updated', { detail: theme }));
   } catch (e) {}
